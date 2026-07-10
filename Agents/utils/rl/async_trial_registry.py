@@ -152,6 +152,10 @@ class TrialNotFound(RegistryError):
     """Raised when a requested trial execution does not exist."""
 
 
+class EnqueueIntentNotFound(RegistryError):
+    """Raised when a requested durable enqueue intent does not exist."""
+
+
 @dataclass(frozen=True)
 class AdmissionResult:
     response: dict[str, Any]
@@ -563,14 +567,21 @@ class AsyncTrialRegistry:
         ]
         return result
 
-    def list_enqueue_intents(self, batch_id: str) -> list[dict[str, Any]]:
+    def list_enqueue_intents(
+        self,
+        batch_id: str,
+        *,
+        unmaterialized_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        materialized_filter = "AND materialized_at IS NULL" if unmaterialized_only else ""
         with self._connection() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT trial_execution_id, batch_id, payload_json,
                        materialized_at, created_at
                 FROM enqueue_intents
                 WHERE batch_id = ?
+                {materialized_filter}
                 ORDER BY rowid
                 """,
                 (batch_id,),
@@ -585,6 +596,38 @@ class AsyncTrialRegistry:
             }
             for row in rows
         ]
+
+    def mark_enqueue_intent_materialized(self, trial_execution_id: str) -> str:
+        """Mark an intent after its stable queue artifact exists.
+
+        Repeated calls return the first materialization timestamp. This lets a
+        reconciler close the crash window between atomic file publication and
+        the registry update without creating another execution.
+        """
+
+        materialized_at = _format_time(_now())
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT materialized_at
+                FROM enqueue_intents
+                WHERE trial_execution_id = ?
+                """,
+                (trial_execution_id,),
+            ).fetchone()
+            if row is None:
+                raise EnqueueIntentNotFound(trial_execution_id)
+            if row["materialized_at"] is not None:
+                return str(row["materialized_at"])
+            connection.execute(
+                """
+                UPDATE enqueue_intents
+                SET materialized_at = ?
+                WHERE trial_execution_id = ? AND materialized_at IS NULL
+                """,
+                (materialized_at, trial_execution_id),
+            )
+            return materialized_at
 
     def transition_trial(self, trial_execution_id: str, target: TrialState) -> dict[str, Any]:
         target = TrialState(target)

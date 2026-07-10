@@ -41,7 +41,7 @@ class AsyncTrialRegistryTest(unittest.TestCase):
             "trainer_run_id": "trainer-run-001",
             "batching_key": {
                 "dataset_name": "seta",
-                "ray_job_id": "ray-job-001",
+                "ray_submission_id": "ray-job-001",
                 "policy_version": "policy-0",
             },
             "trials": [
@@ -55,7 +55,7 @@ class AsyncTrialRegistryTest(unittest.TestCase):
                     "payload": {
                         "session_id": f"session-{index}",
                         "task_id": str(index),
-                        "ray_job_id": "ray-job-001",
+                        "ray_submission_id": "ray-job-001",
                     },
                 }
                 for index in range(trial_count)
@@ -118,6 +118,25 @@ class AsyncTrialRegistryTest(unittest.TestCase):
         self.assertEqual(self._table_count("async_trial_batches"), 1)
         self.assertEqual(self._table_count("trial_executions"), 2)
         self.assertEqual(self._table_count("enqueue_intents"), 2)
+
+    def test_materialized_enqueue_intent_is_durable_and_idempotent(self) -> None:
+        admission = self.registry.admit_batch(self._request())
+        trial_execution_id = admission.response["trials"][0]["trial_execution_id"]
+
+        first_timestamp = self.registry.mark_enqueue_intent_materialized(trial_execution_id)
+        second_timestamp = self.registry.mark_enqueue_intent_materialized(trial_execution_id)
+
+        self.assertEqual(second_timestamp, first_timestamp)
+        pending = self.registry.list_enqueue_intents(
+            admission.batch_id,
+            unmaterialized_only=True,
+        )
+        self.assertEqual(len(pending), 1)
+        self.assertNotEqual(pending[0]["trial_execution_id"], trial_execution_id)
+
+        reopened = MODULE.AsyncTrialRegistry(self.db_path)
+        intents = reopened.list_enqueue_intents(admission.batch_id)
+        self.assertEqual(intents[0]["materialized_at"], first_timestamp)
 
     def test_admission_survives_fresh_python_process_and_retry(self) -> None:
         request = self._request()

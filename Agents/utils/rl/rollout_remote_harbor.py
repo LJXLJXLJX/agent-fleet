@@ -24,6 +24,12 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
+from async_trial_registry import (
+    AsyncTrialRegistry,
+    IdempotencyConflict,
+    InvalidAdmissionRequest,
+)
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATASET_NAME = os.environ.get("RL_DATASET_NAME", "seta")
@@ -43,9 +49,19 @@ ACTIVE_DIR = Path(os.environ.get("RL_ACTIVE_DIR", str(QUEUE_DIR / "active")))
 JOB_QUEUE_ROOT = Path(os.environ.get("RL_JOB_QUEUE_ROOT", str(QUEUE_DIR / "jobs")))
 JOB_RUNTIME_ROOT = Path(os.environ.get("RL_JOB_RUNTIME_ROOT", str(TRACE_LOG.parent / "rl-jobs")))
 ENABLE_DYNAMIC_JOB_ZELLIJ = os.environ.get("RL_DYNAMIC_JOB_ZELLIJ", "1").strip().lower() not in {"0", "false", "no", "off"}
+ENABLE_ASYNC_TRIAL_BATCHES = os.environ.get(
+    "RL_ASYNC_TRIAL_BATCHES_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+ASYNC_TRIAL_REGISTRY_PATH = Path(
+    os.environ.get("RL_ASYNC_TRIAL_REGISTRY_PATH", str(QUEUE_DIR / "async-trial-registry.sqlite3"))
+)
+ASYNC_MAX_TRIALS_PER_BATCH = int(os.environ.get("RL_ASYNC_MAX_TRIALS_PER_BATCH", "256"))
 JOB_ZELLIJ_LOCKS: dict[str, threading.Lock] = {}
 JOB_ZELLIJ_READY: dict[str, str] = {}
 JOB_ZELLIJ_LOCKS_GUARD = threading.Lock()
+ASYNC_MATERIALIZATION_LOCKS = tuple(threading.Lock() for _ in range(256))
+ASYNC_REGISTRY: AsyncTrialRegistry | None = None
+ASYNC_REGISTRY_GUARD = threading.Lock()
 
 
 def _now() -> str:
@@ -57,6 +73,18 @@ def _append_trace(event: dict[str, Any]) -> None:
     event = {k: v for k, v in event.items() if k != "api_key"}
     with TRACE_LOG.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n")
+
+
+def _async_registry() -> AsyncTrialRegistry:
+    global ASYNC_REGISTRY
+    with ASYNC_REGISTRY_GUARD:
+        if ASYNC_REGISTRY is None or ASYNC_REGISTRY.path != ASYNC_TRIAL_REGISTRY_PATH:
+            ASYNC_REGISTRY = AsyncTrialRegistry(ASYNC_TRIAL_REGISTRY_PATH)
+        return ASYNC_REGISTRY
+
+
+def _async_materialization_lock(trial_execution_id: str) -> threading.Lock:
+    return ASYNC_MATERIALIZATION_LOCKS[hash(trial_execution_id) % len(ASYNC_MATERIALIZATION_LOCKS)]
 
 
 def _metadata(request: dict[str, Any]) -> dict[str, Any]:
@@ -333,7 +361,190 @@ def resolve_task_path(request: dict[str, Any]) -> Path:
     return task_path
 
 
-def _enqueue_request(request: dict[str, Any]) -> tuple[str, Path]:
+def _without_client_api_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_client_api_keys(item)
+            for key, item in value.items()
+            if key.lower() != "api_key"
+        }
+    if isinstance(value, list):
+        return [_without_client_api_keys(item) for item in value]
+    return value
+
+
+def _normalize_async_batch_request(request: dict[str, Any]) -> dict[str, Any]:
+    request_id = request.get("request_id")
+    client_batch_id = request.get("client_batch_id")
+    trials = request.get("trials")
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise ValueError("request_id must be a non-empty string")
+    if not isinstance(client_batch_id, str) or not client_batch_id.strip():
+        raise ValueError("client_batch_id must be a non-empty string")
+    if not isinstance(trials, list) or not trials:
+        raise ValueError("trials must be a non-empty array")
+    if len(trials) > ASYNC_MAX_TRIALS_PER_BATCH:
+        raise ValueError(
+            f"trials exceeds RL_ASYNC_MAX_TRIALS_PER_BATCH={ASYNC_MAX_TRIALS_PER_BATCH}"
+        )
+
+    batching_key = request.get("batching_key")
+    batching_defaults = batching_key if isinstance(batching_key, dict) else {}
+    normalized_trials: list[dict[str, Any]] = []
+    client_trial_ids: set[str] = set()
+    for ordinal, trial in enumerate(trials):
+        if not isinstance(trial, dict):
+            raise ValueError(f"trials[{ordinal}] must be a JSON object")
+        client_trial_id = trial.get("client_trial_id")
+        if not isinstance(client_trial_id, str) or not client_trial_id.strip():
+            raise ValueError(f"trials[{ordinal}].client_trial_id must be a non-empty string")
+        if client_trial_id in client_trial_ids:
+            raise ValueError(f"duplicate client_trial_id {client_trial_id!r}")
+        client_trial_ids.add(client_trial_id)
+
+        raw_payload = trial.get("payload")
+        if not isinstance(raw_payload, dict):
+            raise ValueError(f"trials[{ordinal}].payload must be a JSON object")
+        payload = _without_client_api_keys(raw_payload)
+        for key in ("dataset_name", "dataset_root", "ray_submission_id"):
+            if payload.get(key) in (None, "") and batching_defaults.get(key) not in (None, ""):
+                payload[key] = batching_defaults[key]
+        for key in ("session_id", "task_id"):
+            envelope_value = trial.get(key)
+            payload_value = payload.get(key)
+            if envelope_value not in (None, "") and payload_value not in (None, ""):
+                if str(envelope_value) != str(payload_value):
+                    raise ValueError(
+                        f"trials[{ordinal}].{key} conflicts with trials[{ordinal}].payload.{key}"
+                    )
+            elif envelope_value not in (None, ""):
+                payload[key] = envelope_value
+        if payload.get("session_id") in (None, ""):
+            payload["session_id"] = client_trial_id
+
+        metadata = dict(_metadata(payload))
+        for key in ("group_id", "rollout_step", "policy_version"):
+            if key in trial and key not in metadata:
+                metadata[key] = trial[key]
+        if metadata:
+            payload["metadata"] = metadata
+
+        resolve_task_path(payload)
+        _dataset_root(payload.get("dataset_name"), payload.get("dataset_root"))
+        try:
+            _extract_ray_submission_id(payload)
+        except ValueError as exc:
+            raise ValueError(
+                f"trials[{ordinal}].payload requires top-level ray_submission_id in rollout mode"
+            ) from exc
+
+        normalized_trial = dict(trial)
+        normalized_trial["session_id"] = str(payload["session_id"])
+        normalized_trial["task_id"] = str(payload.get("task_id") or payload.get("task_path"))
+        normalized_trial["payload"] = payload
+        normalized_trials.append(normalized_trial)
+
+    normalized_request = dict(request)
+    normalized_request["trials"] = normalized_trials
+    return normalized_request
+
+
+def _queue_artifact_exists(queue_dir: Path, trial_execution_id: str) -> bool:
+    return any(
+        (queue_dir / state / f"{trial_execution_id}.json").exists()
+        for state in ("pending", "active", "results")
+    )
+
+
+def _async_execution_api_key(request: dict[str, Any]) -> str:
+    session_id = str(request.get("session_id") or "")
+    if DEFAULT_API_KEY_MODE == "session":
+        return session_id
+    return DEFAULT_API_KEY or session_id
+
+
+def _materialize_enqueue_intent(
+    registry: AsyncTrialRegistry,
+    intent: dict[str, Any],
+    trial_mapping: dict[str, Any],
+    zellij_sessions: dict[tuple[str, str], str],
+    *,
+    async_request_id: str,
+) -> None:
+    trial_execution_id = str(intent["trial_execution_id"])
+    with _async_materialization_lock(trial_execution_id):
+        request = dict(intent["payload"])
+        request["api_key"] = _async_execution_api_key(request)
+        ray_submission_id = _extract_ray_submission_id(request)
+        queue_dir = _queue_for_submission(ray_submission_id)
+        if not _queue_artifact_exists(queue_dir, trial_execution_id):
+            dataset_name = str(request.get("dataset_name") or DEFAULT_DATASET_NAME)
+            model_name = str(request.get("model_name") or DEFAULT_MODEL_NAME)
+            opik_project_name = _extract_opik_project_name(request, ray_submission_id)
+            zellij_key = (ray_submission_id, dataset_name)
+            zellij_session = zellij_sessions.get(zellij_key)
+            if zellij_session is None:
+                zellij_session = _ensure_submission_zellij(
+                    ray_submission_id,
+                    dataset_name,
+                    queue_dir,
+                    model_name,
+                    opik_project_name,
+                )
+                zellij_sessions[zellij_key] = zellij_session
+            request.update(
+                {
+                    "request_id": trial_execution_id,
+                    "batch_id": intent["batch_id"],
+                    "trial_execution_id": trial_execution_id,
+                    "client_trial_id": trial_mapping["client_trial_id"],
+                    "logical_trial_id": trial_execution_id,
+                    "attempt_id": f"{trial_execution_id}:0",
+                    "attempt_number": 0,
+                    "async_request_id": async_request_id,
+                }
+            )
+            _enqueue_request(request, zellij_session=zellij_session)
+        registry.mark_enqueue_intent_materialized(trial_execution_id)
+
+
+def reconcile_async_batch(batch_id: str) -> int:
+    """Materialize all durable intents that do not yet have a queue artifact."""
+
+    registry = _async_registry()
+    batch = registry.get_batch(batch_id)
+    trial_mappings = {
+        trial["trial_execution_id"]: trial
+        for trial in batch["trials"]
+    }
+    zellij_sessions: dict[tuple[str, str], str] = {}
+    materialized = 0
+    for intent in registry.list_enqueue_intents(batch_id, unmaterialized_only=True):
+        trial_execution_id = str(intent["trial_execution_id"])
+        _materialize_enqueue_intent(
+            registry,
+            intent,
+            trial_mappings[trial_execution_id],
+            zellij_sessions,
+            async_request_id=str(batch["request_id"]),
+        )
+        materialized += 1
+    return materialized
+
+
+def _submit_async_trial_batch(request: dict[str, Any]) -> dict[str, Any]:
+    normalized_request = _normalize_async_batch_request(request)
+    registry = _async_registry()
+    admission = registry.admit_batch(normalized_request)
+    reconcile_async_batch(admission.batch_id)
+    return admission.response
+
+
+def _enqueue_request(
+    request: dict[str, Any],
+    *,
+    zellij_session: str | None = None,
+) -> tuple[str, Path]:
     request_id = request.get("request_id") or uuid4().hex[:12]
     session_id = request.get("session_id") or uuid4().hex
     task_path = resolve_task_path(request)
@@ -348,7 +559,7 @@ def _enqueue_request(request: dict[str, Any]) -> tuple[str, Path]:
     pending_dir = queue_dir / "pending"
     results_dir = queue_dir / "results"
     active_dir = queue_dir / "active"
-    zellij_session = _ensure_submission_zellij(
+    zellij_session = zellij_session or _ensure_submission_zellij(
         ray_submission_id,
         dataset_name,
         queue_dir,
@@ -450,6 +661,9 @@ class Handler(BaseHTTPRequestHandler):
                     "queue_dir": str(QUEUE_DIR),
                     "job_queue_root": str(JOB_QUEUE_ROOT),
                     "dynamic_job_zellij": ENABLE_DYNAMIC_JOB_ZELLIJ,
+                    "async_trial_batches_enabled": ENABLE_ASYNC_TRIAL_BATCHES,
+                    "async_trial_registry_path": str(ASYNC_TRIAL_REGISTRY_PATH),
+                    "async_max_trials_per_batch": ASYNC_MAX_TRIALS_PER_BATCH,
                     "trace_log": str(TRACE_LOG),
                 })
                 return
@@ -474,7 +688,44 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}})
 
     def do_POST(self) -> None:  # noqa: N802
-        if urlparse(self.path).path != "/run_trial":
+        path = urlparse(self.path).path
+        if path == "/async_trial_batches" and ENABLE_ASYNC_TRIAL_BATCHES:
+            try:
+                response = _submit_async_trial_batch(self._read_json())
+                self._send_json(HTTPStatus.ACCEPTED, response)
+            except IdempotencyConflict as exc:
+                self._send_json(
+                    HTTPStatus.CONFLICT,
+                    {
+                        "detail": {
+                            "exception_type": type(exc).__name__,
+                            "exception_message": str(exc),
+                            "request_id": exc.request_id,
+                        }
+                    },
+                )
+            except (ValueError, FileNotFoundError, InvalidAdmissionRequest) as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "detail": {
+                            "exception_type": type(exc).__name__,
+                            "exception_message": str(exc),
+                        }
+                    },
+                )
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "detail": {
+                            "exception_type": type(exc).__name__,
+                            "exception_message": str(exc),
+                        }
+                    },
+                )
+            return
+        if path != "/run_trial":
             self._send_json(HTTPStatus.NOT_FOUND, {"detail": "not found"})
             return
         started = time.monotonic()
