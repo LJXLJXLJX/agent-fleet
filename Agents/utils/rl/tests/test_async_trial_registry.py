@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Contract tests for durable async trial batch admission."""
+
+from __future__ import annotations
+
+import copy
+import importlib.util
+import json
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from pathlib import Path
+
+
+SCRIPT = Path(__file__).parents[1] / "async_trial_registry.py"
+SPEC = importlib.util.spec_from_file_location("async_trial_registry", SCRIPT)
+assert SPEC and SPEC.loader
+MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
+SPEC.loader.exec_module(MODULE)
+
+
+class AsyncTrialRegistryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "registry.sqlite3"
+        self.registry = MODULE.AsyncTrialRegistry(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _request(request_id: str = "request-001", trial_count: int = 2) -> dict[str, object]:
+        return {
+            "request_id": request_id,
+            "client_batch_id": f"client-{request_id}",
+            "trainer_run_id": "trainer-run-001",
+            "batching_key": {
+                "dataset_name": "seta",
+                "ray_job_id": "ray-job-001",
+                "policy_version": "policy-0",
+            },
+            "trials": [
+                {
+                    "client_trial_id": f"session-{index}",
+                    "session_id": f"session-{index}",
+                    "task_id": str(index),
+                    "group_id": index,
+                    "rollout_step": 0,
+                    "policy_version": "policy-0",
+                    "payload": {
+                        "session_id": f"session-{index}",
+                        "task_id": str(index),
+                        "ray_job_id": "ray-job-001",
+                    },
+                }
+                for index in range(trial_count)
+            ],
+        }
+
+    def _table_count(self, table: str) -> int:
+        self.assertIn(
+            table,
+            {
+                "async_trial_batches",
+                "trial_executions",
+                "enqueue_intents",
+                "idempotency_records",
+            },
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+    def test_admission_persists_batch_trials_intents_and_original_response(self) -> None:
+        request = self._request()
+
+        admission = self.registry.admit_batch(request)
+
+        self.assertTrue(admission.created)
+        self.assertEqual(admission.response["state"], "QUEUED")
+        self.assertEqual(admission.response["revision"], 1)
+        self.assertEqual(admission.response["requested_trials"], 2)
+        self.assertEqual(self._table_count("async_trial_batches"), 1)
+        self.assertEqual(self._table_count("trial_executions"), 2)
+        self.assertEqual(self._table_count("enqueue_intents"), 2)
+        self.assertEqual(self._table_count("idempotency_records"), 1)
+
+        reopened = MODULE.AsyncTrialRegistry(self.db_path)
+        persisted = reopened.get_admission("request-001")
+        self.assertIsNotNone(persisted)
+        self.assertEqual(persisted.response, admission.response)
+        batch = reopened.get_batch(admission.batch_id)
+        self.assertEqual(batch["request_id"], "request-001")
+        self.assertEqual(batch["queued_trials"], 2)
+        self.assertEqual(
+            [trial["client_trial_id"] for trial in batch["trials"]],
+            ["session-0", "session-1"],
+        )
+        intents = reopened.list_enqueue_intents(admission.batch_id)
+        self.assertEqual(
+            [intent["payload"]["session_id"] for intent in intents],
+            ["session-0", "session-1"],
+        )
+
+    def test_same_request_returns_original_admission_without_duplicate_records(self) -> None:
+        request = self._request()
+
+        first = self.registry.admit_batch(request)
+        second = self.registry.admit_batch(copy.deepcopy(request))
+
+        self.assertTrue(first.created)
+        self.assertFalse(second.created)
+        self.assertEqual(second.response, first.response)
+        self.assertEqual(self._table_count("async_trial_batches"), 1)
+        self.assertEqual(self._table_count("trial_executions"), 2)
+        self.assertEqual(self._table_count("enqueue_intents"), 2)
+
+    def test_admission_survives_fresh_python_process_and_retry(self) -> None:
+        request = self._request()
+        first = self.registry.admit_batch(request)
+        request_path = Path(self.temp_dir.name) / "request.json"
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        child_program = """
+import importlib.util
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+module_path, database_path, request_path = sys.argv[1:4]
+spec = importlib.util.spec_from_file_location("child_async_trial_registry", module_path)
+assert spec and spec.loader
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+registry = module.AsyncTrialRegistry(database_path)
+request = json.loads(Path(request_path).read_text(encoding="utf-8"))
+admission = registry.admit_batch(request)
+connection = sqlite3.connect(database_path)
+try:
+    journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+finally:
+    connection.close()
+print(json.dumps({
+    "created": admission.created,
+    "response": admission.response,
+    "journal_mode": journal_mode,
+    "sqlite_version": sqlite3.sqlite_version,
+}))
+"""
+
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                child_program,
+                str(SCRIPT),
+                str(self.db_path),
+                str(request_path),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        recovered = json.loads(child.stdout)
+        self.assertFalse(recovered["created"])
+        self.assertEqual(recovered["response"], first.response)
+        self.assertEqual(recovered["journal_mode"], "wal")
+        self.assertEqual(recovered["sqlite_version"], sqlite3.sqlite_version)
+        self.assertEqual(self._table_count("async_trial_batches"), 1)
+        self.assertEqual(self._table_count("trial_executions"), 2)
+        self.assertEqual(self._table_count("enqueue_intents"), 2)
+        self.assertEqual(self._table_count("idempotency_records"), 1)
+
+    def test_same_request_id_with_different_payload_conflicts(self) -> None:
+        original = self._request()
+        changed = copy.deepcopy(original)
+        changed["trials"][0]["payload"]["task_id"] = "different"
+        self.registry.admit_batch(original)
+
+        with self.assertRaises(MODULE.IdempotencyConflict) as raised:
+            self.registry.admit_batch(changed)
+
+        self.assertEqual(raised.exception.request_id, "request-001")
+        self.assertNotEqual(
+            raised.exception.existing_digest,
+            raised.exception.supplied_digest,
+        )
+        self.assertEqual(self._table_count("async_trial_batches"), 1)
+        self.assertEqual(self._table_count("trial_executions"), 2)
+
+    def test_canonical_digest_ignores_json_object_key_order(self) -> None:
+        request = self._request(trial_count=1)
+        reordered = json.loads(json.dumps(request, sort_keys=True))
+
+        self.assertEqual(
+            MODULE.canonical_request_digest(request),
+            MODULE.canonical_request_digest(reordered),
+        )
+
+    def test_invalid_batch_is_rejected_before_any_record_is_written(self) -> None:
+        request = self._request()
+        request["trials"][1]["client_trial_id"] = "session-0"
+
+        with self.assertRaises(MODULE.InvalidAdmissionRequest):
+            self.registry.admit_batch(request)
+
+        self.assertEqual(self._table_count("async_trial_batches"), 0)
+        self.assertEqual(self._table_count("trial_executions"), 0)
+        self.assertEqual(self._table_count("enqueue_intents"), 0)
+        self.assertEqual(self._table_count("idempotency_records"), 0)
+
+    def test_mid_transaction_database_failure_rolls_back_all_records(self) -> None:
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER reject_second_trial
+                BEFORE INSERT ON trial_executions
+                WHEN NEW.client_trial_id = 'session-1'
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected admission failure');
+                END
+                """
+            )
+            connection.commit()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.registry.admit_batch(self._request())
+
+        self.assertEqual(self._table_count("async_trial_batches"), 0)
+        self.assertEqual(self._table_count("trial_executions"), 0)
+        self.assertEqual(self._table_count("enqueue_intents"), 0)
+        self.assertEqual(self._table_count("idempotency_records"), 0)
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("DROP TRIGGER reject_second_trial")
+            connection.commit()
+        retry = self.registry.admit_batch(self._request())
+        self.assertTrue(retry.created)
+        self.assertEqual(self._table_count("async_trial_batches"), 1)
+        self.assertEqual(self._table_count("trial_executions"), 2)
+        self.assertEqual(self._table_count("enqueue_intents"), 2)
+        self.assertEqual(self._table_count("idempotency_records"), 1)
+
+    def test_concurrent_retries_create_one_batch_in_twenty_rounds(self) -> None:
+        for round_number in range(20):
+            request = self._request(f"concurrent-{round_number}", trial_count=1)
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                admissions = list(
+                    executor.map(lambda _: self.registry.admit_batch(request), range(8))
+                )
+
+            self.assertEqual(sum(admission.created for admission in admissions), 1)
+            self.assertEqual(len({admission.batch_id for admission in admissions}), 1)
+
+        self.assertEqual(self._table_count("async_trial_batches"), 20)
+        self.assertEqual(self._table_count("trial_executions"), 20)
+        self.assertEqual(self._table_count("enqueue_intents"), 20)
+        self.assertEqual(self._table_count("idempotency_records"), 20)
+
+    def test_trial_transitions_update_batch_revision_and_counters(self) -> None:
+        admission = self.registry.admit_batch(self._request())
+        first_trial_id = admission.response["trials"][0]["trial_execution_id"]
+        second_trial_id = admission.response["trials"][1]["trial_execution_id"]
+
+        running = self.registry.transition_trial(first_trial_id, MODULE.TrialState.RUNNING)
+        self.assertEqual(running["state"], "RUNNING")
+        self.assertEqual(running["revision"], 2)
+        self.assertEqual(running["queued_trials"], 1)
+        self.assertEqual(running["running_trials"], 1)
+
+        succeeded = self.registry.transition_trial(first_trial_id, MODULE.TrialState.SUCCEEDED)
+        self.assertEqual(succeeded["state"], "RUNNING")
+        self.assertEqual(succeeded["revision"], 3)
+        self.assertEqual(succeeded["succeeded_trials"], 1)
+        self.assertEqual(succeeded["queued_trials"], 1)
+
+        second_running = self.registry.transition_trial(second_trial_id, MODULE.TrialState.RUNNING)
+        self.assertEqual(second_running["revision"], 4)
+        completed = self.registry.transition_trial(second_trial_id, MODULE.TrialState.FAILED)
+        self.assertEqual(completed["state"], "COMPLETED")
+        self.assertEqual(completed["revision"], 5)
+        self.assertEqual(completed["succeeded_trials"], 1)
+        self.assertEqual(completed["failed_trials"], 1)
+        self.assertEqual(completed["running_trials"], 0)
+
+        unchanged = self.registry.transition_trial(second_trial_id, MODULE.TrialState.FAILED)
+        self.assertEqual(unchanged["revision"], 5)
+        with self.assertRaises(MODULE.InvalidStateTransition):
+            self.registry.transition_trial(second_trial_id, MODULE.TrialState.RUNNING)
+        self.assertEqual(self.registry.get_batch(admission.batch_id)["revision"], 5)
+
+    def test_schema_version_is_durable_and_incompatible_version_is_rejected(self) -> None:
+        self.assertEqual(self.registry.schema_version, 1)
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            connection.execute("PRAGMA user_version = 999")
+            connection.commit()
+
+        with self.assertRaises(MODULE.RegistrySchemaError):
+            MODULE.AsyncTrialRegistry(self.db_path)
+
+
+if __name__ == "__main__":
+    unittest.main()
