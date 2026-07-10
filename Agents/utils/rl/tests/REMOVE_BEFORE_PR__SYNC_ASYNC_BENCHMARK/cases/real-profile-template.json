@@ -1,0 +1,14 @@
+{
+  "name": "replace-with-real-profile-name",
+  "trials": 256,
+  "async_batch_size": 32,
+  "execution_capacity": 60,
+  "delay_profile": [
+    {"fraction": 0.5, "seconds": 30.0},
+    {"fraction": 0.4, "seconds": 120.0},
+    {"fraction": 0.09, "seconds": 300.0},
+    {"fraction": 0.01, "seconds": 420.0}
+  ],
+  "metric_interval_seconds": 0.1,
+  "classification": "template-replace-with-measured-quantiles-before-use"
+}

@@ -1,0 +1,9 @@
+{
+  "name": "smoke-32",
+  "trials": 32,
+  "async_batch_size": 16,
+  "execution_capacity": 32,
+  "delay_seconds": 2.0,
+  "metric_interval_seconds": 0.02,
+  "classification": "tool-smoke-not-production-evidence"
+}

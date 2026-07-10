@@ -1,0 +1,9 @@
+{
+  "name": "public-reference-128",
+  "trials": 128,
+  "async_batch_size": 32,
+  "execution_capacity": 128,
+  "delay_seconds": 30.0,
+  "metric_interval_seconds": 0.05,
+  "classification": "public-sample-count-reference-not-concurrency-norm"
+}

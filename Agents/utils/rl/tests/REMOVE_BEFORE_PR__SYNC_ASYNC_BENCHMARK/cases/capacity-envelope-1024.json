@@ -1,0 +1,9 @@
+{
+  "name": "capacity-envelope-1024",
+  "trials": 1024,
+  "async_batch_size": 32,
+  "execution_capacity": 1024,
+  "delay_seconds": 30.0,
+  "metric_interval_seconds": 0.05,
+  "classification": "control-plane-capacity-envelope-not-concurrency-norm"
+}

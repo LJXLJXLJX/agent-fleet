@@ -1,0 +1,13 @@
+{
+  "name": "incident-replay-320",
+  "trials": 320,
+  "async_batch_size": 32,
+  "execution_capacity": 320,
+  "delay_profile": [
+    {"fraction": 0.8, "seconds": 30.0},
+    {"fraction": 0.19, "seconds": 180.0},
+    {"fraction": 0.01, "seconds": 420.0}
+  ],
+  "metric_interval_seconds": 0.1,
+  "classification": "incident-shape-only-not-industry-baseline"
+}
