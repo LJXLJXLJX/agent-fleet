@@ -652,11 +652,29 @@ def _comparison(mode_summaries: dict[str, dict[str, Any]]) -> dict[str, Any] | N
     async_summary = mode_summaries.get("async")
     if sync is None or async_summary is None:
         return None
+    invalid_modes = [
+        mode
+        for mode, summary in (("sync", sync), ("async", async_summary))
+        if not summary.get("result_wait", {}).get("complete", False)
+        or summary["request_summary"]["transport_errors"] != 0
+        or summary["request_summary"]["accepted"] != summary["request_summary"]["requests"]
+    ]
+    if invalid_modes:
+        return {
+            "equal_workload_comparison_valid": False,
+            "invalid_modes": invalid_modes,
+            "sync_to_async_handler_thread_ratio": None,
+            "sync_to_async_established_tcp_ratio": None,
+            "sync_to_async_connection_seconds_ratio": None,
+            "async_to_sync_completion_throughput_ratio": None,
+        }
     sync_metrics = sync.get("server_metrics") or {}
     async_metrics = async_summary.get("server_metrics") or {}
     sync_peak = sync_metrics.get("peak") or {}
     async_peak = async_metrics.get("peak") or {}
     return {
+        "equal_workload_comparison_valid": True,
+        "invalid_modes": [],
         "sync_to_async_handler_thread_ratio": _ratio(
             sync_peak.get("handler_thread_delta"), async_peak.get("handler_thread_delta")
         ),
@@ -784,16 +802,27 @@ def _render_report(final_summary: dict[str, Any]) -> str:
 
     lines.extend(["", "## Comparison", ""])
     if comparison:
-        lines.extend(
-            [
-                "| Ratio | Value |",
-                "| --- | ---: |",
-                f"| Sync / async handler threads | {_display(comparison.get('sync_to_async_handler_thread_ratio'))} |",
-                f"| Sync / async established TCP | {_display(comparison.get('sync_to_async_established_tcp_ratio'))} |",
-                f"| Sync / async connection-seconds | {_display(comparison.get('sync_to_async_connection_seconds_ratio'))} |",
-                f"| Async / sync completion throughput | {_display(comparison.get('async_to_sync_completion_throughput_ratio'))} |",
-            ]
-        )
+        if comparison.get("equal_workload_comparison_valid", True):
+            lines.extend(
+                [
+                    "Equal-workload comparison: **valid**",
+                    "",
+                    "| Ratio | Value |",
+                    "| --- | ---: |",
+                    f"| Sync / async handler threads | {_display(comparison.get('sync_to_async_handler_thread_ratio'))} |",
+                    f"| Sync / async established TCP | {_display(comparison.get('sync_to_async_established_tcp_ratio'))} |",
+                    f"| Sync / async connection-seconds | {_display(comparison.get('sync_to_async_connection_seconds_ratio'))} |",
+                    f"| Async / sync completion throughput | {_display(comparison.get('async_to_sync_completion_throughput_ratio'))} |",
+                ]
+            )
+        else:
+            invalid_modes = ", ".join(comparison.get("invalid_modes", []))
+            lines.append("Equal-workload comparison: **invalid**")
+            lines.append("")
+            lines.append(
+                f"At least one mode was incomplete or had transport errors (`{invalid_modes}`). "
+                "Ratio fields are intentionally suppressed; use the per-mode raw measurements and failure counts."
+            )
     else:
         lines.append("A comparison requires both sync and async modes.")
 

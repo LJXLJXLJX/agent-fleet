@@ -158,7 +158,9 @@ resource ratios, integrity checks, and interpretation limits. `summary.json`
 remains the machine-readable evidence and includes individual request records.
 If one mode accepts only part of the workload, the runner records a failed
 partial report, prints progress, and continues with the other mode so the
-failure still has an A/B result.
+failure still has an A/B result. Equal-workload ratios are suppressed whenever
+either mode is incomplete or has transport errors; partial resource samples
+remain available in the per-mode summaries.
 
 ## Interpretation Limits
 
