@@ -36,6 +36,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--case", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, default=SCRIPT_DIR / "results")
     parser.add_argument("--async-batch-size", type=int)
+    parser.add_argument("--client-ramp-seconds", type=float)
     parser.add_argument("--skip-metrics", action="store_true")
     parser.add_argument("--modes", default="sync,async")
     return parser.parse_args()
@@ -54,6 +55,8 @@ def _load_case(path: Path) -> dict[str, Any]:
     capacity = int(value["execution_capacity"])
     if trials <= 0 or batch_size <= 0 or capacity <= 0:
         raise ValueError("trials, async_batch_size and execution_capacity must be positive")
+    if float(value.get("client_ramp_seconds", 0.0)) < 0:
+        raise ValueError("client_ramp_seconds must be non-negative")
     if "delay_seconds" not in value and "delay_profile" not in value:
         raise ValueError("case requires delay_seconds or delay_profile")
     if "delay_profile" in value:
@@ -99,8 +102,15 @@ def _request_json(
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     headers = {} if body is None else {"Content-Type": "application/json"}
     started = time.monotonic()
-    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+    connection = http.client.HTTPConnection(
+        parsed.hostname,
+        parsed.port,
+        timeout=min(timeout, 10.0),
+    )
     try:
+        connection.connect()
+        if connection.sock is not None:
+            connection.sock.settimeout(timeout)
         connection.request(method, parsed.path or "/", body=body, headers=headers)
         response = connection.getresponse()
         raw_body = response.read()
@@ -165,6 +175,31 @@ def _run_simultaneously(
         return [future.result(timeout=timeout) for future in futures]
 
 
+def _run_operations(
+    operations: list[Callable[[], dict[str, Any]]],
+    timeout: float,
+    ramp_seconds: float,
+) -> list[dict[str, Any]]:
+    if ramp_seconds <= 0 or len(operations) <= 1:
+        return _run_simultaneously(operations, timeout)
+
+    started = time.monotonic()
+
+    def invoke(index: int, operation: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        target = started + ramp_seconds * index / (len(operations) - 1)
+        remaining = target - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        return operation()
+
+    with ThreadPoolExecutor(max_workers=len(operations), thread_name_prefix="benchmark-client") as pool:
+        futures = [
+            pool.submit(invoke, index, operation)
+            for index, operation in enumerate(operations)
+        ]
+        return [future.result(timeout=timeout + ramp_seconds) for future in futures]
+
+
 def _sync_payload(index: int, run_token: str, work_dir: Path, timeout: float) -> dict[str, Any]:
     return {
         "request_id": f"sync-{run_token}-{index:05d}",
@@ -225,16 +260,33 @@ def _result_files(job_queue_root: Path) -> list[Path]:
     return list(job_queue_root.glob("*/results/*.json"))
 
 
-def _wait_for_results(job_queue_root: Path, expected: int, timeout: float) -> None:
+def _wait_for_results(
+    job_queue_root: Path,
+    expected: int,
+    timeout: float,
+    *,
+    raise_on_timeout: bool = True,
+    progress_label: str | None = None,
+) -> int:
     deadline = time.monotonic() + timeout
+    next_progress = time.monotonic() + 5.0
     while time.monotonic() < deadline:
-        if len(_result_files(job_queue_root)) >= expected:
-            return
+        actual = len(_result_files(job_queue_root))
+        if actual >= expected:
+            return actual
+        if progress_label is not None and time.monotonic() >= next_progress:
+            print(
+                f"progress mode={progress_label} results={actual}/{expected}",
+                flush=True,
+            )
+            next_progress = time.monotonic() + 5.0
         time.sleep(0.02)
-    raise TimeoutError(
-        f"timed out waiting for synthetic results: expected={expected}, "
-        f"actual={len(_result_files(job_queue_root))}"
-    )
+    actual = len(_result_files(job_queue_root))
+    if raise_on_timeout:
+        raise TimeoutError(
+            f"timed out waiting for synthetic results: expected={expected}, actual={actual}"
+        )
+    return actual
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -484,7 +536,11 @@ def _run_mode(
                 )
                 for index in range(trials)
             ]
-            requests = _run_simultaneously(operations, timeout + 30.0)
+            requests = _run_operations(
+                operations,
+                timeout + 30.0,
+                float(case.get("client_ramp_seconds", 0.0)),
+            )
             accepted_status = 200
             returned_mappings = None
         else:
@@ -508,7 +564,11 @@ def _run_mode(
                 )
                 for payload in payloads
             ]
-            requests = _run_simultaneously(operations, 60.0)
+            requests = _run_operations(
+                operations,
+                60.0,
+                float(case.get("client_ramp_seconds", 0.0)),
+            )
             accepted_status = 202
             returned_mappings = sum(
                 len(item["body"].get("trials", []))
@@ -516,7 +576,27 @@ def _run_mode(
                 if item["status"] == 202 and isinstance(item["body"], dict)
             )
 
-        _wait_for_results(work_dir / "queue" / "jobs", int(case["trials"]), timeout)
+        request_summary = _request_summary(requests, accepted_status)
+        print(
+            f"requests complete mode={mode} accepted={request_summary['accepted']}/"
+            f"{request_summary['requests']} transport_errors={request_summary['transport_errors']}",
+            flush=True,
+        )
+        expected_results = int(case["trials"])
+        expected_requests = expected_results if mode == "sync" else math.ceil(
+            expected_results / int(case["async_batch_size"])
+        )
+        all_requests_accepted = request_summary["accepted"] == expected_requests
+        result_wait_timeout = timeout if mode == "async" and all_requests_accepted else min(
+            10.0, timeout
+        )
+        observed_results = _wait_for_results(
+            work_dir / "queue" / "jobs",
+            expected_results,
+            result_wait_timeout,
+            raise_on_timeout=False,
+            progress_label=mode,
+        )
         wall_seconds = time.monotonic() - started
         if collector is not None:
             stop_file.write_text("stop\n", encoding="utf-8")
@@ -532,8 +612,14 @@ def _run_mode(
         summary = {
             "mode": mode,
             "wall_seconds": wall_seconds,
-            "request_summary": _request_summary(requests, accepted_status),
+            "request_summary": request_summary,
             "returned_trial_mappings": returned_mappings,
+            "result_wait": {
+                "expected": expected_results,
+                "observed": observed_results,
+                "complete": observed_results >= expected_results,
+                "timeout_seconds": result_wait_timeout,
+            },
             "queue_counts": queue_counts,
             "registry_counts": _registry_counts(work_dir / "registry.sqlite3"),
             "worker_audit": _audit_summary(audit),
@@ -676,10 +762,11 @@ def _render_report(final_summary: dict[str, Any]) -> str:
         "",
         "## Configuration",
         "",
-        "| Logical trials | Async batch size | Execution capacity | Delay |",
-        "| ---: | ---: | ---: | --- |",
+        "| Logical trials | Async batch size | Execution capacity | Client ramp | Delay |",
+        "| ---: | ---: | ---: | ---: | --- |",
         (
             f"| {case['trials']} | {case['async_batch_size']} | {case['execution_capacity']} | "
+            f"{_display(case.get('client_ramp_seconds', 0.0))}s | "
             f"{_display(case.get('delay_seconds', case.get('delay_profile')))} |"
         ),
         "",
@@ -785,6 +872,12 @@ def main() -> int:
         case = dict(case)
         case["async_batch_size"] = args.async_batch_size
         case["name"] = f"{case['name']}-batch-{args.async_batch_size}"
+    if args.client_ramp_seconds is not None:
+        if args.client_ramp_seconds < 0:
+            raise ValueError("--client-ramp-seconds must be non-negative")
+        case = dict(case)
+        case["client_ramp_seconds"] = args.client_ramp_seconds
+        case["name"] = f"{case['name']}-ramp-{args.client_ramp_seconds:g}s"
     modes = [item.strip() for item in args.modes.split(",") if item.strip()]
     if not modes or any(mode not in {"sync", "async"} for mode in modes):
         raise ValueError("--modes must contain sync and/or async")

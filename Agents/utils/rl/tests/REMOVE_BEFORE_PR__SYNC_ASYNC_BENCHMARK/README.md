@@ -75,6 +75,21 @@ bash Agents/utils/rl/tests/REMOVE_BEFORE_PR__SYNC_ASYNC_BENCHMARK/run_case.sh \
   --async-batch-size 64
 ```
 
+Cases use a simultaneous client burst by default. If that intentionally saturates
+the production-equivalent server listen backlog, rerun the same case with a
+bounded ramp to measure steady-state long-connection cost separately:
+
+```bash
+bash Agents/utils/rl/tests/REMOVE_BEFORE_PR__SYNC_ASYNC_BENCHMARK/run_case.sh \
+  --case Agents/utils/rl/tests/REMOVE_BEFORE_PR__SYNC_ASYNC_BENCHMARK/cases/public-reference-128.json \
+  --async-batch-size 32 \
+  --client-ramp-seconds 5
+```
+
+The burst and ramped runs answer different questions and must be reported
+separately. The runner preserves the real `ThreadingHTTPServer` listen backlog;
+it does not enlarge the benchmark server backlog to force the sync case to pass.
+
 For the target-server decision matrix, let the harness run cases and repetitions
 sequentially. This avoids overlapping sync and async measurements:
 
@@ -141,6 +156,9 @@ reporting a conclusion.
 `report.md` is the concise human-readable view: configuration, sync/async table,
 resource ratios, integrity checks, and interpretation limits. `summary.json`
 remains the machine-readable evidence and includes individual request records.
+If one mode accepts only part of the workload, the runner records a failed
+partial report, prints progress, and continues with the other mode so the
+failure still has an A/B result.
 
 ## Interpretation Limits
 

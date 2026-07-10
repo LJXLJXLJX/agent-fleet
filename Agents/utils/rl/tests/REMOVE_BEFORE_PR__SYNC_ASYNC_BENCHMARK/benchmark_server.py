@@ -66,7 +66,7 @@ def main() -> int:
     server = ThreadingHTTPServer((args.host, args.port), module.Handler)
     print(
         f"benchmark rollout server pid={os.getpid()} address={args.host}:{args.port} "
-        f"work_dir={work_dir}",
+        f"work_dir={work_dir} request_queue_size={server.request_queue_size}",
         flush=True,
     )
     server.serve_forever()
