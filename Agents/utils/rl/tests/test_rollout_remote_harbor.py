@@ -60,6 +60,8 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
             ENABLE_ASYNC_TRIAL_BATCHES=True,
             ASYNC_TRIAL_REGISTRY_PATH=self.root / "async-trial-registry.sqlite3",
             ASYNC_MAX_TRIALS_PER_BATCH=8,
+            ASYNC_MAX_REQUEST_BYTES=4096,
+            ASYNC_MAX_BULK_STATUS_IDS=3,
             ASYNC_REGISTRY=None,
         )
         self.module_patcher.start()
@@ -183,6 +185,8 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
         self.assertEqual(payload["queue_dir"], str(self.queue_root))
         self.assertEqual(payload["job_queue_root"], str(self.job_queue_root))
         self.assertFalse(payload["dynamic_job_zellij"])
+        self.assertEqual(payload["async_max_request_bytes"], 4096)
+        self.assertEqual(payload["async_max_bulk_status_ids"], 3)
 
     def test_unknown_get_and_post_paths_return_not_found(self) -> None:
         get_status, get_payload = self._request("GET", "/unknown")
@@ -609,6 +613,54 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
         self.assertFalse(MODULE.ASYNC_TRIAL_REGISTRY_PATH.exists())
         self.assertFalse(self.job_queue_root.exists())
         self.ensure_submission_zellij.assert_not_called()
+
+    def test_async_request_body_at_configured_limit_is_accepted(self) -> None:
+        body = json.dumps(self._valid_async_request(trial_count=1)).encode("utf-8")
+
+        with mock.patch.object(MODULE, "ASYNC_MAX_REQUEST_BYTES", len(body)):
+            status, response = self._request(
+                "POST",
+                "/async_trial_batches",
+                raw_body=body,
+            )
+
+        self.assertEqual(status, 202)
+        self.assertEqual(response["requested_trials"], 1)
+
+    def test_async_oversized_request_body_is_rejected_before_admission(self) -> None:
+        body = json.dumps(self._valid_async_request(trial_count=1)).encode("utf-8")
+
+        with mock.patch.object(MODULE, "ASYNC_MAX_REQUEST_BYTES", len(body) - 1):
+            status, response = self._request(
+                "POST",
+                "/async_trial_batches",
+                raw_body=body,
+            )
+
+        self.assertEqual(status, 413)
+        self.assertEqual(
+            response["detail"]["exception_type"],
+            "AsyncRequestBodyTooLarge",
+        )
+        self.assertFalse(MODULE.ASYNC_TRIAL_REGISTRY_PATH.exists())
+        self.assertFalse(self.job_queue_root.exists())
+        self.ensure_job_zellij.assert_not_called()
+
+    def test_async_bulk_status_id_limit_is_rejected_before_registry_open(self) -> None:
+        batch_ids = [f"atb-{index:032x}" for index in range(4)]
+
+        status, response = self._request(
+            "GET",
+            f"/async_trial_batches?ids={','.join(batch_ids)}",
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn(
+            "RL_ASYNC_MAX_BULK_STATUS_IDS=3",
+            response["detail"]["exception_message"],
+        )
+        self.assertFalse(MODULE.ASYNC_TRIAL_REGISTRY_PATH.exists())
+        self.ensure_job_zellij.assert_not_called()
 
     def test_async_same_request_id_with_changed_payload_returns_conflict(self) -> None:
         request = self._valid_async_request(trial_count=1)

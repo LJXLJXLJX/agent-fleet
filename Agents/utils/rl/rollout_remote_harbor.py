@@ -59,6 +59,10 @@ ASYNC_TRIAL_REGISTRY_PATH = Path(
     os.environ.get("RL_ASYNC_TRIAL_REGISTRY_PATH", str(QUEUE_DIR / "async-trial-registry.sqlite3"))
 )
 ASYNC_MAX_TRIALS_PER_BATCH = int(os.environ.get("RL_ASYNC_MAX_TRIALS_PER_BATCH", "256"))
+ASYNC_MAX_REQUEST_BYTES = int(
+    os.environ.get("RL_ASYNC_MAX_REQUEST_BYTES", str(32 * 1024 * 1024))
+)
+ASYNC_MAX_BULK_STATUS_IDS = int(os.environ.get("RL_ASYNC_MAX_BULK_STATUS_IDS", "128"))
 JOB_ZELLIJ_LOCKS: dict[str, threading.Lock] = {}
 JOB_ZELLIJ_READY: dict[str, str] = {}
 JOB_ZELLIJ_LOCKS_GUARD = threading.Lock()
@@ -66,6 +70,10 @@ ASYNC_MATERIALIZATION_LOCKS = tuple(threading.Lock() for _ in range(256))
 ASYNC_REGISTRY: AsyncTrialRegistry | None = None
 ASYNC_REGISTRY_GUARD = threading.Lock()
 ASYNC_BATCH_ID_PATTERN = re.compile(r"atb-[0-9a-f]{32}\Z")
+
+
+class AsyncRequestBodyTooLarge(ValueError):
+    """Raised before reading an oversized async admission request body."""
 
 
 def _now() -> str:
@@ -670,6 +678,11 @@ def _parse_async_batch_ids(query: dict[str, list[str]]) -> list[str]:
     ]
     if not batch_ids:
         raise ValueError("ids must contain at least one async trial batch id")
+    if len(batch_ids) > ASYNC_MAX_BULK_STATUS_IDS:
+        raise ValueError(
+            "ids exceeds "
+            f"RL_ASYNC_MAX_BULK_STATUS_IDS={ASYNC_MAX_BULK_STATUS_IDS}"
+        )
     return list(dict.fromkeys(_validate_async_batch_id(batch_id) for batch_id in batch_ids))
 
 
@@ -823,10 +836,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_json(self) -> dict[str, Any]:
+    def _read_json(self, *, max_bytes: int | None = None) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or "0")
         if length <= 0:
             return {}
+        if max_bytes is not None and length > max_bytes:
+            raise AsyncRequestBodyTooLarge(
+                f"request body exceeds RL_ASYNC_MAX_REQUEST_BYTES={max_bytes}"
+            )
         data = json.loads(self.rfile.read(length).decode("utf-8"))
         if not isinstance(data, dict):
             raise ValueError("request body must be a JSON object")
@@ -837,8 +854,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_async_trial_batch_submit(self) -> None:
         try:
-            response = _submit_async_trial_batch(self._read_json())
+            response = _submit_async_trial_batch(
+                self._read_json(max_bytes=ASYNC_MAX_REQUEST_BYTES)
+            )
             self._send_json(HTTPStatus.ACCEPTED, response)
+        except AsyncRequestBodyTooLarge as exc:
+            self._send_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                {
+                    "detail": {
+                        "exception_type": type(exc).__name__,
+                        "exception_message": str(exc),
+                    }
+                },
+            )
         except IdempotencyConflict as exc:
             self._send_json(
                 HTTPStatus.CONFLICT,
@@ -1030,6 +1059,8 @@ class Handler(BaseHTTPRequestHandler):
                     "async_trial_batches_enabled": ENABLE_ASYNC_TRIAL_BATCHES,
                     "async_trial_registry_path": str(ASYNC_TRIAL_REGISTRY_PATH),
                     "async_max_trials_per_batch": ASYNC_MAX_TRIALS_PER_BATCH,
+                    "async_max_request_bytes": ASYNC_MAX_REQUEST_BYTES,
+                    "async_max_bulk_status_ids": ASYNC_MAX_BULK_STATUS_IDS,
                     "trace_log": str(TRACE_LOG),
                 })
                 return
