@@ -26,7 +26,7 @@ from typing import Any
 from uuid import uuid4
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class BatchState(str, Enum):
@@ -407,7 +407,7 @@ class AsyncTrialRegistry:
                     batching_key_json, state, revision, requested_trials,
                     queued_trials, running_trials, succeeded_trials,
                     failed_trials, result_manifest_uri, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
                 """,
                 (
                     batch_id,
@@ -419,6 +419,7 @@ class AsyncTrialRegistry:
                     1,
                     len(trial_records),
                     len(trial_records),
+                    f"/async_trial_batches/{batch_id}/results",
                     created_at_text,
                     created_at_text,
                 ),
@@ -536,9 +537,60 @@ class AsyncTrialRegistry:
             "running_trials": row["running_trials"],
             "succeeded_trials": row["succeeded_trials"],
             "failed_trials": row["failed_trials"],
-            "result_manifest_uri": row["result_manifest_uri"],
+            "result_manifest_uri": row["result_manifest_uri"]
+            or f"/async_trial_batches/{batch_id}/results",
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+        }
+
+    def get_batch_result_records(self, batch_id: str) -> dict[str, Any]:
+        """Return one consistent view of terminal result ownership for a batch."""
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT batch.batch_id, batch.state AS batch_state, batch.revision,
+                       batch.requested_trials, batch.succeeded_trials,
+                       batch.failed_trials, batch.result_manifest_uri,
+                       trial.trial_execution_id, trial.client_trial_id,
+                       trial.state AS trial_state, trial.result_uri,
+                       trial.normalized_error_category
+                FROM async_trial_batches AS batch
+                LEFT JOIN trial_executions AS trial
+                  ON trial.batch_id = batch.batch_id
+                 AND trial.state IN ('SUCCEEDED', 'FAILED')
+                WHERE batch.batch_id = ?
+                ORDER BY trial.ordinal
+                """,
+                (batch_id,),
+            ).fetchall()
+        if not rows:
+            raise BatchNotFound(batch_id)
+
+        first = rows[0]
+        results = [
+            {
+                "client_trial_id": row["client_trial_id"],
+                "trial_execution_id": row["trial_execution_id"],
+                "state": row["trial_state"],
+                "result_uri": row["result_uri"],
+                "error_category": row["normalized_error_category"],
+            }
+            for row in rows
+            if row["trial_execution_id"] is not None
+        ]
+        return {
+            "batch_id": batch_id,
+            "name": f"async_trial_batches/{batch_id}/results",
+            "state": first["batch_state"],
+            "revision": first["revision"],
+            "requested_trials": first["requested_trials"],
+            "succeeded_trials": first["succeeded_trials"],
+            "failed_trials": first["failed_trials"],
+            "terminal_trials": len(results),
+            "result_manifest_uri": first["result_manifest_uri"]
+            or f"/async_trial_batches/{batch_id}/results",
+            "results": results,
         }
 
     def _get_batch(self, connection: sqlite3.Connection, batch_id: str) -> dict[str, Any]:

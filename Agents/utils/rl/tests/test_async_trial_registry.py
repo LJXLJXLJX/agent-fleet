@@ -198,6 +198,56 @@ print(json.dumps({
         self.assertEqual(self._table_count("enqueue_intents"), 2)
         self.assertEqual(self._table_count("idempotency_records"), 1)
 
+    def test_terminal_result_record_survives_fresh_python_process(self) -> None:
+        admission = self.registry.admit_batch(self._request(trial_count=1))
+        trial_execution_id = admission.response["trials"][0]["trial_execution_id"]
+        result_path = Path(self.temp_dir.name) / "result.json"
+        result_path.write_text(json.dumps({"ok": True, "reward": 1.0}), encoding="utf-8")
+        self.registry.reconcile_batch_trial_states(
+            admission.batch_id,
+            {
+                trial_execution_id: MODULE.TrialStateObservation(
+                    MODULE.TrialState.SUCCEEDED,
+                    result_uri=str(result_path),
+                )
+            },
+        )
+        child_program = """
+import importlib.util
+import json
+import sys
+
+module_path, database_path, batch_id = sys.argv[1:4]
+spec = importlib.util.spec_from_file_location("child_async_trial_registry", module_path)
+assert spec and spec.loader
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+registry = module.AsyncTrialRegistry(database_path)
+print(json.dumps(registry.get_batch_result_records(batch_id)))
+"""
+
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                child_program,
+                str(SCRIPT),
+                str(self.db_path),
+                admission.batch_id,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        recovered = json.loads(child.stdout)
+        self.assertEqual(recovered["state"], "COMPLETED")
+        self.assertEqual(recovered["terminal_trials"], 1)
+        self.assertEqual(recovered["results"][0]["result_uri"], str(result_path))
+
     def test_same_request_id_with_different_payload_conflicts(self) -> None:
         original = self._request()
         changed = copy.deepcopy(original)
@@ -320,6 +370,7 @@ print(json.dumps({
                 )
             },
         )
+        result_records = self.registry.get_batch_result_records(admission.batch_id)
 
         self.assertEqual(partially_completed["state"], "RUNNING")
         self.assertEqual(partially_completed["queued_trials"], 1)
@@ -331,6 +382,16 @@ print(json.dumps({
         self.assertEqual(completed["revision"], 3)
         self.assertEqual(repeated["revision"], 2)
         self.assertEqual(stale_active_observation["revision"], 2)
+        self.assertEqual(result_records["state"], "COMPLETED")
+        self.assertEqual(result_records["terminal_trials"], 2)
+        self.assertEqual(
+            [result["client_trial_id"] for result in result_records["results"]],
+            ["session-0", "session-1"],
+        )
+        self.assertEqual(
+            result_records["result_manifest_uri"],
+            f"/async_trial_batches/{admission.batch_id}/results",
+        )
         self.assertEqual(
             self.registry.get_batch(admission.batch_id)["trials"][0]["result_uri"],
             "/tmp/result.json",
@@ -355,7 +416,7 @@ print(json.dumps({
         self.assertEqual(snapshots[0]["queued_trials"], 1)
 
     def test_schema_version_is_durable_and_incompatible_version_is_rejected(self) -> None:
-        self.assertEqual(self.registry.schema_version, 1)
+        self.assertEqual(self.registry.schema_version, 2)
         with closing(sqlite3.connect(self.db_path)) as connection:
             connection.execute("PRAGMA user_version = 999")
             connection.commit()

@@ -546,12 +546,19 @@ def _validate_async_batch_id(batch_id: str) -> str:
     return batch_id
 
 
+def _load_worker_result(result_path: Path) -> dict[str, Any]:
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    if not isinstance(result, dict):
+        raise ValueError("worker result must be a JSON object")
+    return result
+
+
 def _observed_result_state(result_path: Path) -> tuple[TrialState, str | None]:
     try:
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        result = _load_worker_result(result_path)
+    except (OSError, ValueError):
         return TrialState.FAILED, "MALFORMED_WORKER_RESULT"
-    if isinstance(result, dict) and result.get("ok") is True:
+    if result.get("ok") is True:
         return TrialState.SUCCEEDED, None
     return TrialState.FAILED, "WORKER_RESULT_FAILED"
 
@@ -634,6 +641,44 @@ def get_async_batch_snapshots(batch_ids: list[str]) -> dict[str, Any]:
         "batches": snapshots,
         "missing_ids": missing_ids,
     }
+
+
+def get_async_batch_results(batch_id: str) -> dict[str, Any]:
+    """Return terminal worker results using the existing /run_trial payload shape."""
+
+    batch_id = _validate_async_batch_id(batch_id)
+    reconcile_async_batch_status(batch_id)
+    manifest = _async_registry().get_batch_result_records(batch_id)
+    records = manifest.pop("results")
+    delivered: list[dict[str, Any]] = []
+    unavailable = 0
+
+    for record in records:
+        entry = {
+            "client_trial_id": record["client_trial_id"],
+            "trial_execution_id": record["trial_execution_id"],
+            "state": record["state"],
+        }
+        error_category = record["error_category"]
+        result_uri = record["result_uri"]
+        try:
+            if not isinstance(result_uri, str) or not result_uri:
+                raise FileNotFoundError("terminal trial has no result artifact")
+            entry["result"] = _load_worker_result(Path(result_uri))
+            if error_category is not None:
+                entry["error_category"] = error_category
+        except (OSError, ValueError):
+            unavailable += 1
+            entry["result"] = None
+            entry["error"] = {
+                "category": error_category or "RESULT_ARTIFACT_UNAVAILABLE",
+            }
+        delivered.append(entry)
+
+    manifest["available_results"] = len(delivered) - unavailable
+    manifest["unavailable_results"] = unavailable
+    manifest["results"] = delivered
+    return manifest
 
 
 def _submit_async_trial_batch(request: dict[str, Any]) -> dict[str, Any]:
@@ -819,6 +864,25 @@ class Handler(BaseHTTPRequestHandler):
                 {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
             )
 
+    def _handle_async_trial_batch_results_get(self, batch_id: str) -> None:
+        try:
+            self._send_json(HTTPStatus.OK, get_async_batch_results(batch_id))
+        except ValueError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+            )
+        except BatchNotFound as exc:
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+            )
+
     def _send_run_trial_error(
         self,
         status: HTTPStatus,
@@ -893,9 +957,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             async_batch_prefix = "/async_trial_batches/"
             if parsed.path.startswith(async_batch_prefix):
-                batch_id = parsed.path[len(async_batch_prefix):]
-                if ENABLE_ASYNC_TRIAL_BATCHES and batch_id and "/" not in batch_id:
-                    self._handle_async_trial_batch_get(batch_id)
+                suffix = parsed.path[len(async_batch_prefix):]
+                parts = suffix.split("/")
+                if not ENABLE_ASYNC_TRIAL_BATCHES:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"detail": "not found"})
+                # GET /async_trial_batches/{batch_id}
+                elif len(parts) == 1 and parts[0]:
+                    self._handle_async_trial_batch_get(parts[0])
+                # GET /async_trial_batches/{batch_id}/results
+                elif len(parts) == 2 and parts[0] and parts[1] == "results":
+                    self._handle_async_trial_batch_results_get(parts[0])
                 else:
                     self._send_json(HTTPStatus.NOT_FOUND, {"detail": "not found"})
                 return

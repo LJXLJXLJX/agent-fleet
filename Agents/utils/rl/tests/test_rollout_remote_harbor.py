@@ -429,6 +429,108 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
         self.assertEqual(response["missing_ids"], [missing])
         self.assertNotIn("expired_ids", response)
 
+    def test_async_results_return_partial_exact_payloads_and_survive_registry_reopen(self) -> None:
+        _, admission = self._request(
+            "POST",
+            "/async_trial_batches",
+            self._valid_async_request(trial_count=2),
+        )
+        first_pending = self._async_queue_path(admission, 0, "pending")
+        first_active = self._async_queue_path(admission, 0, "active")
+        first_result = self._async_queue_path(admission, 0, "results")
+        second_pending = self._async_queue_path(admission, 1, "pending")
+        second_active = self._async_queue_path(admission, 1, "active")
+        second_result = self._async_queue_path(admission, 1, "results")
+        first_payload = {
+            "ok": True,
+            "task_id": "1",
+            "reward": 1.0,
+            "verifier_result": {"rewards": {"reward": 1.0}},
+            "large_result_body": "x" * 10_000,
+        }
+
+        first_pending.replace(first_active)
+        first_result.write_text(json.dumps(first_payload), encoding="utf-8")
+        first_active.unlink()
+        partial_status, partial = self._request(
+            "GET",
+            f"/async_trial_batches/{admission['batch_id']}/results",
+        )
+        _, repeated_partial = self._request(
+            "GET",
+            f"/async_trial_batches/{admission['batch_id']}/results",
+        )
+
+        self.assertEqual(partial_status, 200)
+        self.assertEqual(partial["state"], "RUNNING")
+        self.assertEqual(partial["requested_trials"], 2)
+        self.assertEqual(partial["terminal_trials"], 1)
+        self.assertEqual(partial["available_results"], 1)
+        self.assertEqual(partial["unavailable_results"], 0)
+        self.assertEqual(partial["results"][0]["result"], first_payload)
+        self.assertEqual(repeated_partial, partial)
+
+        second_payload = {
+            "ok": False,
+            "task_id": "1",
+            "reward": 0.0,
+            "exception_info": {"exception_type": "SyntheticFailure"},
+        }
+        second_pending.replace(second_active)
+        second_result.write_text(json.dumps(second_payload), encoding="utf-8")
+        second_active.unlink()
+        MODULE.ASYNC_REGISTRY = None
+
+        completed_status, completed = self._request(
+            "GET",
+            f"/async_trial_batches/{admission['batch_id']}/results",
+        )
+
+        self.assertEqual(completed_status, 200)
+        self.assertEqual(completed["state"], "COMPLETED")
+        self.assertEqual(completed["terminal_trials"], 2)
+        self.assertEqual(completed["available_results"], 2)
+        self.assertEqual(completed["unavailable_results"], 0)
+        self.assertEqual(
+            [result["result"] for result in completed["results"]],
+            [first_payload, second_payload],
+        )
+        self.assertEqual(completed["results"][1]["state"], "FAILED")
+        self.assertEqual(
+            completed["results"][1]["error_category"],
+            "WORKER_RESULT_FAILED",
+        )
+
+    def test_async_results_report_malformed_terminal_artifact_explicitly(self) -> None:
+        _, admission = self._request(
+            "POST",
+            "/async_trial_batches",
+            self._valid_async_request(trial_count=1),
+        )
+        pending = self._async_queue_path(admission, 0, "pending")
+        active = self._async_queue_path(admission, 0, "active")
+        result = self._async_queue_path(admission, 0, "results")
+        pending.replace(active)
+        result.write_text("{not-json", encoding="utf-8")
+        active.unlink()
+
+        status, response = self._request(
+            "GET",
+            f"/async_trial_batches/{admission['batch_id']}/results",
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["state"], "COMPLETED")
+        self.assertEqual(response["failed_trials"], 1)
+        self.assertEqual(response["terminal_trials"], 1)
+        self.assertEqual(response["available_results"], 0)
+        self.assertEqual(response["unavailable_results"], 1)
+        self.assertIsNone(response["results"][0]["result"])
+        self.assertEqual(
+            response["results"][0]["error"],
+            {"category": "MALFORMED_WORKER_RESULT"},
+        )
+
     def test_async_get_distinguishes_malformed_unknown_and_missing_ids(self) -> None:
         malformed_status, malformed = self._request(
             "GET",
@@ -438,12 +540,22 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
             "GET",
             f"/async_trial_batches/atb-{'0' * 32}",
         )
+        malformed_results_status, _ = self._request(
+            "GET",
+            "/async_trial_batches/not-a-batch-id/results",
+        )
+        unknown_results_status, _ = self._request(
+            "GET",
+            f"/async_trial_batches/atb-{'0' * 32}/results",
+        )
         missing_status, missing = self._request("GET", "/async_trial_batches")
 
         self.assertEqual(malformed_status, 400)
         self.assertEqual(malformed["detail"]["exception_type"], "ValueError")
         self.assertEqual(unknown_status, 404)
         self.assertEqual(unknown["detail"]["exception_type"], "BatchNotFound")
+        self.assertEqual(malformed_results_status, 400)
+        self.assertEqual(unknown_results_status, 404)
         self.assertEqual(missing_status, 400)
         self.assertIn("ids", missing["detail"]["exception_message"])
 
@@ -474,10 +586,15 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
                 "GET",
                 f"/async_trial_batches/atb-{'0' * 32}",
             )
+            results_status, results_response = self._request(
+                "GET",
+                f"/async_trial_batches/atb-{'0' * 32}/results",
+            )
 
         self.assertEqual((post_status, post_response), (404, {"detail": "not found"}))
         self.assertEqual((list_status, list_response), (404, {"detail": "not found"}))
         self.assertEqual((get_status, get_response), (404, {"detail": "not found"}))
+        self.assertEqual((results_status, results_response), (404, {"detail": "not found"}))
         self.assertFalse(MODULE.ASYNC_TRIAL_REGISTRY_PATH.exists())
         self.ensure_submission_zellij.assert_not_called()
 
