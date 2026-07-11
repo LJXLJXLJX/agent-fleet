@@ -83,6 +83,24 @@ def _submit(url: str, payload: dict[str, Any], timeout: float) -> tuple[int, dic
         return exc.code, body
 
 
+def _get_snapshot(url: str, batch_id: str, timeout: float) -> tuple[int, dict[str, Any]]:
+    request = urllib.request.Request(
+        f"{url.rstrip('/')}/async_trial_batches/{batch_id}",
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+            return response.status, body
+    except urllib.error.HTTPError as exc:
+        raw_body = exc.read().decode("utf-8", errors="replace")
+        try:
+            body = json.loads(raw_body)
+        except json.JSONDecodeError:
+            body = {"raw_body": raw_body}
+        return exc.code, body
+
+
 def _wait_for_queue_artifacts(
     queue_root: Path,
     ray_submission_id: str,
@@ -152,6 +170,24 @@ def main() -> int:
             summary["missing_queue_artifacts"] = sorted(trial_execution_ids - found.keys())
             print(json.dumps(summary, indent=2, sort_keys=True))
             return 1
+
+    recovery_started = time.monotonic()
+    snapshot_status, snapshot = _get_snapshot(
+        args.harbor_url,
+        str(response["batch_id"]),
+        args.timeout,
+    )
+    summary["state_recovery_ms"] = round(
+        (time.monotonic() - recovery_started) * 1000,
+        3,
+    )
+    summary["snapshot_http_status"] = snapshot_status
+    summary["snapshot_state"] = snapshot.get("state")
+    summary["snapshot_requested_trials"] = snapshot.get("requested_trials")
+    if snapshot_status != 200:
+        summary["snapshot_response"] = snapshot
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 1
 
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0

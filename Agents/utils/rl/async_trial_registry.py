@@ -117,6 +117,13 @@ TERMINAL_TRIAL_STATES = {
     TrialState.STALE_POST_EXECUTION,
 }
 
+OBSERVABLE_QUEUE_STATES = {
+    TrialState.QUEUED,
+    TrialState.RUNNING,
+    TrialState.SUCCEEDED,
+    TrialState.FAILED,
+}
+
 
 class RegistryError(RuntimeError):
     """Base class for registry failures that callers may classify."""
@@ -164,6 +171,13 @@ class AdmissionResult:
     @property
     def batch_id(self) -> str:
         return str(self.response["batch_id"])
+
+
+@dataclass(frozen=True)
+class TrialStateObservation:
+    state: TrialState
+    result_uri: str | None = None
+    normalized_error_category: str | None = None
 
 
 def _now() -> datetime:
@@ -538,6 +552,59 @@ class AsyncTrialRegistry:
         with self._connection() as connection:
             return self._get_batch(connection, batch_id)
 
+    def get_batch_snapshot(self, batch_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM async_trial_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+        if row is None:
+            raise BatchNotFound(batch_id)
+        return self._batch_snapshot(row)
+
+    def get_batch_snapshots(
+        self,
+        batch_ids: list[str],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        requested = list(dict.fromkeys(batch_ids))
+        if not requested:
+            return [], []
+        placeholders = ", ".join("?" for _ in requested)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM async_trial_batches WHERE batch_id IN ({placeholders})",
+                requested,
+            ).fetchall()
+        by_id = {str(row["batch_id"]): row for row in rows}
+        return (
+            [self._batch_snapshot(by_id[batch_id]) for batch_id in requested if batch_id in by_id],
+            [batch_id for batch_id in requested if batch_id not in by_id],
+        )
+
+    @staticmethod
+    def _batch_snapshot(row: sqlite3.Row) -> dict[str, Any]:
+        batch_id = str(row["batch_id"])
+        return {
+            "batch_id": batch_id,
+            "name": f"async_trial_batches/{batch_id}",
+            "request_id": row["request_id"],
+            "client_batch_id": row["client_batch_id"],
+            "trainer_run_id": row["trainer_run_id"],
+            "state": row["state"],
+            "revision": row["revision"],
+            "requested_trials": row["requested_trials"],
+            "queued_trials": row["queued_trials"],
+            "running_trials": row["running_trials"],
+            "succeeded_trials": row["succeeded_trials"],
+            "failed_trials": row["failed_trials"],
+            "cancelled_trials": row["cancelled_trials"],
+            "deadline_exceeded_trials": row["deadline_exceeded_trials"],
+            "stale_trials": row["stale_trials"],
+            "result_manifest_uri": row["result_manifest_uri"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
     def _get_batch(self, connection: sqlite3.Connection, batch_id: str) -> dict[str, Any]:
         batch = connection.execute(
             "SELECT * FROM async_trial_batches WHERE batch_id = ?",
@@ -593,6 +660,39 @@ class AsyncTrialRegistry:
                 "payload": json.loads(row["payload_json"]),
                 "materialized_at": row["materialized_at"],
                 "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def list_trial_reconciliation_records(self, batch_id: str) -> list[dict[str, Any]]:
+        """Read the queue locator and durable state needed by status reconciliation."""
+
+        with self._connection() as connection:
+            batch = connection.execute(
+                "SELECT batch_id FROM async_trial_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                raise BatchNotFound(batch_id)
+            rows = connection.execute(
+                """
+                SELECT trial.trial_execution_id, trial.state, trial.result_uri,
+                       trial.normalized_error_category, intent.payload_json
+                FROM trial_executions AS trial
+                JOIN enqueue_intents AS intent
+                  ON intent.trial_execution_id = trial.trial_execution_id
+                WHERE trial.batch_id = ?
+                ORDER BY trial.ordinal
+                """,
+                (batch_id,),
+            ).fetchall()
+        return [
+            {
+                "trial_execution_id": row["trial_execution_id"],
+                "state": row["state"],
+                "result_uri": row["result_uri"],
+                "normalized_error_category": row["normalized_error_category"],
+                "payload": json.loads(row["payload_json"]),
             }
             for row in rows
         ]
@@ -656,40 +756,145 @@ class AsyncTrialRegistry:
                 (target.value, updated_at, trial_execution_id),
             )
             batch_id = str(trial["batch_id"])
-            counters = self._trial_counters(connection, batch_id)
+            self._refresh_batch(connection, batch_id, updated_at)
+            return self._get_batch(connection, batch_id)
+
+    def reconcile_batch_trial_states(
+        self,
+        batch_id: str,
+        observations: Mapping[str, TrialStateObservation],
+    ) -> dict[str, Any]:
+        """Monotonically reconcile one batch from observed queue artifacts.
+
+        A restarted service may first observe a terminal result without ever
+        seeing the active file, so QUEUED -> terminal is valid here. Stale
+        pending/active observations never move a terminal trial backwards. All
+        observations are applied in one transaction and advance revision once.
+        """
+
+        updated_at = _format_time(_now())
+        with self._write_transaction() as connection:
             batch = connection.execute(
-                "SELECT state FROM async_trial_batches WHERE batch_id = ?",
+                "SELECT batch_id FROM async_trial_batches WHERE batch_id = ?",
                 (batch_id,),
             ).fetchone()
             if batch is None:
                 raise BatchNotFound(batch_id)
-            current_batch_state = BatchState(batch["state"])
-            target_batch_state = self._derive_batch_state(current_batch_state, counters)
-            validate_batch_transition(current_batch_state, target_batch_state)
-            connection.execute(
+
+            trials = connection.execute(
                 """
-                UPDATE async_trial_batches
-                SET state = ?, revision = revision + 1,
-                    queued_trials = ?, running_trials = ?,
-                    succeeded_trials = ?, failed_trials = ?,
-                    cancelled_trials = ?, deadline_exceeded_trials = ?,
-                    stale_trials = ?, updated_at = ?
+                SELECT trial_execution_id, state, result_uri,
+                       normalized_error_category
+                FROM trial_executions
                 WHERE batch_id = ?
                 """,
-                (
-                    target_batch_state.value,
-                    counters["queued_trials"],
-                    counters["running_trials"],
-                    counters["succeeded_trials"],
-                    counters["failed_trials"],
-                    counters["cancelled_trials"],
-                    counters["deadline_exceeded_trials"],
-                    counters["stale_trials"],
-                    updated_at,
-                    batch_id,
-                ),
-            )
-            return self._get_batch(connection, batch_id)
+                (batch_id,),
+            ).fetchall()
+            by_id = {str(trial["trial_execution_id"]): trial for trial in trials}
+            changed = False
+
+            for trial_execution_id, observation in observations.items():
+                observed = TrialState(observation.state)
+                if observed not in OBSERVABLE_QUEUE_STATES:
+                    raise InvalidStateTransition(
+                        f"queue reconciliation cannot observe trial state {observed.value}"
+                    )
+                trial = by_id.get(trial_execution_id)
+                if trial is None:
+                    raise TrialNotFound(trial_execution_id)
+
+                current = TrialState(trial["state"])
+                if current in TERMINAL_TRIAL_STATES and current != observed:
+                    continue
+
+                state_changed = current != observed and not (
+                    current == TrialState.RUNNING and observed == TrialState.QUEUED
+                )
+                if state_changed and not (
+                    current == TrialState.QUEUED and observed in TERMINAL_TRIAL_STATES
+                ):
+                    validate_trial_transition(current, observed)
+
+                result_uri = (
+                    observation.result_uri
+                    if trial["result_uri"] is None
+                    else None
+                )
+                error_category = (
+                    observation.normalized_error_category
+                    if trial["normalized_error_category"] is None
+                    else None
+                )
+                if not state_changed and result_uri is None and error_category is None:
+                    continue
+
+                connection.execute(
+                    """
+                    UPDATE trial_executions
+                    SET state = ?, result_uri = COALESCE(?, result_uri),
+                        normalized_error_category = COALESCE(?, normalized_error_category),
+                        updated_at = ?
+                    WHERE trial_execution_id = ?
+                    """,
+                    (
+                        observed.value if state_changed else current.value,
+                        result_uri,
+                        error_category,
+                        updated_at,
+                        trial_execution_id,
+                    ),
+                )
+                changed = True
+
+            if changed:
+                self._refresh_batch(connection, batch_id, updated_at)
+            row = connection.execute(
+                "SELECT * FROM async_trial_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if row is None:
+                raise BatchNotFound(batch_id)
+            return self._batch_snapshot(row)
+
+    def _refresh_batch(
+        self,
+        connection: sqlite3.Connection,
+        batch_id: str,
+        updated_at: str,
+    ) -> None:
+        counters = self._trial_counters(connection, batch_id)
+        batch = connection.execute(
+            "SELECT state FROM async_trial_batches WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if batch is None:
+            raise BatchNotFound(batch_id)
+        current_batch_state = BatchState(batch["state"])
+        target_batch_state = self._derive_batch_state(current_batch_state, counters)
+        validate_batch_transition(current_batch_state, target_batch_state)
+        connection.execute(
+            """
+            UPDATE async_trial_batches
+            SET state = ?, revision = revision + 1,
+                queued_trials = ?, running_trials = ?,
+                succeeded_trials = ?, failed_trials = ?,
+                cancelled_trials = ?, deadline_exceeded_trials = ?,
+                stale_trials = ?, updated_at = ?
+            WHERE batch_id = ?
+            """,
+            (
+                target_batch_state.value,
+                counters["queued_trials"],
+                counters["running_trials"],
+                counters["succeeded_trials"],
+                counters["failed_trials"],
+                counters["cancelled_trials"],
+                counters["deadline_exceeded_trials"],
+                counters["stale_trials"],
+                updated_at,
+                batch_id,
+            ),
+        )
 
     @staticmethod
     def _trial_counters(connection: sqlite3.Connection, batch_id: str) -> dict[str, int]:
@@ -729,6 +934,11 @@ class AsyncTrialRegistry:
             return BatchState.COMPLETED
         if current == BatchState.CANCEL_REQUESTED:
             return BatchState.CANCEL_REQUESTED
-        if counters["running_trials"] > 0 or current == BatchState.RUNNING:
+        observed_execution = counters["succeeded_trials"] + counters["failed_trials"] > 0
+        if (
+            counters["running_trials"] > 0
+            or observed_execution
+            or current == BatchState.RUNNING
+        ):
             return BatchState.RUNNING
         return BatchState.QUEUED

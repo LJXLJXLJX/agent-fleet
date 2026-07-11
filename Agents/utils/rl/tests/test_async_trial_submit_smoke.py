@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""In-repository 32-trial smoke for the async submit boundary."""
+"""In-repository 32-trial smoke for async submit and handle recovery."""
 
 from __future__ import annotations
 
@@ -104,6 +104,15 @@ class AsyncSubmitSmokeTest(unittest.TestCase):
             self.assertEqual(summary["returned_trial_mappings"], 32)
             self.assertEqual(summary["queue_artifacts"], 32)
             self.assertEqual(summary["queue_states"], {"active": 0, "pending": 32, "results": 0})
+            self.assertEqual(summary["snapshot_http_status"], 200)
+            self.assertEqual(summary["snapshot_state"], "QUEUED")
+            self.assertEqual(summary["snapshot_requested_trials"], 32)
+            self.assertGreaterEqual(summary["state_recovery_ms"], 0)
+            if os.environ.get("RL_TEST_REPORT_METRICS") == "1":
+                print(
+                    "async handle recovery: "
+                    f"state_recovery_ms={summary['state_recovery_ms']} unresolved=0"
+                )
             ensure_zellij.assert_called_once()
 
 

@@ -316,6 +316,76 @@ print(json.dumps({
             self.registry.transition_trial(second_trial_id, MODULE.TrialState.RUNNING)
         self.assertEqual(self.registry.get_batch(admission.batch_id)["revision"], 5)
 
+    def test_queue_reconciliation_is_monotonic_and_survives_missed_running_state(self) -> None:
+        admission = self.registry.admit_batch(self._request(trial_count=2))
+        first_trial_id = admission.response["trials"][0]["trial_execution_id"]
+        second_trial_id = admission.response["trials"][1]["trial_execution_id"]
+
+        partially_completed = self.registry.reconcile_batch_trial_states(
+            admission.batch_id,
+            {
+                first_trial_id: MODULE.TrialStateObservation(
+                    MODULE.TrialState.SUCCEEDED,
+                    result_uri="/tmp/result.json",
+                )
+            },
+        )
+        repeated = self.registry.reconcile_batch_trial_states(
+            admission.batch_id,
+            {
+                first_trial_id: MODULE.TrialStateObservation(
+                    MODULE.TrialState.SUCCEEDED,
+                    result_uri="/tmp/result.json",
+                )
+            },
+        )
+        stale_active_observation = self.registry.reconcile_batch_trial_states(
+            admission.batch_id,
+            {first_trial_id: MODULE.TrialStateObservation(MODULE.TrialState.RUNNING)},
+        )
+        completed = self.registry.reconcile_batch_trial_states(
+            admission.batch_id,
+            {
+                second_trial_id: MODULE.TrialStateObservation(
+                    MODULE.TrialState.FAILED,
+                    result_uri="/tmp/failed-result.json",
+                )
+            },
+        )
+
+        self.assertEqual(partially_completed["state"], "RUNNING")
+        self.assertEqual(partially_completed["queued_trials"], 1)
+        self.assertEqual(partially_completed["succeeded_trials"], 1)
+        self.assertEqual(partially_completed["revision"], 2)
+        self.assertEqual(completed["state"], "COMPLETED")
+        self.assertEqual(completed["succeeded_trials"], 1)
+        self.assertEqual(completed["failed_trials"], 1)
+        self.assertEqual(completed["revision"], 3)
+        self.assertEqual(repeated["revision"], 2)
+        self.assertEqual(stale_active_observation["revision"], 2)
+        self.assertEqual(
+            self.registry.get_batch(admission.batch_id)["trials"][0]["result_uri"],
+            "/tmp/result.json",
+        )
+
+    def test_compact_batch_snapshots_preserve_request_order_and_report_missing_ids(self) -> None:
+        first = self.registry.admit_batch(self._request("request-first", trial_count=1))
+        second = self.registry.admit_batch(self._request("request-second", trial_count=1))
+        missing = "atb-" + "0" * 32
+
+        snapshots, missing_ids = self.registry.get_batch_snapshots(
+            [second.batch_id, missing, first.batch_id, second.batch_id]
+        )
+
+        self.assertEqual(
+            [snapshot["batch_id"] for snapshot in snapshots],
+            [second.batch_id, first.batch_id],
+        )
+        self.assertEqual(missing_ids, [missing])
+        self.assertNotIn("trials", snapshots[0])
+        self.assertNotIn("batching_key", snapshots[0])
+        self.assertEqual(snapshots[0]["queued_trials"], 1)
+
     def test_schema_version_is_durable_and_incompatible_version_is_rejected(self) -> None:
         self.assertEqual(self.registry.schema_version, 1)
         with closing(sqlite3.connect(self.db_path)) as connection:

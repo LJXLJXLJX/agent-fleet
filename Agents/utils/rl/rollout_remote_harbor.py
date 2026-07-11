@@ -26,8 +26,11 @@ from uuid import uuid4
 
 from async_trial_registry import (
     AsyncTrialRegistry,
+    BatchNotFound,
     IdempotencyConflict,
     InvalidAdmissionRequest,
+    TrialState,
+    TrialStateObservation,
 )
 
 
@@ -62,6 +65,7 @@ JOB_ZELLIJ_LOCKS_GUARD = threading.Lock()
 ASYNC_MATERIALIZATION_LOCKS = tuple(threading.Lock() for _ in range(256))
 ASYNC_REGISTRY: AsyncTrialRegistry | None = None
 ASYNC_REGISTRY_GUARD = threading.Lock()
+ASYNC_BATCH_ID_PATTERN = re.compile(r"atb-[0-9a-f]{32}\Z")
 
 
 def _now() -> str:
@@ -539,6 +543,107 @@ def reconcile_async_batch(batch_id: str) -> int:
     return materialized
 
 
+def _validate_async_batch_id(batch_id: str) -> str:
+    if not ASYNC_BATCH_ID_PATTERN.fullmatch(batch_id):
+        raise ValueError(f"malformed async trial batch id: {batch_id!r}")
+    return batch_id
+
+
+def _observed_result_state(result_path: Path) -> tuple[TrialState, str | None]:
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return TrialState.FAILED, "MALFORMED_WORKER_RESULT"
+    if isinstance(result, dict) and result.get("ok") is True:
+        return TrialState.SUCCEEDED, None
+    return TrialState.FAILED, "WORKER_RESULT_FAILED"
+
+
+def reconcile_async_batch_status(batch_id: str) -> dict[str, Any]:
+    """Reconcile durable trial state from the existing file queue.
+
+    Stable snapshots remain read-only: SQLite takes a write transaction only
+    when a queue artifact reveals a state or terminal metadata change.
+    """
+
+    batch_id = _validate_async_batch_id(batch_id)
+    registry = _async_registry()
+    observations: dict[str, TrialStateObservation] = {}
+    for record in registry.list_trial_reconciliation_records(batch_id):
+        trial_execution_id = str(record["trial_execution_id"])
+        payload = record["payload"]
+        queue_dir = _queue_for_job(_extract_ray_job_id(payload))
+        pending_path = queue_dir / "pending" / f"{trial_execution_id}.json"
+        active_path = queue_dir / "active" / f"{trial_execution_id}.json"
+        result_path = queue_dir / "results" / f"{trial_execution_id}.json"
+
+        observation: TrialStateObservation | None = None
+        if result_path.exists():
+            state, error_category = _observed_result_state(result_path)
+            observation = TrialStateObservation(
+                state=state,
+                result_uri=str(result_path),
+                normalized_error_category=error_category,
+            )
+        elif active_path.exists():
+            observation = TrialStateObservation(TrialState.RUNNING)
+        elif pending_path.exists():
+            observation = TrialStateObservation(TrialState.QUEUED)
+
+        if observation is None:
+            continue
+        current = TrialState(record["state"])
+        if current in {
+            TrialState.SUCCEEDED,
+            TrialState.FAILED,
+            TrialState.CANCELLED,
+            TrialState.DEADLINE_EXCEEDED,
+            TrialState.STALE_PRE_EXECUTION,
+            TrialState.STALE_POST_EXECUTION,
+        } and current != observation.state:
+            continue
+        state_changed = current != observation.state and not (
+            current == TrialState.RUNNING and observation.state == TrialState.QUEUED
+        )
+        result_uri_missing = observation.result_uri is not None and record["result_uri"] is None
+        error_missing = (
+            observation.normalized_error_category is not None
+            and record["normalized_error_category"] is None
+        )
+        if state_changed or result_uri_missing or error_missing:
+            observations[trial_execution_id] = observation
+
+    if observations:
+        return registry.reconcile_batch_trial_states(batch_id, observations)
+    return registry.get_batch_snapshot(batch_id)
+
+
+def _parse_async_batch_ids(query: dict[str, list[str]]) -> list[str]:
+    batch_ids = [
+        item.strip()
+        for value in query.get("ids", [])
+        for item in value.split(",")
+        if item.strip()
+    ]
+    if not batch_ids:
+        raise ValueError("ids must contain at least one async trial batch id")
+    return list(dict.fromkeys(_validate_async_batch_id(batch_id) for batch_id in batch_ids))
+
+
+def get_async_batch_snapshots(batch_ids: list[str]) -> dict[str, Any]:
+    registry = _async_registry()
+    existing, missing_ids = registry.get_batch_snapshots(batch_ids)
+    snapshots = [
+        reconcile_async_batch_status(str(snapshot["batch_id"]))
+        for snapshot in existing
+    ]
+    return {
+        "batches": snapshots,
+        "missing_ids": missing_ids,
+        "expired_ids": [],
+    }
+
+
 def _submit_async_trial_batch(request: dict[str, Any]) -> dict[str, Any]:
     normalized_request = _validate_and_normalize_async_batch_request(request)
     registry = _async_registry()
@@ -686,6 +791,42 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
 
+    def _handle_async_trial_batch_get(self, batch_id: str) -> None:
+        try:
+            self._send_json(HTTPStatus.OK, reconcile_async_batch_status(batch_id))
+        except ValueError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+            )
+        except BatchNotFound as exc:
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+            )
+
+    def _handle_async_trial_batches_get(self, query: dict[str, list[str]]) -> None:
+        try:
+            self._send_json(
+                HTTPStatus.OK,
+                get_async_batch_snapshots(_parse_async_batch_ids(query)),
+            )
+        except ValueError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+            )
+
     def _send_run_trial_error(
         self,
         status: HTTPStatus,
@@ -752,6 +893,20 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         try:
+            if parsed.path == "/async_trial_batches":
+                if ENABLE_ASYNC_TRIAL_BATCHES:
+                    self._handle_async_trial_batches_get(query)
+                else:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"detail": "not found"})
+                return
+            async_batch_prefix = "/async_trial_batches/"
+            if parsed.path.startswith(async_batch_prefix):
+                batch_id = parsed.path[len(async_batch_prefix):]
+                if ENABLE_ASYNC_TRIAL_BATCHES and batch_id and "/" not in batch_id:
+                    self._handle_async_trial_batch_get(batch_id)
+                else:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"detail": "not found"})
+                return
             if parsed.path == "/health":
                 self._send_json(HTTPStatus.OK, {
                     "status": "ok",
