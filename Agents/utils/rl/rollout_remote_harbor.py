@@ -373,7 +373,14 @@ def _without_client_api_keys(value: Any) -> Any:
     return value
 
 
-def _normalize_async_batch_request(request: dict[str, Any]) -> dict[str, Any]:
+# Validate the batch envelope and every trial before any durable state is written.
+# This also removes client-supplied API keys, applies batch-level defaults, merges
+# envelope metadata into each legacy run_trial payload, rejects conflicting or
+# duplicate identifiers, and verifies task routing inputs. The resulting canonical
+# request is the value used for idempotency checks, persistence, and queue handoff.
+def _validate_and_normalize_async_batch_request(
+    request: dict[str, Any],
+) -> dict[str, Any]:
     request_id = request.get("request_id")
     client_batch_id = request.get("client_batch_id")
     trials = request.get("trials")
@@ -533,7 +540,7 @@ def reconcile_async_batch(batch_id: str) -> int:
 
 
 def _submit_async_trial_batch(request: dict[str, Any]) -> dict[str, Any]:
-    normalized_request = _normalize_async_batch_request(request)
+    normalized_request = _validate_and_normalize_async_batch_request(request)
     registry = _async_registry()
     admission = registry.admit_batch(normalized_request)
     reconcile_async_batch(admission.batch_id)
