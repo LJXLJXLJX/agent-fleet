@@ -521,6 +521,26 @@ class AsyncTrialRegistry:
             [batch_id for batch_id in requested if batch_id not in by_id],
         )
 
+    def list_recoverable_batch_ids(self) -> list[str]:
+        """Return batches whose durable work may still need startup reconciliation."""
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT batch.batch_id
+                FROM async_trial_batches AS batch
+                WHERE batch.state != 'COMPLETED'
+                   OR EXISTS (
+                       SELECT 1
+                       FROM enqueue_intents AS intent
+                       WHERE intent.batch_id = batch.batch_id
+                         AND intent.materialized_at IS NULL
+                   )
+                ORDER BY batch.created_at, batch.batch_id
+                """
+            ).fetchall()
+        return [str(row["batch_id"]) for row in rows]
+
     @staticmethod
     def _batch_snapshot(row: sqlite3.Row) -> dict[str, Any]:
         batch_id = str(row["batch_id"])
@@ -665,7 +685,8 @@ class AsyncTrialRegistry:
             rows = connection.execute(
                 """
                 SELECT trial.trial_execution_id, trial.state, trial.result_uri,
-                       trial.normalized_error_category, intent.payload_json
+                       trial.normalized_error_category, intent.payload_json,
+                       intent.materialized_at
                 FROM trial_executions AS trial
                 JOIN enqueue_intents AS intent
                   ON intent.trial_execution_id = trial.trial_execution_id
@@ -681,6 +702,7 @@ class AsyncTrialRegistry:
                 "result_uri": row["result_uri"],
                 "normalized_error_category": row["normalized_error_category"],
                 "payload": json.loads(row["payload_json"]),
+                "materialized_at": row["materialized_at"],
             }
             for row in rows
         ]

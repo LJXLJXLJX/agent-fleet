@@ -484,6 +484,12 @@ def _materialize_enqueue_intent(
 ) -> None:
     trial_execution_id = str(intent["trial_execution_id"])
     with _async_materialization_lock(trial_execution_id):
+        if TrialState(str(trial_mapping["state"])) in {
+            TrialState.SUCCEEDED,
+            TrialState.FAILED,
+        }:
+            registry.mark_enqueue_intent_materialized(trial_execution_id)
+            return
         request = dict(intent["payload"])
         request["api_key"] = _async_execution_api_key(request)
         ray_submission_id = _extract_ray_submission_id(request)
@@ -563,11 +569,17 @@ def _observed_result_state(result_path: Path) -> tuple[TrialState, str | None]:
     return TrialState.FAILED, "WORKER_RESULT_FAILED"
 
 
-def reconcile_async_batch_status(batch_id: str) -> dict[str, Any]:
+def reconcile_async_batch_status(
+    batch_id: str,
+    *,
+    fail_missing_materialized: bool = False,
+) -> dict[str, Any]:
     """Reconcile durable trial state from the existing file queue.
 
     Stable snapshots remain read-only: SQLite takes a write transaction only
     when a queue artifact reveals a state or terminal metadata change.
+    Startup recovery may additionally classify a previously materialized trial
+    with no remaining queue artifact as failed instead of executing it again.
     """
 
     batch_id = _validate_async_batch_id(batch_id)
@@ -594,9 +606,19 @@ def reconcile_async_batch_status(batch_id: str) -> dict[str, Any]:
         elif pending_path.exists():
             observation = TrialStateObservation(TrialState.QUEUED)
 
-        if observation is None:
-            continue
         current = TrialState(record["state"])
+        if observation is None:
+            if (
+                fail_missing_materialized
+                and record["materialized_at"] is not None
+                and current not in {TrialState.SUCCEEDED, TrialState.FAILED}
+            ):
+                observation = TrialStateObservation(
+                    TrialState.FAILED,
+                    normalized_error_category="QUEUE_ARTIFACT_MISSING",
+                )
+            else:
+                continue
         if (
             current in {TrialState.SUCCEEDED, TrialState.FAILED}
             and current != observation.state
@@ -616,6 +638,27 @@ def reconcile_async_batch_status(batch_id: str) -> dict[str, Any]:
     if observations:
         return registry.reconcile_batch_trial_states(batch_id, observations)
     return registry.get_batch_snapshot(batch_id)
+
+
+def reconcile_async_state_on_startup() -> dict[str, int]:
+    """Recover committed async work before the HTTP listener accepts traffic."""
+
+    registry = _async_registry()
+    batch_ids = registry.list_recoverable_batch_ids()
+    summary = {
+        "batches_scanned": len(batch_ids),
+        "intents_materialized": 0,
+        "completed_batches": 0,
+    }
+    for batch_id in batch_ids:
+        summary["intents_materialized"] += reconcile_async_batch(batch_id)
+        snapshot = reconcile_async_batch_status(
+            batch_id,
+            fail_missing_materialized=True,
+        )
+        if snapshot["state"] == "COMPLETED":
+            summary["completed_batches"] += 1
+    return summary
 
 
 def _parse_async_batch_ids(query: dict[str, list[str]]) -> list[str]:
@@ -1029,6 +1072,15 @@ def main() -> int:
     port = int(os.environ.get("RL_PORT", "19001"))
     for path in (TRACE_LOG.parent, PENDING_DIR, ACTIVE_DIR, RESULTS_DIR):
         path.mkdir(parents=True, exist_ok=True)
+    if ENABLE_ASYNC_TRIAL_BATCHES:
+        recovery = reconcile_async_state_on_startup()
+        print(
+            "RL async startup recovery "
+            f"batches={recovery['batches_scanned']} "
+            f"materialized={recovery['intents_materialized']} "
+            f"completed={recovery['completed_batches']}",
+            flush=True,
+        )
     print(f"RL rollout Harbor service listening on {host}:{port}", flush=True)
     ThreadingHTTPServer((host, port), Handler).serve_forever()
     return 0

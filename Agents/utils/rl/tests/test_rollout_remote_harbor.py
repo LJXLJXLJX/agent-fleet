@@ -7,6 +7,7 @@ import http.client
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -644,7 +645,7 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
         self.assertEqual(len(list(pending_dir.glob("*.json"))), 2)
         self.ensure_submission_zellij.assert_called_once()
 
-    def test_reconcile_closes_crash_window_after_queue_file_publication(self) -> None:
+    def test_startup_recovery_closes_crash_window_after_queue_file_publication(self) -> None:
         request = self._valid_async_request(trial_count=1)
         real_enqueue = MODULE._enqueue_request
 
@@ -676,11 +677,188 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
             registry.list_enqueue_intents(admission.batch_id)[0]["materialized_at"]
         )
 
-        self.assertEqual(MODULE.reconcile_async_batch(admission.batch_id), 1)
+        MODULE.ASYNC_REGISTRY = None
+        first_recovery = MODULE.reconcile_async_state_on_startup()
+        second_recovery = MODULE.reconcile_async_state_on_startup()
+
+        self.assertEqual(first_recovery["batches_scanned"], 1)
+        self.assertEqual(first_recovery["intents_materialized"], 1)
+        self.assertEqual(second_recovery["intents_materialized"], 0)
         self.assertEqual(len(list(pending_path.parent.glob("*.json"))), 1)
         self.assertIsNotNone(
-            registry.list_enqueue_intents(admission.batch_id)[0]["materialized_at"]
+            MODULE._async_registry().list_enqueue_intents(admission.batch_id)[0]["materialized_at"]
         )
+
+    def test_startup_recovery_materializes_committed_intent_exactly_once(self) -> None:
+        normalized = MODULE._validate_and_normalize_async_batch_request(
+            self._valid_async_request(trial_count=1)
+        )
+        admission = MODULE._async_registry().admit_batch(normalized)
+        pending_path = self._async_queue_path(admission.response, 0, "pending")
+        self.assertFalse(pending_path.exists())
+
+        MODULE.ASYNC_REGISTRY = None
+        first_recovery = MODULE.reconcile_async_state_on_startup()
+        second_recovery = MODULE.reconcile_async_state_on_startup()
+
+        self.assertEqual(first_recovery["batches_scanned"], 1)
+        self.assertEqual(first_recovery["intents_materialized"], 1)
+        self.assertEqual(second_recovery["intents_materialized"], 0)
+        self.assertTrue(pending_path.exists())
+        self.assertEqual(len(list(pending_path.parent.glob("*.json"))), 1)
+        self.ensure_job_zellij.assert_called_once()
+
+    def test_startup_recovery_fails_missing_materialized_artifact_without_reexecution(self) -> None:
+        _, admission = self._request(
+            "POST",
+            "/async_trial_batches",
+            self._valid_async_request(trial_count=1),
+        )
+        pending_path = self._async_queue_path(admission, 0, "pending")
+        pending_path.unlink()
+        self.ensure_job_zellij.reset_mock()
+        MODULE.ASYNC_REGISTRY = None
+
+        recovery = MODULE.reconcile_async_state_on_startup()
+        repeated_recovery = MODULE.reconcile_async_state_on_startup()
+        snapshot = MODULE._async_registry().get_batch_snapshot(admission["batch_id"])
+        result_status, results = self._request(
+            "GET",
+            f"/async_trial_batches/{admission['batch_id']}/results",
+        )
+
+        self.assertEqual(recovery["completed_batches"], 1)
+        self.assertEqual(repeated_recovery["batches_scanned"], 0)
+        self.assertEqual(snapshot["state"], "COMPLETED")
+        self.assertEqual(snapshot["failed_trials"], 1)
+        self.assertEqual(result_status, 200)
+        self.assertEqual(results["results"][0]["result"], None)
+        self.assertEqual(
+            results["results"][0]["error"],
+            {"category": "QUEUE_ARTIFACT_MISSING"},
+        )
+        pending_dir = self.job_queue_root / "ray-job-async" / "pending"
+        self.assertEqual(len(list(pending_dir.glob("*.json"))), 0)
+        self.ensure_job_zellij.assert_not_called()
+
+    def test_startup_recovery_never_reexecutes_terminal_unmaterialized_intent(self) -> None:
+        normalized = MODULE._validate_and_normalize_async_batch_request(
+            self._valid_async_request(trial_count=1)
+        )
+        registry = MODULE._async_registry()
+        admission = registry.admit_batch(normalized)
+        trial_execution_id = admission.response["trials"][0]["trial_execution_id"]
+        registry.reconcile_batch_trial_states(
+            admission.batch_id,
+            {
+                trial_execution_id: MODULE.TrialStateObservation(
+                    MODULE.TrialState.FAILED,
+                    normalized_error_category="PREEXISTING_TERMINAL_FAILURE",
+                )
+            },
+        )
+        self.ensure_job_zellij.reset_mock()
+        MODULE.ASYNC_REGISTRY = None
+
+        recovery = MODULE.reconcile_async_state_on_startup()
+
+        self.assertEqual(recovery["batches_scanned"], 1)
+        self.assertEqual(recovery["completed_batches"], 1)
+        self.assertIsNotNone(
+            MODULE._async_registry().list_enqueue_intents(admission.batch_id)[0]["materialized_at"]
+        )
+        pending_dir = self.job_queue_root / "ray-job-async" / "pending"
+        self.assertEqual(len(list(pending_dir.glob("*.json"))), 0)
+        self.ensure_job_zellij.assert_not_called()
+
+    def test_fresh_python_process_recovers_running_and_terminal_artifacts(self) -> None:
+        _, admission = self._request(
+            "POST",
+            "/async_trial_batches",
+            self._valid_async_request(trial_count=2),
+        )
+        first_pending = self._async_queue_path(admission, 0, "pending")
+        first_active = self._async_queue_path(admission, 0, "active")
+        second_pending = self._async_queue_path(admission, 1, "pending")
+        second_active = self._async_queue_path(admission, 1, "active")
+        second_result = self._async_queue_path(admission, 1, "results")
+        first_pending.replace(first_active)
+        second_pending.replace(second_active)
+        second_result.write_text(json.dumps({"ok": True, "reward": 1.0}), encoding="utf-8")
+        second_active.unlink()
+
+        child_program = """
+import json
+import rollout_remote_harbor as service
+
+print(json.dumps(service.reconcile_async_state_on_startup()))
+"""
+        child_env = os.environ.copy()
+        child_env.update(
+            {
+                "PYTHONPATH": str(SCRIPT.parent),
+                "RL_DATASET_NAME": "test-dataset",
+                "RL_DATASET_ROOT": str(self.dataset_root),
+                "RL_TRACE_LOG": str(self.trace_log),
+                "RL_QUEUE_DIR": str(self.queue_root),
+                "RL_ACTIVE_DIR": str(self.queue_root / "active"),
+                "RL_JOB_QUEUE_ROOT": str(self.job_queue_root),
+                "RL_JOB_RUNTIME_ROOT": str(self.root / "runtime"),
+                "RL_DYNAMIC_JOB_ZELLIJ": "0",
+                "RL_ASYNC_TRIAL_BATCHES_ENABLED": "1",
+                "RL_ASYNC_TRIAL_REGISTRY_PATH": str(MODULE.ASYNC_TRIAL_REGISTRY_PATH),
+            }
+        )
+
+        first_child = subprocess.run(
+            [sys.executable, "-c", child_program],
+            check=True,
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        second_child = subprocess.run(
+            [sys.executable, "-c", child_program],
+            check=True,
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        MODULE.ASYNC_REGISTRY = None
+        snapshot = MODULE._async_registry().get_batch_snapshot(admission["batch_id"])
+
+        self.assertEqual(json.loads(first_child.stdout)["batches_scanned"], 1)
+        self.assertEqual(json.loads(second_child.stdout)["intents_materialized"], 0)
+        self.assertEqual(snapshot["state"], "RUNNING")
+        self.assertEqual(snapshot["running_trials"], 1)
+        self.assertEqual(snapshot["succeeded_trials"], 1)
+        self.assertEqual(snapshot["revision"], 2)
+        self.assertTrue(first_active.exists())
+        self.assertTrue(second_result.exists())
+
+    def test_main_recovers_async_state_before_opening_listener(self) -> None:
+        events: list[str] = []
+        fake_server = mock.Mock()
+        fake_server.serve_forever.side_effect = lambda: events.append("serve")
+
+        def recover() -> dict[str, int]:
+            events.append("recover")
+            return {"batches_scanned": 1, "intents_materialized": 1, "completed_batches": 0}
+
+        def open_listener(*_args: object, **_kwargs: object) -> mock.Mock:
+            events.append("listen")
+            return fake_server
+
+        with (
+            mock.patch.object(MODULE, "reconcile_async_state_on_startup", side_effect=recover),
+            mock.patch.object(MODULE, "ThreadingHTTPServer", side_effect=open_listener),
+        ):
+            exit_code = MODULE.main()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(events, ["recover", "listen", "serve"])
 
 
 if __name__ == "__main__":
