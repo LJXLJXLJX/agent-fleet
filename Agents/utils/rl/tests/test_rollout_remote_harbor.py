@@ -63,6 +63,7 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
             ASYNC_MAX_REQUEST_BYTES=4096,
             ASYNC_MAX_BULK_STATUS_IDS=3,
             ASYNC_REGISTRY=None,
+            ASYNC_METRICS=MODULE.AsyncControlPlaneMetrics(),
         )
         self.module_patcher.start()
         self.environment_patcher = mock.patch.dict(
@@ -174,6 +175,15 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
             / f"{trial['trial_execution_id']}.json"
         )
 
+    def _trace_events(self) -> list[dict[str, object]]:
+        if not self.trace_log.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.trace_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
     def test_health_reports_current_rollout_configuration(self) -> None:
         status, payload = self._request("GET", "/health")
 
@@ -187,6 +197,12 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
         self.assertFalse(payload["dynamic_job_zellij"])
         self.assertEqual(payload["async_max_request_bytes"], 4096)
         self.assertEqual(payload["async_max_bulk_status_ids"], 3)
+        control_plane = payload["async_control_plane"]
+        self.assertTrue(control_plane["ready"])
+        self.assertEqual(control_plane["registry"]["schema_version"], 2)
+        self.assertEqual(control_plane["registry"]["journal_mode"], "wal")
+        self.assertEqual(control_plane["registry"]["outstanding_batches"], 0)
+        self.assertEqual(control_plane["queue_depth"], {"pending": 0, "active": 0})
 
     def test_unknown_get_and_post_paths_return_not_found(self) -> None:
         get_status, get_payload = self._request("GET", "/unknown")
@@ -644,7 +660,7 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
         )
         self.assertFalse(MODULE.ASYNC_TRIAL_REGISTRY_PATH.exists())
         self.assertFalse(self.job_queue_root.exists())
-        self.ensure_job_zellij.assert_not_called()
+        self.ensure_submission_zellij.assert_not_called()
 
     def test_async_bulk_status_id_limit_is_rejected_before_registry_open(self) -> None:
         batch_ids = [f"atb-{index:032x}" for index in range(4)]
@@ -660,7 +676,7 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
             response["detail"]["exception_message"],
         )
         self.assertFalse(MODULE.ASYNC_TRIAL_REGISTRY_PATH.exists())
-        self.ensure_job_zellij.assert_not_called()
+        self.ensure_submission_zellij.assert_not_called()
 
     def test_async_same_request_id_with_changed_payload_returns_conflict(self) -> None:
         request = self._valid_async_request(trial_count=1)
@@ -697,6 +713,145 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
         self.assertEqual(len(list(pending_dir.glob("*.json"))), 2)
         self.ensure_submission_zellij.assert_called_once()
 
+    def test_async_lifecycle_events_link_logical_and_execution_identity(self) -> None:
+        request = self._valid_async_request(trial_count=1)
+        _, admission = self._request("POST", "/async_trial_batches", request)
+        pending = self._async_queue_path(admission, 0, "pending")
+        active = self._async_queue_path(admission, 0, "active")
+        result = self._async_queue_path(admission, 0, "results")
+        trial = admission["trials"][0]
+
+        pending.replace(active)
+        self._request("GET", f"/async_trial_batches/{admission['batch_id']}")
+        result.write_text(json.dumps({"ok": True, "reward": 1.0}), encoding="utf-8")
+        active.unlink()
+        self._request("GET", f"/async_trial_batches/{admission['batch_id']}/results")
+
+        events = self._trace_events()
+        event_names = {event["event"] for event in events}
+        self.assertTrue(
+            {
+                "async_batch_admitted",
+                "async_trial_queued",
+                "async_trial_state_observed",
+                "async_status_response_delivered",
+                "async_results_response_delivered",
+            }.issubset(event_names)
+        )
+        trial_events = [
+            event
+            for event in events
+            if event.get("trial_execution_id") == trial["trial_execution_id"]
+        ]
+        self.assertTrue(trial_events)
+        self.assertTrue(
+            all(event.get("batch_id") == admission["batch_id"] for event in trial_events)
+        )
+        self.assertTrue(
+            all(event.get("client_trial_id") == trial["client_trial_id"] for event in trial_events)
+        )
+        observed_states = {
+            event.get("to_state")
+            for event in trial_events
+            if event["event"] == "async_trial_state_observed"
+        }
+        self.assertEqual(observed_states, {"RUNNING", "SUCCEEDED"})
+
+    def test_async_response_drop_retry_recovers_same_durable_admission(self) -> None:
+        request = self._valid_async_request(trial_count=1)
+        with mock.patch.object(
+            MODULE.Handler,
+            "_send_json",
+            side_effect=BrokenPipeError("injected response loss"),
+        ):
+            with self.assertRaises(http.client.RemoteDisconnected):
+                self._request("POST", "/async_trial_batches", request)
+
+        retry_status, recovered = self._request("POST", "/async_trial_batches", request)
+
+        self.assertEqual(retry_status, 202)
+        admission = MODULE._async_registry().get_admission("async-request-001")
+        self.assertIsNotNone(admission)
+        self.assertEqual(recovered, admission.response)
+        pending_dir = self.job_queue_root / "ray-job-async" / "pending"
+        self.assertEqual(len(list(pending_dir.glob("*.json"))), 1)
+        events = self._trace_events()
+        self.assertTrue(
+            any(event["event"] == "async_response_delivery_failed" for event in events)
+        )
+        self.assertEqual(
+            [
+                event["admission_outcome"]
+                for event in events
+                if event["event"] == "async_batch_admitted"
+            ],
+            ["created", "recovered"],
+        )
+
+    def test_trace_write_failure_does_not_change_accepted_work(self) -> None:
+        request = self._valid_async_request(trial_count=1)
+        with mock.patch.object(MODULE, "TRACE_LOG", self.root):
+            status, response = self._request("POST", "/async_trial_batches", request)
+
+        self.assertEqual(status, 202)
+        self.assertIsNotNone(MODULE._async_registry().get_admission("async-request-001"))
+        self.assertTrue(self._async_queue_path(response, 0, "pending").exists())
+
+    def test_async_responses_and_trace_do_not_expose_secret_markers(self) -> None:
+        secret = "step-10-secret-marker"
+        request = self._valid_async_request(trial_count=1)
+        request["trials"][0]["payload"]["api_key"] = secret
+        submit_status, admission = self._request("POST", "/async_trial_batches", request)
+        status_status, snapshot = self._request(
+            "GET",
+            f"/async_trial_batches/{admission['batch_id']}",
+        )
+        with mock.patch.object(
+            MODULE,
+            "reconcile_async_batch_status",
+            side_effect=RuntimeError(f"internal failure containing {secret}"),
+        ):
+            error_status, error = self._request(
+                "GET",
+                f"/async_trial_batches/{admission['batch_id']}",
+            )
+        pending = self._async_queue_path(admission, 0, "pending")
+        result_path = self._async_queue_path(admission, 0, "results")
+        pending.unlink()
+        result_path.write_text(
+            json.dumps(
+                {
+                    "ok": True,
+                    "metadata": {
+                        "api_key": secret,
+                        "authorization": f"Bearer {secret}",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        results_status, results = self._request(
+            "GET",
+            f"/async_trial_batches/{admission['batch_id']}/results",
+        )
+        health_status, health = self._request("GET", "/health")
+
+        self.assertEqual(
+            (submit_status, status_status, error_status, results_status, health_status),
+            (202, 200, 500, 200, 200),
+        )
+        self.assertEqual(error["detail"]["category"], "STATUS_INTERNAL_ERROR")
+        metrics = health["async_control_plane"]["metrics"]
+        self.assertEqual(metrics["counters"]["status_requests"], 2)
+        self.assertEqual(
+            metrics["rejection_categories"]["STATUS_INTERNAL_ERROR"],
+            1,
+        )
+        serialized = json.dumps(
+            [admission, snapshot, error, results, health, self._trace_events()]
+        )
+        self.assertNotIn(secret, serialized)
+
     def test_startup_recovery_closes_crash_window_after_queue_file_publication(self) -> None:
         request = self._valid_async_request(trial_count=1)
         real_enqueue = MODULE._enqueue_request
@@ -713,7 +868,8 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
             status, response = self._request("POST", "/async_trial_batches", request)
 
         self.assertEqual(status, 500)
-        self.assertIn("injected crash", response["detail"]["exception_message"])
+        self.assertEqual(response["detail"]["category"], "ADMISSION_INTERNAL_ERROR")
+        self.assertEqual(response["detail"]["exception_message"], "internal server error")
         registry = MODULE._async_registry()
         admission = registry.get_admission("async-request-001")
         self.assertIsNotNone(admission)
@@ -758,7 +914,7 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
         self.assertEqual(second_recovery["intents_materialized"], 0)
         self.assertTrue(pending_path.exists())
         self.assertEqual(len(list(pending_path.parent.glob("*.json"))), 1)
-        self.ensure_job_zellij.assert_called_once()
+        self.ensure_submission_zellij.assert_called_once()
 
     def test_startup_recovery_fails_missing_materialized_artifact_without_reexecution(self) -> None:
         _, admission = self._request(
@@ -768,7 +924,7 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
         )
         pending_path = self._async_queue_path(admission, 0, "pending")
         pending_path.unlink()
-        self.ensure_job_zellij.reset_mock()
+        self.ensure_submission_zellij.reset_mock()
         MODULE.ASYNC_REGISTRY = None
 
         recovery = MODULE.reconcile_async_state_on_startup()
@@ -791,7 +947,7 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
         )
         pending_dir = self.job_queue_root / "ray-job-async" / "pending"
         self.assertEqual(len(list(pending_dir.glob("*.json"))), 0)
-        self.ensure_job_zellij.assert_not_called()
+        self.ensure_submission_zellij.assert_not_called()
 
     def test_startup_recovery_never_reexecutes_terminal_unmaterialized_intent(self) -> None:
         normalized = MODULE._validate_and_normalize_async_batch_request(
@@ -809,7 +965,7 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
                 )
             },
         )
-        self.ensure_job_zellij.reset_mock()
+        self.ensure_submission_zellij.reset_mock()
         MODULE.ASYNC_REGISTRY = None
 
         recovery = MODULE.reconcile_async_state_on_startup()
@@ -821,7 +977,7 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
         )
         pending_dir = self.job_queue_root / "ray-job-async" / "pending"
         self.assertEqual(len(list(pending_dir.glob("*.json"))), 0)
-        self.ensure_job_zellij.assert_not_called()
+        self.ensure_submission_zellij.assert_not_called()
 
     def test_fresh_python_process_recovers_running_and_terminal_artifacts(self) -> None:
         _, admission = self._request(

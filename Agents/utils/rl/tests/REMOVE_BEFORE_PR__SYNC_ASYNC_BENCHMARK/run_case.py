@@ -207,7 +207,7 @@ def _sync_payload(index: int, run_token: str, work_dir: Path, timeout: float) ->
         "task_id": "1",
         "dataset_name": "benchmark",
         "dataset_root": str((work_dir / "dataset").resolve()),
-        "ray_job_id": f"benchmark-sync-{run_token}",
+        "ray_submission_id": f"benchmark-sync-{run_token}",
         "request_timeout": timeout,
     }
 
@@ -227,7 +227,7 @@ def _async_payload(
         "batching_key": {
             "dataset_name": "benchmark",
             "dataset_root": str((work_dir / "dataset").resolve()),
-            "ray_job_id": f"benchmark-async-{run_token}",
+            "ray_submission_id": f"benchmark-async-{run_token}",
             "policy_version": "benchmark-policy-0",
         },
         "trials": [

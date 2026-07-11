@@ -20,6 +20,39 @@ log_msg() {
   printf '[%s] [rl-worker-%s] %s\n' "$(date '+%F %T')" "$WORKER_ID" "$1" | tee -a "$WORKER_LOG"
 }
 
+trace_event() {
+  python3 - "$RL_TRACE_LOG" "$@" <<'PY' || true
+import fcntl
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(sys.argv[1])
+names = (
+    "event", "request_id", "async_request_id", "batch_id",
+    "trial_execution_id", "client_trial_id", "task_id", "ray_submission_id",
+    "polar_task_id", "status", "reward", "exception_type", "duration_ms",
+)
+event = {
+    "event_schema_version": 1,
+    "component": "rl_rollout_worker",
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+}
+for name, value in zip(names, sys.argv[2:]):
+    if value != "":
+        event[name] = int(value) if name == "duration_ms" else value
+path.parent.mkdir(parents=True, exist_ok=True)
+with path.open("a", encoding="utf-8") as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    try:
+        handle.write(json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n")
+        handle.flush()
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+PY
+}
+
 safe_name() {
   printf '%s' "$1" | tr '/[:space:]' '___' | tr -cd 'A-Za-z0-9._-'
 }
@@ -268,6 +301,10 @@ while true; do
   ray_submission_id="$(json_get "$request_file" ray_submission_id)"
   opik_project_name="$(json_get "$request_file" opik_project_name)"
   polar_task_id="$(json_get "$request_file" polar_task_id)"
+  async_request_id="$(json_get "$request_file" async_request_id)"
+  batch_id="$(json_get "$request_file" batch_id)"
+  trial_execution_id="$(json_get "$request_file" trial_execution_id)"
+  client_trial_id="$(json_get "$request_file" client_trial_id)"
   display_name="$(json_get "$request_file" display_name)"
   force_build="$(json_get_first "$request_file" force_build trial_config.environment.force_build)"
   max_new_tokens="$(json_get_first "$request_file" max_new_tokens trial_config.agent.kwargs.max_new_tokens)"
@@ -297,6 +334,13 @@ while true; do
   printf '%s\t%s\t%s\t%s\t%s\n' "$request_id" "$task_name" "$display_name" "$ray_submission_id" "$polar_task_id" > "$CURRENT_FILE"
   clear_pane_history
   log_msg "starting request=${request_id} display=${display_name} task=${task_name} ray_submission=${ray_submission_id:-none} polar_task=${polar_task_id:-none}"
+  rename_pane "$display_name"
+  run_started_epoch="$(date +%s)"
+  if [[ -n "$batch_id" ]]; then
+    trace_event "async_trial_run_started" "$request_id" "$async_request_id" "$batch_id" \
+      "$trial_execution_id" "$client_trial_id" "$task_name" "$ray_submission_id" \
+      "$polar_task_id" "" "" "" ""
+  fi
 
   if [[ -n "$dataset_root" ]]; then
     worklist="$WORKLIST_DIR/$(safe_name "$dataset_root").txt"
@@ -444,8 +488,15 @@ PY
   fi
 
   json_build_result "$request_file" "${result_file:-}" "$task_console_log" "$reward" "$exception_type" "$rc" "$result_out" "$status"
-  printf '{"event":"finish","timestamp":"%s","request_id":"%s","task_id":"%s","display_name":"%s","ray_submission_id":"%s","polar_task_id":"%s","status":"%s","reward":"%s","exception_type":"%s"}\n' \
-    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$request_id" "$task_name" "$display_name" "$ray_submission_id" "$polar_task_id" "$status" "$reward" "$exception_type" >> "$RL_TRACE_LOG"
+  run_duration_ms="$(( ($(date +%s) - run_started_epoch) * 1000 ))"
+  trace_event "finish" "$request_id" "$async_request_id" "$batch_id" \
+    "$trial_execution_id" "$client_trial_id" "$task_name" "$ray_submission_id" \
+    "$polar_task_id" "$status" "$reward" "$exception_type" "$run_duration_ms"
+  if [[ -n "$batch_id" ]]; then
+    trace_event "async_trial_result_committed" "$request_id" "$async_request_id" "$batch_id" \
+      "$trial_execution_id" "$client_trial_id" "$task_name" "$ray_submission_id" \
+      "$polar_task_id" "$status" "$reward" "$exception_type" "$run_duration_ms"
+  fi
   log_msg "finished request=${request_id} display=${display_name} task=${task_name} status=${status} reward=${reward:-none} exception=${exception_type:-none} rc=${rc}"
   rm -f "$CURRENT_FILE" "$request_file"
   if ! python3 "$RL_SCRIPT_DIR/rollout_worker_utils.py" prune-trials \

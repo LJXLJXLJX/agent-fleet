@@ -321,6 +321,45 @@ class AsyncTrialRegistry:
         with self._connection() as connection:
             return int(connection.execute("PRAGMA user_version").fetchone()[0])
 
+    def health_snapshot(self) -> dict[str, Any]:
+        """Return a compact readiness and workload snapshot without request payloads."""
+
+        with self._connection() as connection:
+            schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            readable = int(connection.execute("SELECT 1").fetchone()[0]) == 1
+            batch_rows = connection.execute(
+                "SELECT state, COUNT(*) AS count FROM async_trial_batches GROUP BY state"
+            ).fetchall()
+            trial_rows = connection.execute(
+                "SELECT state, COUNT(*) AS count FROM trial_executions GROUP BY state"
+            ).fetchall()
+            unmaterialized_intents = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM enqueue_intents WHERE materialized_at IS NULL"
+                ).fetchone()[0]
+            )
+
+        batch_counts = {str(row["state"]): int(row["count"]) for row in batch_rows}
+        trial_counts = {str(row["state"]): int(row["count"]) for row in trial_rows}
+        return {
+            "ready": (
+                schema_version == SCHEMA_VERSION
+                and journal_mode == "wal"
+                and readable
+            ),
+            "schema_version": schema_version,
+            "expected_schema_version": SCHEMA_VERSION,
+            "journal_mode": journal_mode,
+            "readable": readable,
+            "outstanding_batches": sum(
+                count for state, count in batch_counts.items() if state != BatchState.COMPLETED.value
+            ),
+            "unmaterialized_intents": unmaterialized_intents,
+            "batch_counts": batch_counts,
+            "trial_counts": trial_counts,
+        }
+
     @staticmethod
     def _validate_admission(request: Mapping[str, Any]) -> tuple[str, str, list[dict[str, Any]]]:
         request_id = request.get("request_id")
@@ -684,8 +723,10 @@ class AsyncTrialRegistry:
                 raise BatchNotFound(batch_id)
             rows = connection.execute(
                 """
-                SELECT trial.trial_execution_id, trial.state, trial.result_uri,
-                       trial.normalized_error_category, intent.payload_json,
+                SELECT trial.trial_execution_id, trial.client_trial_id,
+                       trial.state, trial.result_uri,
+                       trial.normalized_error_category, trial.created_at,
+                       trial.updated_at, intent.payload_json,
                        intent.materialized_at
                 FROM trial_executions AS trial
                 JOIN enqueue_intents AS intent
@@ -698,9 +739,12 @@ class AsyncTrialRegistry:
         return [
             {
                 "trial_execution_id": row["trial_execution_id"],
+                "client_trial_id": row["client_trial_id"],
                 "state": row["state"],
                 "result_uri": row["result_uri"],
                 "normalized_error_category": row["normalized_error_category"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
                 "payload": json.loads(row["payload_json"]),
                 "materialized_at": row["materialized_at"],
             }

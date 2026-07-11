@@ -58,11 +58,17 @@ def main() -> int:
     finally:
         sys.path.remove(str(script.parent))
 
-    def synthetic_zellij(ray_job_id: str, dataset_name: str, queue_dir: Path) -> str:
-        del dataset_name, queue_dir
-        return f"benchmark-{ray_job_id}"
+    def synthetic_zellij(
+        ray_submission_id: str,
+        dataset_name: str,
+        queue_dir: Path,
+        model_name: str,
+        opik_project_name: str,
+    ) -> str:
+        del dataset_name, queue_dir, model_name, opik_project_name
+        return f"benchmark-{ray_submission_id}"
 
-    module._ensure_job_zellij = synthetic_zellij
+    module._ensure_submission_zellij = synthetic_zellij
     server = ThreadingHTTPServer((args.host, args.port), module.Handler)
     print(
         f"benchmark rollout server pid={os.getpid()} address={args.host}:{args.port} "

@@ -16,7 +16,9 @@ import signal
 import subprocess
 import threading
 import time
+from collections import Counter, deque
 from datetime import datetime, timezone
+from fcntl import LOCK_EX, LOCK_UN, flock
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 from async_trial_registry import (
+    AdmissionResult,
     AsyncTrialRegistry,
     BatchNotFound,
     IdempotencyConflict,
@@ -70,6 +73,48 @@ ASYNC_MATERIALIZATION_LOCKS = tuple(threading.Lock() for _ in range(256))
 ASYNC_REGISTRY: AsyncTrialRegistry | None = None
 ASYNC_REGISTRY_GUARD = threading.Lock()
 ASYNC_BATCH_ID_PATTERN = re.compile(r"atb-[0-9a-f]{32}\Z")
+TRACE_WARNING_GUARD = threading.Lock()
+TRACE_WARNING_LAST_AT = 0.0
+
+
+class AsyncControlPlaneMetrics:
+    """Small process-local counters used to explain async control-plane health."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._started = time.monotonic()
+        self._counters: Counter[str] = Counter()
+        self._rejections: Counter[str] = Counter()
+        self._status_requests: deque[float] = deque()
+
+    def record(self, name: str, *, rejection_category: str | None = None) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._counters[name] += 1
+            if rejection_category is not None:
+                self._rejections[rejection_category] += 1
+            if name == "status_requests":
+                self._status_requests.append(now)
+                self._trim_status_requests(now)
+
+    def snapshot(self) -> dict[str, Any]:
+        now = time.monotonic()
+        with self._lock:
+            self._trim_status_requests(now)
+            return {
+                "uptime_seconds": round(now - self._started, 3),
+                "status_qps_60s": round(len(self._status_requests) / 60.0, 3),
+                "counters": dict(sorted(self._counters.items())),
+                "rejection_categories": dict(sorted(self._rejections.items())),
+            }
+
+    def _trim_status_requests(self, now: float) -> None:
+        cutoff = now - 60.0
+        while self._status_requests and self._status_requests[0] < cutoff:
+            self._status_requests.popleft()
+
+
+ASYNC_METRICS = AsyncControlPlaneMetrics()
 
 
 class AsyncRequestBodyTooLarge(ValueError):
@@ -80,11 +125,58 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _append_trace(event: dict[str, Any]) -> None:
-    TRACE_LOG.parent.mkdir(parents=True, exist_ok=True)
-    event = {k: v for k, v in event.items() if k != "api_key"}
-    with TRACE_LOG.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n")
+def _redact_sensitive(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _redact_sensitive(item)
+            for key, item in value.items()
+            if key.lower() not in {"api_key", "authorization", "proxy-authorization"}
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    if isinstance(value, str) and DEFAULT_API_KEY and DEFAULT_API_KEY in value:
+        return value.replace(DEFAULT_API_KEY, "<redacted>")
+    return value
+
+
+def _append_trace(event: dict[str, Any]) -> bool:
+    """Best-effort append; telemetry failures must never change accepted work."""
+
+    global TRACE_WARNING_LAST_AT
+    try:
+        TRACE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        safe_event = _redact_sensitive(event)
+        with TRACE_LOG.open("a", encoding="utf-8") as handle:
+            flock(handle.fileno(), LOCK_EX)
+            try:
+                handle.write(json.dumps(safe_event, ensure_ascii=True, sort_keys=True) + "\n")
+                handle.flush()
+            finally:
+                flock(handle.fileno(), LOCK_UN)
+        return True
+    except Exception as exc:
+        ASYNC_METRICS.record("trace_write_failures")
+        with TRACE_WARNING_GUARD:
+            now = time.monotonic()
+            if now - TRACE_WARNING_LAST_AT >= 60.0:
+                print(
+                    f"warning: failed to append rollout trace: {type(exc).__name__}",
+                    flush=True,
+                )
+                TRACE_WARNING_LAST_AT = now
+        return False
+
+
+def _record_async_event(event: str, **fields: Any) -> bool:
+    return _append_trace(
+        {
+            "event": event,
+            "event_schema_version": 1,
+            "component": "async_trial_control_plane",
+            "timestamp": _now(),
+            **fields,
+        }
+    )
 
 
 def _async_registry() -> AsyncTrialRegistry:
@@ -171,6 +263,53 @@ def _queue_for_submission(ray_submission_id: str) -> Path:
     if not ray_submission_id:
         return QUEUE_DIR
     return JOB_QUEUE_ROOT / _safe_slug(ray_submission_id)
+
+
+def _elapsed_ms_since(timestamp: str | None) -> float | None:
+    if not timestamp:
+        return None
+    try:
+        started = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return None
+    return round((datetime.now(timezone.utc) - started).total_seconds() * 1000, 3)
+
+
+def _async_queue_depth() -> dict[str, int]:
+    # Results are durable history rather than outstanding queue depth and may
+    # grow for the full retention window, so health probes do not scan them.
+    queue_roots = {QUEUE_DIR}
+    if JOB_QUEUE_ROOT.is_dir():
+        queue_roots.update(path for path in JOB_QUEUE_ROOT.iterdir() if path.is_dir())
+    return {
+        state: sum(len(list((root / state).glob("*.json"))) for root in queue_roots)
+        for state in ("pending", "active")
+    }
+
+
+def _async_health_snapshot() -> dict[str, Any]:
+    if not ENABLE_ASYNC_TRIAL_BATCHES:
+        return {
+            "ready": False,
+            "reason": "disabled",
+            "metrics": ASYNC_METRICS.snapshot(),
+        }
+    try:
+        registry = _async_registry().health_snapshot()
+        return {
+            "ready": bool(registry["ready"]),
+            "registry": registry,
+            "queue_depth": _async_queue_depth(),
+            "metrics": ASYNC_METRICS.snapshot(),
+        }
+    except Exception as exc:
+        ASYNC_METRICS.record("health_failures")
+        return {
+            "ready": False,
+            "error_category": "REGISTRY_UNAVAILABLE",
+            "exception_type": type(exc).__name__,
+            "metrics": ASYNC_METRICS.snapshot(),
+        }
 
 
 def _submission_session_name(ray_submission_id: str, dataset_name: str) -> str:
@@ -496,13 +635,23 @@ def _materialize_enqueue_intent(
             TrialState.SUCCEEDED,
             TrialState.FAILED,
         }:
-            registry.mark_enqueue_intent_materialized(trial_execution_id)
+            materialized_at = registry.mark_enqueue_intent_materialized(trial_execution_id)
+            _record_async_event(
+                "async_enqueue_intent_closed",
+                request_id=async_request_id,
+                batch_id=intent["batch_id"],
+                trial_execution_id=trial_execution_id,
+                client_trial_id=trial_mapping["client_trial_id"],
+                state=trial_mapping["state"],
+                materialized_at=materialized_at,
+            )
             return
         request = dict(intent["payload"])
         request["api_key"] = _async_execution_api_key(request)
         ray_submission_id = _extract_ray_submission_id(request)
         queue_dir = _queue_for_submission(ray_submission_id)
-        if not _queue_artifact_exists(queue_dir, trial_execution_id):
+        queue_artifact_created = not _queue_artifact_exists(queue_dir, trial_execution_id)
+        if queue_artifact_created:
             dataset_name = str(request.get("dataset_name") or DEFAULT_DATASET_NAME)
             model_name = str(request.get("model_name") or DEFAULT_MODEL_NAME)
             opik_project_name = _extract_opik_project_name(request, ray_submission_id)
@@ -524,10 +673,21 @@ def _materialize_enqueue_intent(
                     "trial_execution_id": trial_execution_id,
                     "client_trial_id": trial_mapping["client_trial_id"],
                     "async_request_id": async_request_id,
+                    "async_admitted_at": intent["created_at"],
                 }
             )
             _enqueue_request(request, zellij_session=zellij_session)
-        registry.mark_enqueue_intent_materialized(trial_execution_id)
+        materialized_at = registry.mark_enqueue_intent_materialized(trial_execution_id)
+        _record_async_event(
+            "async_trial_queued",
+            request_id=async_request_id,
+            batch_id=intent["batch_id"],
+            trial_execution_id=trial_execution_id,
+            client_trial_id=trial_mapping["client_trial_id"],
+            queue_artifact_created=queue_artifact_created,
+            queue_latency_ms=_elapsed_ms_since(str(intent["created_at"])),
+            materialized_at=materialized_at,
+        )
 
 
 def reconcile_async_batch(batch_id: str) -> int:
@@ -592,11 +752,13 @@ def reconcile_async_batch_status(
 
     batch_id = _validate_async_batch_id(batch_id)
     registry = _async_registry()
+    batch = registry.get_batch(batch_id)
     observations: dict[str, TrialStateObservation] = {}
+    transition_events: list[dict[str, Any]] = []
     for record in registry.list_trial_reconciliation_records(batch_id):
         trial_execution_id = str(record["trial_execution_id"])
         payload = record["payload"]
-        queue_dir = _queue_for_job(_extract_ray_job_id(payload))
+        queue_dir = _queue_for_submission(_extract_ray_submission_id(payload))
         pending_path = queue_dir / "pending" / f"{trial_execution_id}.json"
         active_path = queue_dir / "active" / f"{trial_execution_id}.json"
         result_path = queue_dir / "results" / f"{trial_execution_id}.json"
@@ -642,15 +804,31 @@ def reconcile_async_batch_status(
         )
         if state_changed or result_uri_missing or error_missing:
             observations[trial_execution_id] = observation
+            transition_events.append(
+                {
+                    "request_id": batch["request_id"],
+                    "batch_id": batch_id,
+                    "trial_execution_id": trial_execution_id,
+                    "client_trial_id": record["client_trial_id"],
+                    "from_state": current.value,
+                    "to_state": observation.state.value,
+                    "error_category": observation.normalized_error_category,
+                    "state_observation_latency_ms": _elapsed_ms_since(record["updated_at"]),
+                }
+            )
 
     if observations:
-        return registry.reconcile_batch_trial_states(batch_id, observations)
+        snapshot = registry.reconcile_batch_trial_states(batch_id, observations)
+        for event in transition_events:
+            _record_async_event("async_trial_state_observed", **event)
+        return snapshot
     return registry.get_batch_snapshot(batch_id)
 
 
 def reconcile_async_state_on_startup() -> dict[str, int]:
     """Recover committed async work before the HTTP listener accepts traffic."""
 
+    started = time.monotonic()
     registry = _async_registry()
     batch_ids = registry.list_recoverable_batch_ids()
     summary = {
@@ -666,6 +844,12 @@ def reconcile_async_state_on_startup() -> dict[str, int]:
         )
         if snapshot["state"] == "COMPLETED":
             summary["completed_batches"] += 1
+    _record_async_event(
+        "async_startup_reconciliation_completed",
+        **summary,
+        duration_ms=round((time.monotonic() - started) * 1000, 3),
+    )
+    ASYNC_METRICS.record("startup_reconciliations")
     return summary
 
 
@@ -720,7 +904,7 @@ def get_async_batch_results(batch_id: str) -> dict[str, Any]:
         try:
             if not isinstance(result_uri, str) or not result_uri:
                 raise FileNotFoundError("terminal trial has no result artifact")
-            entry["result"] = _load_worker_result(Path(result_uri))
+            entry["result"] = _redact_sensitive(_load_worker_result(Path(result_uri)))
             if error_category is not None:
                 entry["error_category"] = error_category
         except (OSError, ValueError):
@@ -737,12 +921,38 @@ def get_async_batch_results(batch_id: str) -> dict[str, Any]:
     return manifest
 
 
-def _submit_async_trial_batch(request: dict[str, Any]) -> dict[str, Any]:
+def _submit_async_trial_batch(request: dict[str, Any]) -> AdmissionResult:
+    started = time.monotonic()
     normalized_request = _validate_and_normalize_async_batch_request(request)
     registry = _async_registry()
     admission = registry.admit_batch(normalized_request)
-    reconcile_async_batch(admission.batch_id)
-    return admission.response
+    admission_latency_ms = round((time.monotonic() - started) * 1000, 3)
+    outcome = "created" if admission.created else "recovered"
+    ASYNC_METRICS.record(f"admissions_{outcome}")
+    _record_async_event(
+        "async_batch_admitted",
+        request_id=normalized_request["request_id"],
+        batch_id=admission.batch_id,
+        client_batch_id=normalized_request["client_batch_id"],
+        trainer_run_id=normalized_request.get("trainer_run_id"),
+        requested_trials=len(normalized_request["trials"]),
+        admission_outcome=outcome,
+        admission_latency_ms=admission_latency_ms,
+    )
+    materialization_started = time.monotonic()
+    materialized = reconcile_async_batch(admission.batch_id)
+    _record_async_event(
+        "async_batch_materialized",
+        request_id=normalized_request["request_id"],
+        batch_id=admission.batch_id,
+        requested_trials=len(normalized_request["trials"]),
+        intents_materialized=materialized,
+        materialization_latency_ms=round(
+            (time.monotonic() - materialization_started) * 1000,
+            3,
+        ),
+    )
+    return admission
 
 
 def _enqueue_request(
@@ -809,6 +1019,11 @@ def _enqueue_request(
         "polar_task_id": polar_task_id,
         "model_name": model_name,
         "opik_project_name": opik_project_name,
+        "batch_id": request.get("batch_id"),
+        "trial_execution_id": request.get("trial_execution_id"),
+        "client_trial_id": request.get("client_trial_id"),
+        "async_request_id": request.get("async_request_id"),
+        "queue_latency_ms": _elapsed_ms_since(request.get("async_admitted_at")),
         "dataset_name": payload["dataset_name"],
         "queue_dir": str(queue_dir),
         "zellij_session": zellij_session,
@@ -852,107 +1067,254 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"{self.address_string()} - {fmt % args}", flush=True)
 
-    def _handle_async_trial_batch_submit(self) -> None:
+    def _send_async_json(
+        self,
+        status: HTTPStatus,
+        payload: dict[str, Any],
+        *,
+        operation: str,
+        request_id: str | None = None,
+        batch_id: str | None = None,
+    ) -> bool:
         try:
-            response = _submit_async_trial_batch(
-                self._read_json(max_bytes=ASYNC_MAX_REQUEST_BYTES)
+            self._send_json(status, payload)
+            return True
+        except OSError as exc:
+            ASYNC_METRICS.record("response_delivery_failures")
+            _record_async_event(
+                "async_response_delivery_failed",
+                operation=operation,
+                request_id=request_id,
+                batch_id=batch_id,
+                http_status=int(status),
+                error_category="CLIENT_CONNECTION_LOST",
+                exception_type=type(exc).__name__,
             )
-            self._send_json(HTTPStatus.ACCEPTED, response)
+            return False
+
+    def _send_async_error(
+        self,
+        status: HTTPStatus,
+        exc: Exception,
+        *,
+        operation: str,
+        category: str,
+        request_id: str | None = None,
+        batch_id: str | None = None,
+    ) -> None:
+        public_message: Any = str(exc) if int(status) < 500 else "internal server error"
+        public_message = _redact_sensitive(public_message)
+        detail = {
+            "category": category,
+            "retryable": int(status) >= 500,
+            "exception_type": type(exc).__name__,
+            "exception_message": public_message,
+        }
+        if isinstance(exc, IdempotencyConflict):
+            detail["request_id"] = exc.request_id
+        ASYNC_METRICS.record("request_rejections", rejection_category=category)
+        _record_async_event(
+            "async_request_rejected",
+            operation=operation,
+            request_id=request_id,
+            batch_id=batch_id,
+            http_status=int(status),
+            rejection_category=category,
+            exception_type=type(exc).__name__,
+        )
+        self._send_async_json(
+            status,
+            {"detail": detail},
+            operation=operation,
+            request_id=request_id,
+            batch_id=batch_id,
+        )
+
+    def _handle_async_trial_batch_submit(self) -> None:
+        started = time.monotonic()
+        request: dict[str, Any] = {}
+        try:
+            request = self._read_json(max_bytes=ASYNC_MAX_REQUEST_BYTES)
+            admission = _submit_async_trial_batch(request)
+            delivered = self._send_async_json(
+                HTTPStatus.ACCEPTED,
+                admission.response,
+                operation="submit",
+                request_id=str(request.get("request_id") or "") or None,
+                batch_id=admission.batch_id,
+            )
+            if delivered:
+                ASYNC_METRICS.record("submit_responses_delivered")
+                _record_async_event(
+                    "async_submit_response_delivered",
+                    request_id=request.get("request_id"),
+                    batch_id=admission.batch_id,
+                    admission_outcome="created" if admission.created else "recovered",
+                    http_status=int(HTTPStatus.ACCEPTED),
+                    response_latency_ms=round((time.monotonic() - started) * 1000, 3),
+                )
         except AsyncRequestBodyTooLarge as exc:
-            self._send_json(
+            self._send_async_error(
                 HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                {
-                    "detail": {
-                        "exception_type": type(exc).__name__,
-                        "exception_message": str(exc),
-                    }
-                },
+                exc,
+                operation="submit",
+                category="REQUEST_BODY_TOO_LARGE",
             )
         except IdempotencyConflict as exc:
-            self._send_json(
+            self._send_async_error(
                 HTTPStatus.CONFLICT,
-                {
-                    "detail": {
-                        "exception_type": type(exc).__name__,
-                        "exception_message": str(exc),
-                        "request_id": exc.request_id,
-                    }
-                },
+                exc,
+                operation="submit",
+                category="IDEMPOTENCY_CONFLICT",
+                request_id=exc.request_id,
             )
         except (ValueError, FileNotFoundError, InvalidAdmissionRequest) as exc:
-            self._send_json(
+            self._send_async_error(
                 HTTPStatus.BAD_REQUEST,
-                {
-                    "detail": {
-                        "exception_type": type(exc).__name__,
-                        "exception_message": str(exc),
-                    }
-                },
+                exc,
+                operation="submit",
+                category="INVALID_ADMISSION_REQUEST",
+                request_id=str(request.get("request_id") or "") or None,
             )
         except Exception as exc:
-            self._send_json(
+            self._send_async_error(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
-                {
-                    "detail": {
-                        "exception_type": type(exc).__name__,
-                        "exception_message": str(exc),
-                    }
-                },
+                exc,
+                operation="submit",
+                category="ADMISSION_INTERNAL_ERROR",
+                request_id=str(request.get("request_id") or "") or None,
             )
 
     def _handle_async_trial_batch_get(self, batch_id: str) -> None:
+        started = time.monotonic()
+        ASYNC_METRICS.record("status_requests")
         try:
-            self._send_json(HTTPStatus.OK, reconcile_async_batch_status(batch_id))
+            snapshot = reconcile_async_batch_status(batch_id)
+            delivered = self._send_async_json(
+                HTTPStatus.OK,
+                snapshot,
+                operation="status",
+                batch_id=batch_id,
+            )
+            if delivered:
+                _record_async_event(
+                    "async_status_response_delivered",
+                    batch_id=batch_id,
+                    state=snapshot["state"],
+                    revision=snapshot["revision"],
+                    queued_trials=snapshot["queued_trials"],
+                    running_trials=snapshot["running_trials"],
+                    succeeded_trials=snapshot["succeeded_trials"],
+                    failed_trials=snapshot["failed_trials"],
+                    status_latency_ms=round((time.monotonic() - started) * 1000, 3),
+                )
         except ValueError as exc:
-            self._send_json(
+            self._send_async_error(
                 HTTPStatus.BAD_REQUEST,
-                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+                exc,
+                operation="status",
+                category="MALFORMED_BATCH_ID",
+                batch_id=batch_id,
             )
         except BatchNotFound as exc:
-            self._send_json(
+            self._send_async_error(
                 HTTPStatus.NOT_FOUND,
-                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+                exc,
+                operation="status",
+                category="BATCH_NOT_FOUND",
+                batch_id=batch_id,
             )
         except Exception as exc:
-            self._send_json(
+            self._send_async_error(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
-                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+                exc,
+                operation="status",
+                category="STATUS_INTERNAL_ERROR",
+                batch_id=batch_id,
             )
 
     def _handle_async_trial_batches_get(self, query: dict[str, list[str]]) -> None:
+        started = time.monotonic()
+        ASYNC_METRICS.record("status_requests")
         try:
-            self._send_json(
+            batch_ids = _parse_async_batch_ids(query)
+            response = get_async_batch_snapshots(batch_ids)
+            delivered = self._send_async_json(
                 HTTPStatus.OK,
-                get_async_batch_snapshots(_parse_async_batch_ids(query)),
+                response,
+                operation="bulk_status",
             )
+            if delivered:
+                _record_async_event(
+                    "async_bulk_status_response_delivered",
+                    requested_batch_ids=len(batch_ids),
+                    returned_batches=len(response["batches"]),
+                    missing_batch_ids=len(response["missing_ids"]),
+                    status_latency_ms=round((time.monotonic() - started) * 1000, 3),
+                )
         except ValueError as exc:
-            self._send_json(
+            self._send_async_error(
                 HTTPStatus.BAD_REQUEST,
-                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+                exc,
+                operation="bulk_status",
+                category="INVALID_BULK_STATUS_REQUEST",
             )
         except Exception as exc:
-            self._send_json(
+            self._send_async_error(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
-                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+                exc,
+                operation="bulk_status",
+                category="STATUS_INTERNAL_ERROR",
             )
 
     def _handle_async_trial_batch_results_get(self, batch_id: str) -> None:
+        started = time.monotonic()
+        ASYNC_METRICS.record("result_requests")
         try:
-            self._send_json(HTTPStatus.OK, get_async_batch_results(batch_id))
+            results = get_async_batch_results(batch_id)
+            delivered = self._send_async_json(
+                HTTPStatus.OK,
+                results,
+                operation="results",
+                batch_id=batch_id,
+            )
+            if delivered:
+                ASYNC_METRICS.record("result_responses_delivered")
+                _record_async_event(
+                    "async_results_response_delivered",
+                    batch_id=batch_id,
+                    state=results["state"],
+                    terminal_trials=results["terminal_trials"],
+                    available_results=results["available_results"],
+                    unavailable_results=results["unavailable_results"],
+                    result_delivery_latency_ms=round(
+                        (time.monotonic() - started) * 1000,
+                        3,
+                    ),
+                )
         except ValueError as exc:
-            self._send_json(
+            self._send_async_error(
                 HTTPStatus.BAD_REQUEST,
-                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+                exc,
+                operation="results",
+                category="MALFORMED_BATCH_ID",
+                batch_id=batch_id,
             )
         except BatchNotFound as exc:
-            self._send_json(
+            self._send_async_error(
                 HTTPStatus.NOT_FOUND,
-                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+                exc,
+                operation="results",
+                category="BATCH_NOT_FOUND",
+                batch_id=batch_id,
             )
         except Exception as exc:
-            self._send_json(
+            self._send_async_error(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
-                {"detail": {"exception_type": type(exc).__name__, "exception_message": str(exc)}},
+                exc,
+                operation="results",
+                category="RESULT_DELIVERY_INTERNAL_ERROR",
+                batch_id=batch_id,
             )
 
     def _send_run_trial_error(
@@ -1043,8 +1405,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.NOT_FOUND, {"detail": "not found"})
                 return
             if parsed.path == "/health":
+                async_health = _async_health_snapshot()
                 self._send_json(HTTPStatus.OK, {
-                    "status": "ok",
+                    "status": "ok" if not ENABLE_ASYNC_TRIAL_BATCHES or async_health["ready"] else "degraded",
                     "mode": "rollout",
                     "dataset_roots": {name: str(path) for name, path in _dataset_roots().items()},
                     "disabled_task_ids": sorted(_disabled_task_ids()),
@@ -1061,6 +1424,7 @@ class Handler(BaseHTTPRequestHandler):
                     "async_max_trials_per_batch": ASYNC_MAX_TRIALS_PER_BATCH,
                     "async_max_request_bytes": ASYNC_MAX_REQUEST_BYTES,
                     "async_max_bulk_status_ids": ASYNC_MAX_BULK_STATUS_IDS,
+                    "async_control_plane": async_health,
                     "trace_log": str(TRACE_LOG),
                 })
                 return

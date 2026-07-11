@@ -415,6 +415,26 @@ print(json.dumps(registry.get_batch_result_records(batch_id)))
         self.assertNotIn("batching_key", snapshots[0])
         self.assertEqual(snapshots[0]["queued_trials"], 1)
 
+    def test_health_snapshot_reports_readiness_and_compact_workload_counts(self) -> None:
+        admission = self.registry.admit_batch(self._request(trial_count=2))
+        first_trial_id = admission.response["trials"][0]["trial_execution_id"]
+        self.registry.mark_enqueue_intent_materialized(first_trial_id)
+        self.registry.reconcile_batch_trial_states(
+            admission.batch_id,
+            {first_trial_id: MODULE.TrialStateObservation(MODULE.TrialState.RUNNING)},
+        )
+
+        health = self.registry.health_snapshot()
+
+        self.assertTrue(health["ready"])
+        self.assertEqual(health["schema_version"], 2)
+        self.assertEqual(health["journal_mode"], "wal")
+        self.assertTrue(health["readable"])
+        self.assertEqual(health["outstanding_batches"], 1)
+        self.assertEqual(health["unmaterialized_intents"], 1)
+        self.assertEqual(health["batch_counts"], {"RUNNING": 1})
+        self.assertEqual(health["trial_counts"], {"QUEUED": 1, "RUNNING": 1})
+
     def test_schema_version_is_durable_and_incompatible_version_is_rejected(self) -> None:
         self.assertEqual(self.registry.schema_version, 2)
         with closing(sqlite3.connect(self.db_path)) as connection:
