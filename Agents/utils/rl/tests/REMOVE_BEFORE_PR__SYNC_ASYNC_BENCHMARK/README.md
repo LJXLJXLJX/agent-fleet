@@ -162,6 +162,11 @@ failure still has an A/B result. Equal-workload ratios are suppressed whenever
 either mode is incomplete or has transport errors; partial resource samples
 remain available in the per-mode summaries.
 
+Sync request latency includes synthetic execution and result delivery, while
+async request latency measures admission only. Use mode wall time and completion
+throughput for execution parity. Until status/bounded wait exists, async
+connection-seconds cover submit only and are not a full-lifecycle resource claim.
+
 ## Interpretation Limits
 
 - Public framework batch values are sample-count references, not proven HTTP

@@ -790,6 +790,12 @@ def _render_report(final_summary: dict[str, Any]) -> str:
         "",
         "## Results",
         "",
+        (
+            "Sync request latency includes synthetic execution and result delivery; async request "
+            "latency measures durable batch admission only. Compare mode wall time and completion "
+            "throughput for equal-workload execution parity."
+        ),
+        "",
         "| Metric | " + " | ".join(name.title() for name in mode_names) + " |",
         "| --- | " + " | ".join("---:" for _ in mode_names) + " |",
     ]
@@ -832,6 +838,11 @@ def _render_report(final_summary: dict[str, Any]) -> str:
             "Not collected. This run used `--skip-metrics`; macOS smoke results are not resource evidence."
         )
     else:
+        lines.append(
+            "The current async prototype has submit only; the runner observes result files directly. "
+            "Async connection-seconds therefore exclude the future GET/bounded-wait notification plane."
+        )
+        lines.append("")
         lines.extend(
             [
                 "| Metric | " + " | ".join(name.title() for name in mode_names) + " |",
@@ -885,6 +896,7 @@ def _render_report(final_summary: dict[str, Any]) -> str:
             "",
             "- This is a synthetic admission and execution-handoff test, not a real Harbor or training result.",
             "- It does not measure final unknown-outcome, lost-result, rolling-deploy, or trainer-stall metrics.",
+            "- Async connection ratios cover submit only; remeasure after batch GET/bounded wait is implemented.",
             "- Public-reference case sizes are structural sample-count references, not proven concurrency norms.",
             "",
         ]

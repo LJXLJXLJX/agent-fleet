@@ -643,6 +643,104 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"{self.address_string()} - {fmt % args}", flush=True)
 
+    def _handle_async_trial_batch_submit(self) -> None:
+        try:
+            response = _submit_async_trial_batch(self._read_json())
+            self._send_json(HTTPStatus.ACCEPTED, response)
+        except IdempotencyConflict as exc:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {
+                    "detail": {
+                        "exception_type": type(exc).__name__,
+                        "exception_message": str(exc),
+                        "request_id": exc.request_id,
+                    }
+                },
+            )
+        except (ValueError, FileNotFoundError, InvalidAdmissionRequest) as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "detail": {
+                        "exception_type": type(exc).__name__,
+                        "exception_message": str(exc),
+                    }
+                },
+            )
+        except Exception as exc:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {
+                    "detail": {
+                        "exception_type": type(exc).__name__,
+                        "exception_message": str(exc),
+                    }
+                },
+            )
+
+    def _send_run_trial_error(
+        self,
+        status: HTTPStatus,
+        exc: Exception,
+        *,
+        started: float,
+        request: dict[str, Any],
+        request_id: str,
+    ) -> None:
+        detail = {
+            "exception_type": type(exc).__name__,
+            "exception_message": str(exc),
+        }
+        _append_trace({
+            "event": "error",
+            "timestamp": _now(),
+            "request_id": request_id,
+            "task_id": request.get("task_id") or request.get("task_path") or "<unknown>",
+            "duration_sec": round(time.monotonic() - started, 3),
+            "exception_info": detail,
+        })
+        self._send_json(status, {"detail": detail})
+
+    def _handle_run_trial(self) -> None:
+        started = time.monotonic()
+        request: dict[str, Any] = {}
+        request_id = ""
+        try:
+            request = self._read_json()
+            request_id, result_path = _enqueue_request(request)
+            wait_timeout = float(
+                request.get("request_timeout")
+                or request.get("timeout")
+                or DEFAULT_TIMEOUT
+            )
+            result = _wait_result(result_path, wait_timeout)
+            _append_trace({
+                "event": "returned",
+                "timestamp": _now(),
+                "request_id": request_id,
+                "task_id": result.get("task_id"),
+                "status": "completed" if result.get("ok") else "failed",
+                "duration_sec": round(time.monotonic() - started, 3),
+            })
+            self._send_json(HTTPStatus.OK, result)
+        except ValueError as exc:
+            self._send_run_trial_error(
+                HTTPStatus.BAD_REQUEST,
+                exc,
+                started=started,
+                request=request,
+                request_id=request_id,
+            )
+        except Exception as exc:
+            self._send_run_trial_error(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                exc,
+                started=started,
+                request=request,
+                request_id=request_id,
+            )
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
@@ -689,84 +787,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
-        if path == "/async_trial_batches" and ENABLE_ASYNC_TRIAL_BATCHES:
-            try:
-                response = _submit_async_trial_batch(self._read_json())
-                self._send_json(HTTPStatus.ACCEPTED, response)
-            except IdempotencyConflict as exc:
-                self._send_json(
-                    HTTPStatus.CONFLICT,
-                    {
-                        "detail": {
-                            "exception_type": type(exc).__name__,
-                            "exception_message": str(exc),
-                            "request_id": exc.request_id,
-                        }
-                    },
-                )
-            except (ValueError, FileNotFoundError, InvalidAdmissionRequest) as exc:
-                self._send_json(
-                    HTTPStatus.BAD_REQUEST,
-                    {
-                        "detail": {
-                            "exception_type": type(exc).__name__,
-                            "exception_message": str(exc),
-                        }
-                    },
-                )
-            except Exception as exc:
-                self._send_json(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    {
-                        "detail": {
-                            "exception_type": type(exc).__name__,
-                            "exception_message": str(exc),
-                        }
-                    },
-                )
+        if path == "/async_trial_batches":
+            if ENABLE_ASYNC_TRIAL_BATCHES:
+                self._handle_async_trial_batch_submit()
+            else:
+                self._send_json(HTTPStatus.NOT_FOUND, {"detail": "not found"})
             return
-        if path != "/run_trial":
-            self._send_json(HTTPStatus.NOT_FOUND, {"detail": "not found"})
+        if path == "/run_trial":
+            self._handle_run_trial()
             return
-        started = time.monotonic()
-        request: dict[str, Any] = {}
-        request_id = ""
-        try:
-            request = self._read_json()
-            request_id, result_path = _enqueue_request(request)
-            wait_timeout = float(request.get("request_timeout") or request.get("timeout") or DEFAULT_TIMEOUT)
-            result = _wait_result(result_path, wait_timeout)
-            _append_trace({
-                "event": "returned",
-                "timestamp": _now(),
-                "request_id": request_id,
-                "task_id": result.get("task_id"),
-                "status": "completed" if result.get("ok") else "failed",
-                "duration_sec": round(time.monotonic() - started, 3),
-            })
-            self._send_json(HTTPStatus.OK, result)
-        except ValueError as exc:
-            detail = {"exception_type": type(exc).__name__, "exception_message": str(exc)}
-            _append_trace({
-                "event": "error",
-                "timestamp": _now(),
-                "request_id": request_id,
-                "task_id": request.get("task_id") or request.get("task_path") or "<unknown>",
-                "duration_sec": round(time.monotonic() - started, 3),
-                "exception_info": detail,
-            })
-            self._send_json(HTTPStatus.BAD_REQUEST, {"detail": detail})
-        except Exception as exc:
-            detail = {"exception_type": type(exc).__name__, "exception_message": str(exc)}
-            _append_trace({
-                "event": "error",
-                "timestamp": _now(),
-                "request_id": request_id,
-                "task_id": request.get("task_id") or request.get("task_path") or "<unknown>",
-                "duration_sec": round(time.monotonic() - started, 3),
-                "exception_info": detail,
-            })
-            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"detail": detail})
+        self._send_json(HTTPStatus.NOT_FOUND, {"detail": "not found"})
 
 
 def main() -> int:
