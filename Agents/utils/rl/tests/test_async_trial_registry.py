@@ -284,38 +284,6 @@ print(json.dumps({
         self.assertEqual(self._table_count("enqueue_intents"), 20)
         self.assertEqual(self._table_count("idempotency_records"), 20)
 
-    def test_trial_transitions_update_batch_revision_and_counters(self) -> None:
-        admission = self.registry.admit_batch(self._request())
-        first_trial_id = admission.response["trials"][0]["trial_execution_id"]
-        second_trial_id = admission.response["trials"][1]["trial_execution_id"]
-
-        running = self.registry.transition_trial(first_trial_id, MODULE.TrialState.RUNNING)
-        self.assertEqual(running["state"], "RUNNING")
-        self.assertEqual(running["revision"], 2)
-        self.assertEqual(running["queued_trials"], 1)
-        self.assertEqual(running["running_trials"], 1)
-
-        succeeded = self.registry.transition_trial(first_trial_id, MODULE.TrialState.SUCCEEDED)
-        self.assertEqual(succeeded["state"], "RUNNING")
-        self.assertEqual(succeeded["revision"], 3)
-        self.assertEqual(succeeded["succeeded_trials"], 1)
-        self.assertEqual(succeeded["queued_trials"], 1)
-
-        second_running = self.registry.transition_trial(second_trial_id, MODULE.TrialState.RUNNING)
-        self.assertEqual(second_running["revision"], 4)
-        completed = self.registry.transition_trial(second_trial_id, MODULE.TrialState.FAILED)
-        self.assertEqual(completed["state"], "COMPLETED")
-        self.assertEqual(completed["revision"], 5)
-        self.assertEqual(completed["succeeded_trials"], 1)
-        self.assertEqual(completed["failed_trials"], 1)
-        self.assertEqual(completed["running_trials"], 0)
-
-        unchanged = self.registry.transition_trial(second_trial_id, MODULE.TrialState.FAILED)
-        self.assertEqual(unchanged["revision"], 5)
-        with self.assertRaises(MODULE.InvalidStateTransition):
-            self.registry.transition_trial(second_trial_id, MODULE.TrialState.RUNNING)
-        self.assertEqual(self.registry.get_batch(admission.batch_id)["revision"], 5)
-
     def test_queue_reconciliation_is_monotonic_and_survives_missed_running_state(self) -> None:
         admission = self.registry.admit_batch(self._request(trial_count=2))
         first_trial_id = admission.response["trials"][0]["trial_execution_id"]

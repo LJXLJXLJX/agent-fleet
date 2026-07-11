@@ -296,8 +296,6 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
         self.assertEqual(queued["request_id"], trial["trial_execution_id"])
         self.assertEqual(queued["batch_id"], response["batch_id"])
         self.assertEqual(queued["client_trial_id"], "client-trial-0")
-        self.assertEqual(queued["logical_trial_id"], trial["trial_execution_id"])
-        self.assertEqual(queued["attempt_number"], 0)
         self.assertEqual(queued["session_id"], "session-0")
         self.assertEqual(queued["task_id"], "1")
         self.assertEqual(queued["metadata"]["group_id"], 0)
@@ -429,7 +427,7 @@ class RolloutRemoteHarborHTTPTest(unittest.TestCase):
             [second["batch_id"], first["batch_id"]],
         )
         self.assertEqual(response["missing_ids"], [missing])
-        self.assertEqual(response["expired_ids"], [])
+        self.assertNotIn("expired_ids", response)
 
     def test_async_get_distinguishes_malformed_unknown_and_missing_ids(self) -> None:
         malformed_status, malformed = self._request(

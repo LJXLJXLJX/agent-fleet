@@ -509,9 +509,6 @@ def _materialize_enqueue_intent(
                     "batch_id": intent["batch_id"],
                     "trial_execution_id": trial_execution_id,
                     "client_trial_id": trial_mapping["client_trial_id"],
-                    "logical_trial_id": trial_execution_id,
-                    "attempt_id": f"{trial_execution_id}:0",
-                    "attempt_number": 0,
                     "async_request_id": async_request_id,
                 }
             )
@@ -593,14 +590,10 @@ def reconcile_async_batch_status(batch_id: str) -> dict[str, Any]:
         if observation is None:
             continue
         current = TrialState(record["state"])
-        if current in {
-            TrialState.SUCCEEDED,
-            TrialState.FAILED,
-            TrialState.CANCELLED,
-            TrialState.DEADLINE_EXCEEDED,
-            TrialState.STALE_PRE_EXECUTION,
-            TrialState.STALE_POST_EXECUTION,
-        } and current != observation.state:
+        if (
+            current in {TrialState.SUCCEEDED, TrialState.FAILED}
+            and current != observation.state
+        ):
             continue
         state_changed = current != observation.state and not (
             current == TrialState.RUNNING and observation.state == TrialState.QUEUED
@@ -640,7 +633,6 @@ def get_async_batch_snapshots(batch_ids: list[str]) -> dict[str, Any]:
     return {
         "batches": snapshots,
         "missing_ids": missing_ids,
-        "expired_ids": [],
     }
 
 

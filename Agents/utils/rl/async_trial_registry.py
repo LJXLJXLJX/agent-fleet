@@ -19,7 +19,7 @@ import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -30,91 +30,44 @@ SCHEMA_VERSION = 1
 
 
 class BatchState(str, Enum):
-    PENDING = "PENDING"
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
-    CANCEL_REQUESTED = "CANCEL_REQUESTED"
     COMPLETED = "COMPLETED"
-    CANCELLED = "CANCELLED"
-    FAILED = "FAILED"
-    DEADLINE_EXCEEDED = "DEADLINE_EXCEEDED"
 
 
 class TrialState(str, Enum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
-    CANCEL_REQUESTED = "CANCEL_REQUESTED"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
-    CANCELLED = "CANCELLED"
-    DEADLINE_EXCEEDED = "DEADLINE_EXCEEDED"
-    STALE_PRE_EXECUTION = "STALE_PRE_EXECUTION"
-    STALE_POST_EXECUTION = "STALE_POST_EXECUTION"
 
 
 BATCH_TRANSITIONS = {
-    BatchState.PENDING: {BatchState.QUEUED},
     BatchState.QUEUED: {
         BatchState.RUNNING,
         BatchState.COMPLETED,
-        BatchState.CANCEL_REQUESTED,
-        BatchState.FAILED,
-        BatchState.DEADLINE_EXCEEDED,
     },
-    BatchState.RUNNING: {
-        BatchState.COMPLETED,
-        BatchState.CANCEL_REQUESTED,
-        BatchState.FAILED,
-        BatchState.DEADLINE_EXCEEDED,
-    },
-    BatchState.CANCEL_REQUESTED: {
-        BatchState.CANCELLED,
-        BatchState.COMPLETED,
-        BatchState.FAILED,
-        BatchState.DEADLINE_EXCEEDED,
-    },
+    BatchState.RUNNING: {BatchState.COMPLETED},
     BatchState.COMPLETED: set(),
-    BatchState.CANCELLED: set(),
-    BatchState.FAILED: set(),
-    BatchState.DEADLINE_EXCEEDED: set(),
 }
 
 TRIAL_TRANSITIONS = {
     TrialState.QUEUED: {
         TrialState.RUNNING,
-        TrialState.CANCELLED,
-        TrialState.DEADLINE_EXCEEDED,
-        TrialState.STALE_PRE_EXECUTION,
+        TrialState.SUCCEEDED,
+        TrialState.FAILED,
     },
     TrialState.RUNNING: {
         TrialState.SUCCEEDED,
         TrialState.FAILED,
-        TrialState.CANCEL_REQUESTED,
-        TrialState.DEADLINE_EXCEEDED,
-        TrialState.STALE_POST_EXECUTION,
-    },
-    TrialState.CANCEL_REQUESTED: {
-        TrialState.CANCELLED,
-        TrialState.SUCCEEDED,
-        TrialState.FAILED,
-        TrialState.DEADLINE_EXCEEDED,
-        TrialState.STALE_POST_EXECUTION,
     },
     TrialState.SUCCEEDED: set(),
     TrialState.FAILED: set(),
-    TrialState.CANCELLED: set(),
-    TrialState.DEADLINE_EXCEEDED: set(),
-    TrialState.STALE_PRE_EXECUTION: set(),
-    TrialState.STALE_POST_EXECUTION: set(),
 }
 
 TERMINAL_TRIAL_STATES = {
     TrialState.SUCCEEDED,
     TrialState.FAILED,
-    TrialState.CANCELLED,
-    TrialState.DEADLINE_EXCEEDED,
-    TrialState.STALE_PRE_EXECUTION,
-    TrialState.STALE_POST_EXECUTION,
 }
 
 OBSERVABLE_QUEUE_STATES = {
@@ -231,11 +184,9 @@ class AsyncTrialRegistry:
         path: str | Path,
         *,
         busy_timeout_seconds: float = 5.0,
-        idempotency_ttl_seconds: float | None = None,
     ) -> None:
         self.path = Path(path)
         self.busy_timeout_seconds = busy_timeout_seconds
-        self.idempotency_ttl_seconds = idempotency_ttl_seconds
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
@@ -310,9 +261,6 @@ class AsyncTrialRegistry:
                 running_trials INTEGER NOT NULL,
                 succeeded_trials INTEGER NOT NULL,
                 failed_trials INTEGER NOT NULL,
-                cancelled_trials INTEGER NOT NULL,
-                deadline_exceeded_trials INTEGER NOT NULL,
-                stale_trials INTEGER NOT NULL,
                 result_manifest_uri TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -329,7 +277,6 @@ class AsyncTrialRegistry:
                 session_id TEXT,
                 task_id TEXT,
                 state TEXT NOT NULL,
-                attempt_count INTEGER NOT NULL DEFAULT 0,
                 metadata_json TEXT NOT NULL,
                 result_uri TEXT,
                 normalized_error_category TEXT,
@@ -360,8 +307,7 @@ class AsyncTrialRegistry:
                 batch_id TEXT NOT NULL UNIQUE
                     REFERENCES async_trial_batches(batch_id) ON DELETE CASCADE,
                 response_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                expires_at TEXT
+                created_at TEXT NOT NULL
             )
             """
         )
@@ -410,11 +356,6 @@ class AsyncTrialRegistry:
         request_digest = canonical_request_digest(request)
         created_at = _now()
         created_at_text = _format_time(created_at)
-        expires_at = None
-        if self.idempotency_ttl_seconds is not None:
-            expires_at = _format_time(
-                created_at + timedelta(seconds=self.idempotency_ttl_seconds)
-            )
 
         batch_id = f"atb-{uuid4().hex}"
         trial_records = [
@@ -465,9 +406,8 @@ class AsyncTrialRegistry:
                     batch_id, request_id, client_batch_id, trainer_run_id,
                     batching_key_json, state, revision, requested_trials,
                     queued_trials, running_trials, succeeded_trials,
-                    failed_trials, cancelled_trials, deadline_exceeded_trials,
-                    stale_trials, result_manifest_uri, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, NULL, ?, ?)
+                    failed_trials, result_manifest_uri, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, NULL, ?, ?)
                 """,
                 (
                     batch_id,
@@ -489,9 +429,9 @@ class AsyncTrialRegistry:
                     """
                     INSERT INTO trial_executions (
                         trial_execution_id, batch_id, ordinal, client_trial_id,
-                        session_id, task_id, state, attempt_count, metadata_json,
+                        session_id, task_id, state, metadata_json,
                         result_uri, normalized_error_category, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
                     """,
                     (
                         trial_execution_id,
@@ -524,8 +464,8 @@ class AsyncTrialRegistry:
                 """
                 INSERT INTO idempotency_records (
                     request_id, request_digest, batch_id, response_json,
-                    created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     request_id,
@@ -533,7 +473,6 @@ class AsyncTrialRegistry:
                     batch_id,
                     response_json,
                     created_at_text,
-                    expires_at,
                 ),
             )
         return AdmissionResult(response=response, created=True)
@@ -597,9 +536,6 @@ class AsyncTrialRegistry:
             "running_trials": row["running_trials"],
             "succeeded_trials": row["succeeded_trials"],
             "failed_trials": row["failed_trials"],
-            "cancelled_trials": row["cancelled_trials"],
-            "deadline_exceeded_trials": row["deadline_exceeded_trials"],
-            "stale_trials": row["stale_trials"],
             "result_manifest_uri": row["result_manifest_uri"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -615,7 +551,7 @@ class AsyncTrialRegistry:
         trials = connection.execute(
             """
             SELECT trial_execution_id, ordinal, client_trial_id, session_id,
-                   task_id, state, attempt_count, metadata_json, result_uri,
+                   task_id, state, metadata_json, result_uri,
                    normalized_error_category, created_at, updated_at
             FROM trial_executions
             WHERE batch_id = ?
@@ -729,36 +665,6 @@ class AsyncTrialRegistry:
             )
             return materialized_at
 
-    def transition_trial(self, trial_execution_id: str, target: TrialState) -> dict[str, Any]:
-        target = TrialState(target)
-        updated_at = _format_time(_now())
-        with self._write_transaction() as connection:
-            trial = connection.execute(
-                """
-                SELECT batch_id, state
-                FROM trial_executions
-                WHERE trial_execution_id = ?
-                """,
-                (trial_execution_id,),
-            ).fetchone()
-            if trial is None:
-                raise TrialNotFound(trial_execution_id)
-            current = TrialState(trial["state"])
-            if current == target:
-                return self._get_batch(connection, str(trial["batch_id"]))
-            validate_trial_transition(current, target)
-            connection.execute(
-                """
-                UPDATE trial_executions
-                SET state = ?, updated_at = ?
-                WHERE trial_execution_id = ?
-                """,
-                (target.value, updated_at, trial_execution_id),
-            )
-            batch_id = str(trial["batch_id"])
-            self._refresh_batch(connection, batch_id, updated_at)
-            return self._get_batch(connection, batch_id)
-
     def reconcile_batch_trial_states(
         self,
         batch_id: str,
@@ -767,9 +673,9 @@ class AsyncTrialRegistry:
         """Monotonically reconcile one batch from observed queue artifacts.
 
         A restarted service may first observe a terminal result without ever
-        seeing the active file, so QUEUED -> terminal is valid here. Stale
-        pending/active observations never move a terminal trial backwards. All
-        observations are applied in one transaction and advance revision once.
+        seeing the active file, so QUEUED -> terminal is valid here. Outdated
+        queue observations never move a terminal trial backwards. All observations
+        are applied in one transaction and advance revision once.
         """
 
         updated_at = _format_time(_now())
@@ -810,9 +716,7 @@ class AsyncTrialRegistry:
                 state_changed = current != observed and not (
                     current == TrialState.RUNNING and observed == TrialState.QUEUED
                 )
-                if state_changed and not (
-                    current == TrialState.QUEUED and observed in TERMINAL_TRIAL_STATES
-                ):
+                if state_changed:
                     validate_trial_transition(current, observed)
 
                 result_uri = (
@@ -878,8 +782,7 @@ class AsyncTrialRegistry:
             SET state = ?, revision = revision + 1,
                 queued_trials = ?, running_trials = ?,
                 succeeded_trials = ?, failed_trials = ?,
-                cancelled_trials = ?, deadline_exceeded_trials = ?,
-                stale_trials = ?, updated_at = ?
+                updated_at = ?
             WHERE batch_id = ?
             """,
             (
@@ -888,9 +791,6 @@ class AsyncTrialRegistry:
                 counters["running_trials"],
                 counters["succeeded_trials"],
                 counters["failed_trials"],
-                counters["cancelled_trials"],
-                counters["deadline_exceeded_trials"],
-                counters["stale_trials"],
                 updated_at,
                 batch_id,
             ),
@@ -903,15 +803,9 @@ class AsyncTrialRegistry:
             SELECT
                 COUNT(*) AS requested_trials,
                 SUM(CASE WHEN state = 'QUEUED' THEN 1 ELSE 0 END) AS queued_trials,
-                SUM(CASE WHEN state IN ('RUNNING', 'CANCEL_REQUESTED') THEN 1 ELSE 0 END)
-                    AS running_trials,
+                SUM(CASE WHEN state = 'RUNNING' THEN 1 ELSE 0 END) AS running_trials,
                 SUM(CASE WHEN state = 'SUCCEEDED' THEN 1 ELSE 0 END) AS succeeded_trials,
-                SUM(CASE WHEN state = 'FAILED' THEN 1 ELSE 0 END) AS failed_trials,
-                SUM(CASE WHEN state = 'CANCELLED' THEN 1 ELSE 0 END) AS cancelled_trials,
-                SUM(CASE WHEN state = 'DEADLINE_EXCEEDED' THEN 1 ELSE 0 END)
-                    AS deadline_exceeded_trials,
-                SUM(CASE WHEN state IN ('STALE_PRE_EXECUTION', 'STALE_POST_EXECUTION')
-                         THEN 1 ELSE 0 END) AS stale_trials
+                SUM(CASE WHEN state = 'FAILED' THEN 1 ELSE 0 END) AS failed_trials
             FROM trial_executions
             WHERE batch_id = ?
             """,
@@ -921,19 +815,9 @@ class AsyncTrialRegistry:
 
     @staticmethod
     def _derive_batch_state(current: BatchState, counters: Mapping[str, int]) -> BatchState:
-        terminal_count = (
-            counters["succeeded_trials"]
-            + counters["failed_trials"]
-            + counters["cancelled_trials"]
-            + counters["deadline_exceeded_trials"]
-            + counters["stale_trials"]
-        )
+        terminal_count = counters["succeeded_trials"] + counters["failed_trials"]
         if terminal_count == counters["requested_trials"]:
-            if current == BatchState.CANCEL_REQUESTED:
-                return BatchState.CANCELLED
             return BatchState.COMPLETED
-        if current == BatchState.CANCEL_REQUESTED:
-            return BatchState.CANCEL_REQUESTED
         observed_execution = counters["succeeded_trials"] + counters["failed_trials"] > 0
         if (
             counters["running_trials"] > 0
