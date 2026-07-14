@@ -22,6 +22,7 @@ python3 Agents/utils/rl/tests/async_batch_submit_driver.py \
   --queue-root /path/to/rl-queue/jobs
 ```
 
-Future long-running, high-load, real Harbor, and Proxy validation assets also
-belong under this directory, but should use explicit manual entry points rather
-than `test_*.py` when they are unsuitable for the default discovery command.
+Long-running, high-load, restart, transport-fault, real Harbor, and Proxy
+validation uses the explicit entry points documented in
+`Agents/utils/rl/tests/manual/README.md`. Those scripts do not use `test_*.py`
+names and are not included in default discovery.

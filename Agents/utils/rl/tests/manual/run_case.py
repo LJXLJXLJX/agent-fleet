@@ -27,8 +27,8 @@ from uuid import uuid4
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SERVER_SCRIPT = SCRIPT_DIR / "benchmark_server.py"
-WORKER_SCRIPT = SCRIPT_DIR / "synthetic_queue_worker.py"
-COLLECTOR_SCRIPT = SCRIPT_DIR / "collect_process_metrics.py"
+WORKER_SCRIPT = SCRIPT_DIR / "synthetic_worker.py"
+COLLECTOR_SCRIPT = SCRIPT_DIR / "collect_metrics.py"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -111,7 +111,10 @@ def _request_json(
         connection.connect()
         if connection.sock is not None:
             connection.sock.settimeout(timeout)
-        connection.request(method, parsed.path or "/", body=body, headers=headers)
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+        connection.request(method, target, body=body, headers=headers)
         response = connection.getresponse()
         raw_body = response.read()
         decoded: Any = {}
@@ -399,6 +402,9 @@ def _registry_counts(path: Path) -> dict[str, int] | None:
 def _audit_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     claims = [event for event in events if event.get("event") == "claim"]
     finishes = [event for event in events if event.get("event") == "finish"]
+    duplicate_result_writes = sum(
+        event.get("event") == "duplicate_result_write" for event in events
+    )
     claim_counts = Counter(str(event.get("request_id")) for event in claims)
     duplicate_claims = sum(count - 1 for count in claim_counts.values() if count > 1)
     throughput = None
@@ -412,6 +418,7 @@ def _audit_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         "finishes": len(finishes),
         "unique_request_ids": len(claim_counts),
         "duplicate_claims": duplicate_claims,
+        "duplicate_result_writes": duplicate_result_writes,
         "completion_throughput_per_second": throughput,
     }
 
@@ -457,6 +464,13 @@ def _worker_command(case: dict[str, Any], work_dir: Path, audit_log: Path) -> li
         )
     else:
         command.extend(["--delay-seconds", str(case["delay_seconds"])])
+    for case_key, option in (
+        ("failure_fraction", "--failure-fraction"),
+        ("hang_fraction", "--hang-fraction"),
+        ("duplicate_result_fraction", "--duplicate-result-fraction"),
+    ):
+        if case_key in case:
+            command.extend([option, str(case[case_key])])
     return command
 
 

@@ -69,6 +69,14 @@ def main() -> int:
         return f"benchmark-{ray_submission_id}"
 
     module._ensure_submission_zellij = synthetic_zellij
+    recovery = module.reconcile_async_state_on_startup()
+    print(
+        "benchmark startup recovery "
+        f"batches={recovery['batches_scanned']} "
+        f"materialized={recovery['intents_materialized']} "
+        f"completed={recovery['completed_batches']}",
+        flush=True,
+    )
     server = ThreadingHTTPServer((args.host, args.port), module.Handler)
     print(
         f"benchmark rollout server pid={os.getpid()} address={args.host}:{args.port} "

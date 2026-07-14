@@ -1,0 +1,29 @@
+{
+  "name": "lifecycle-smoke-32",
+  "trials": 32,
+  "async_batch_size": 8,
+  "server_max_trials_per_batch": 16,
+  "admission_rejection_probe_trials": 17,
+  "execution_capacity": 8,
+  "delay_profile": [
+    {"fraction": 0.5, "seconds": 0.2},
+    {"fraction": 0.5, "seconds": 1.0}
+  ],
+  "failure_fraction": 0.125,
+  "submit_concurrency": 4,
+  "status_chunk_size": 16,
+  "poll_interval_seconds": 0.05,
+  "request_timeout_seconds": 0.3,
+  "recovery_timeout_seconds": 5.0,
+  "lifecycle_timeout_seconds": 30.0,
+  "drop_submit_response_batches": [0],
+  "duplicate_submit_clients": 2,
+  "drop_status_at_progress": [0.1, 0.3, 0.7],
+  "drop_results_response_every": 2,
+  "result_fetch_delay_seconds": 0.5,
+  "restart_phase": "mixed-terminal",
+  "restart_style": "kill",
+  "restart_downtime_seconds": 0.2,
+  "metric_interval_seconds": 0.02,
+  "classification": "tool-smoke-not-production-evidence"
+}

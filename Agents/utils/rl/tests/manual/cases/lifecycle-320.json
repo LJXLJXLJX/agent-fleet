@@ -1,0 +1,28 @@
+{
+  "name": "lifecycle-320",
+  "trials": 320,
+  "async_batch_size": 32,
+  "server_max_trials_per_batch": 64,
+  "admission_rejection_probe_trials": 65,
+  "execution_capacity": 60,
+  "delay_profile": [
+    {"fraction": 0.8, "seconds": 1.0},
+    {"fraction": 0.19, "seconds": 3.0},
+    {"fraction": 0.01, "seconds": 6.0}
+  ],
+  "submit_concurrency": 10,
+  "status_chunk_size": 128,
+  "poll_interval_seconds": 0.5,
+  "request_timeout_seconds": 2.0,
+  "recovery_timeout_seconds": 30.0,
+  "lifecycle_timeout_seconds": 180.0,
+  "drop_submit_response_batches": [0],
+  "duplicate_submit_clients": 2,
+  "drop_status_at_progress": [0.1, 0.3, 0.7],
+  "drop_results_response_every": 5,
+  "restart_phase": "mixed-terminal",
+  "restart_style": "kill",
+  "restart_downtime_seconds": 1.0,
+  "metric_interval_seconds": 0.05,
+  "classification": "synthetic-control-plane-capacity-not-production-concurrency-norm"
+}
