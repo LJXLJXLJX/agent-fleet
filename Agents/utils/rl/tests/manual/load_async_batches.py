@@ -32,7 +32,13 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _drop_response(method: str, url: str, payload: dict[str, Any] | None = None) -> None:
+def _drop_response(
+    method: str,
+    url: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    retry_timeout: float,
+) -> None:
     parsed = urlparse(url)
     body = b"" if payload is None else json.dumps(payload, separators=(",", ":")).encode()
     target = parsed.path or "/"
@@ -51,8 +57,19 @@ def _drop_response(method: str, url: str, payload: dict[str, Any] | None = None)
             ]
         )
     request = ("\r\n".join(headers) + "\r\n\r\n").encode("ascii") + body
-    with socket.create_connection((str(parsed.hostname), int(parsed.port)), timeout=5.0) as conn:
-        conn.sendall(request)
+    deadline = time.monotonic() + retry_timeout
+    while True:
+        try:
+            with socket.create_connection(
+                (str(parsed.hostname), int(parsed.port)),
+                timeout=min(1.0, max(0.05, deadline - time.monotonic())),
+            ) as conn:
+                conn.sendall(request)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
 
 
 def _admission_exists(database: Path, request_id: str) -> bool:
@@ -126,7 +143,12 @@ def _submit_one(
     drop_started: float | None = None
     if dropped:
         drop_started = time.monotonic()
-        _drop_response("POST", endpoint, payload)
+        _drop_response(
+            "POST",
+            endpoint,
+            payload,
+            retry_timeout=recovery_timeout,
+        )
         admission_confirmed_after_drop = _wait_until(
             lambda: _admission_exists(registry_path, str(payload["request_id"])),
             recovery_timeout,
@@ -298,7 +320,7 @@ def run(case: dict[str, Any], base_url: str, work_dir: Path, manifest: Path) -> 
             drop_started_at: list[float] = []
             if drop_status_every > 0 and (status_requests + 1) % drop_status_every == 0:
                 drop_started_at.append(time.monotonic())
-                _drop_response("GET", url)
+                _drop_response("GET", url, retry_timeout=recovery_timeout)
                 dropped_status_responses += 1
                 drops_before_request += 1
             progress = (
@@ -311,7 +333,7 @@ def run(case: dict[str, Any], base_url: str, work_dir: Path, manifest: Path) -> 
                 and progress >= progress_drop_targets[progress_drop_index]
             ):
                 drop_started_at.append(time.monotonic())
-                _drop_response("GET", url)
+                _drop_response("GET", url, retry_timeout=recovery_timeout)
                 dropped_status_responses += 1
                 drops_before_request += 1
                 progress_drop_index += 1
@@ -367,7 +389,7 @@ def run(case: dict[str, Any], base_url: str, work_dir: Path, manifest: Path) -> 
         result_drop_started_at: float | None = None
         if drop_results_every > 0 and index % drop_results_every == 0:
             result_drop_started_at = time.monotonic()
-            _drop_response("GET", url)
+            _drop_response("GET", url, retry_timeout=recovery_timeout)
             dropped_result_responses += 1
         result, attempts, recovery = _request_with_retry(
             "GET",
