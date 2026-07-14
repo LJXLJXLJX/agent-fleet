@@ -1,8 +1,8 @@
 # Rollout 异步控制面验证报告
 
-状态：**Conditional Go**  
-测试日期：2026-07-10 至 2026-07-14  
-验证分支：`feature/async-trial-batches`  
+状态：**Conditional Go**
+测试日期：2026-07-10 至 2026-07-14
+验证分支：`feature/async-trial-batches`
 最终生命周期与故障注入复测版本：`0f23c60`
 
 ## 1. 执行摘要
