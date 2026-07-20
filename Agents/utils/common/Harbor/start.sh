@@ -83,12 +83,10 @@ harbor_report_foreground_result() {
 harbor_stop_rollout_zellij_sessions() {
   local session
   while IFS= read -r session; do
-    case "$session" in
-      harbor-rollout-*)
-        zellij kill-session "$session" >/dev/null 2>&1 || true
-        zellij delete-session "$session" >/dev/null 2>&1 || true
-        ;;
-    esac
+    if [[ "$session" == harbor-rollout-* || "$session" =~ ^hr-[0-9a-f]{32}$ ]]; then
+      zellij kill-session "$session" >/dev/null 2>&1 || true
+      zellij delete-session "$session" >/dev/null 2>&1 || true
+    fi
   done < <(zellij list-sessions --short 2>/dev/null || true)
 }
 

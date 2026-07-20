@@ -2,7 +2,8 @@
 
 | Script | Purpose |
 | --- | --- |
-| `setup.sh` | One-shot control-plane bootstrap: installs Node, Pi, and the pinned host Harbor runner; writes config and installs the Pi skills |
+| `setup.sh` | One-shot control-plane bootstrap: installs Node, Pi, and the pinned host Harbor runner; writes config, installs Git hooks, and installs the Pi skills |
+| `install-git-hooks.sh` | Enable the repository's advisory Ruff pre-commit hook for an existing checkout |
 | `run_fleet.sh` | Routes tasksets to the existing Harbor or OpenClaw runner |
 | `fleet_spec.sh` | Internal dispatcher for validated single- and multi-run spec inputs |
 | `fleet_batch.sh` | Internal concurrent launcher for normalized multi-run inputs |
@@ -59,7 +60,7 @@ dependency and is prepared separately by the runner.
 4. Install Pi (pinned to 0.81.1)
 5. Merge the `sii-gateway` Pi provider and default model
 6. Write the prerequisite path contract and control-plane env to `~/.bashrc`
-7. Validate the current checkout and sync its submodules
+7. Validate the current checkout, sync its submodules, and enable repository Git hooks
 8. Create or validate the pinned Harbor/Opik runner environment
 9. Install the Pi skills
 10. Write this checkout's ignored `config.local.env`
@@ -94,6 +95,21 @@ dependency and is prepared separately by the runner.
 Safe to re-run.
 
 </details>
+
+### Advisory Ruff commit hook
+
+`setup.sh` enables `.githooks/pre-commit` through the checkout-local
+`core.hooksPath` setting. Existing checkouts can enable it directly:
+
+```bash
+./scripts/install-git-hooks.sh
+```
+
+The hook runs the same Ruff configuration as CI against repository-tracked
+Python files (excluding an initialized submodule checkout). A clean check continues
+normally. If Ruff reports errors (or cannot run), the hook asks whether to
+continue; only `y` or `Y` permits the commit, so the check remains advisory
+without silently ignoring failures.
 
 ### Prerequisite paths
 

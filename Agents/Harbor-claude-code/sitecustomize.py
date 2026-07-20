@@ -487,6 +487,15 @@ def _patch_claude_code_realtime_hooks() -> None:
                     "export PATH=\"$HOME/.local/bin:$PATH\"; "
                     f"{patched_command}"
                 )
+            if not hook_enabled:
+                return await original_exec_as_agent(
+                    environment,
+                    patched_command,
+                    env=env,
+                    cwd=cwd,
+                    timeout_sec=timeout_sec,
+                )
+
             # Harbor AK 2.1.69 run() first calls exec_as_agent with a setup
             # command that creates $CLAUDE_CONFIG_DIR subdirectories (debug,
             # projects/-app, etc.) but never writes settings.json.  We detect
@@ -614,5 +623,8 @@ def _patch_claude_code_fallback() -> None:
     ClaudeCode._opik_fallback_patch_applied = True
 
 
+from e2b_runtime import patch_e2b_runtime_from_env
+
+patch_e2b_runtime_from_env()
 _patch_claude_code_realtime_hooks()
 _patch_claude_code_fallback()

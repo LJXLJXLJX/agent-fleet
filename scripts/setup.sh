@@ -498,6 +498,10 @@ if ! git -C "$REPO_DIR" submodule sync --recursive ||
   exit 1
 fi
 
+info "Enabling repository Git hooks..."
+"$SOURCE_REPO_ROOT/scripts/install-git-hooks.sh" "$REPO_DIR"
+ok "Git hooks enabled"
+
 if [[ ! -d "$REPO_DIR/skills" ]]; then
   err "$REPO_DIR/skills not found, repo structure looks wrong"
   exit 1

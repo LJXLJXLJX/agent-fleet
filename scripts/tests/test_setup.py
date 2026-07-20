@@ -19,6 +19,11 @@ class SetupTest(unittest.TestCase):
         for path in (self.home, self.repo / ".git", self.bin_dir, self.state):
             path.mkdir(parents=True)
 
+        hook = self.repo / ".githooks" / "pre-commit"
+        hook.parent.mkdir()
+        hook.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        hook.chmod(0o755)
+
         for skill in (
             "harbor-benchmark-runner",
             "openclaw-fleet-operations",
@@ -89,7 +94,9 @@ if [[ "${1:-}" == "-C" && "${3:-}" == "rev-parse" && "${4:-}" == "--git-dir" ]];
 fi
 if [[ "${1:-}" == "clone" ]]; then
   destination="${@: -1}"
-  mkdir -p "$destination/.git"
+  mkdir -p "$destination/.git" "$destination/.githooks"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$destination/.githooks/pre-commit"
+  chmod +x "$destination/.githooks/pre-commit"
   for skill in \
     harbor-benchmark-runner \
     openclaw-fleet-operations \
@@ -264,6 +271,7 @@ exit 0
         self.assertNotIn("clone", git_log)
         self.assertIn("submodule sync --recursive", git_log)
         self.assertIn("submodule update --init --recursive", git_log)
+        self.assertIn("config core.hooksPath .githooks", git_log)
 
         pi_dir = self.home / ".pi" / "agent"
         settings = json.loads((pi_dir / "settings.json").read_text(encoding="utf-8"))

@@ -41,7 +41,8 @@ class ClaudeCommandPatchTest(unittest.TestCase):
 
             async def run(self, instruction, environment, context):
                 command = (
-                    "claude --append-system-prompt Use English only for all reasoning. "
+                    "claude --verbose --output-format=stream-json "
+                    "--append-system-prompt Use English only for all reasoning. "
                     "--permission-mode=bypassPermissions --print -- 'real task'"
                 )
                 return await self.exec_as_agent(environment, command)
@@ -69,6 +70,7 @@ class ClaudeCommandPatchTest(unittest.TestCase):
             asyncio.run(agent.run("real task", object(), object()))
 
         self.assertEqual(len(captured), 1)
+        self.assertIn('export PATH="$HOME/.local/bin:$PATH";', captured[0])
         argv = shlex.split(captured[0])
         prompt_index = argv.index("--append-system-prompt")
         self.assertEqual(argv[prompt_index + 1], "Use English only for all reasoning.")

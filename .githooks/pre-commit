@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+ruff_version="0.16.0"
+
+confirm_commit() {
+  local answer=""
+  printf '[WARN] Ruff did not pass. Commit anyway? [y/N] ' >&2
+  if [[ ! -r /dev/tty ]]; then
+    printf '\n[ERROR] Ruff confirmation requires an interactive terminal; commit aborted.\n' >&2
+    return 1
+  fi
+  IFS= read -r answer </dev/tty || return 1
+  if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+    printf '[WARN] Continuing commit despite Ruff errors.\n' >&2
+    return 0
+  fi
+  printf '[INFO] Commit aborted. Fix Ruff errors and try again.\n' >&2
+  return 1
+}
+
+run_ruff() {
+  local managed_bin="${AGENT_FLEET_BIN_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/agent-fleet/bin}"
+  local -a python_files=()
+  mapfile -d '' python_files < <(git ls-files -z -- '*.py')
+  if (( ${#python_files[@]} == 0 )); then
+    return 0
+  fi
+  if command -v ruff >/dev/null 2>&1; then
+    ruff check --config .github/ruff.toml "${python_files[@]}"
+  elif command -v uvx >/dev/null 2>&1; then
+    uvx --from "ruff==$ruff_version" ruff check --config .github/ruff.toml \
+      "${python_files[@]}"
+  elif [[ -x "$managed_bin/uvx" ]]; then
+    "$managed_bin/uvx" --from "ruff==$ruff_version" ruff check \
+      --config .github/ruff.toml "${python_files[@]}"
+  else
+    printf '[WARN] Ruff is unavailable; install Ruff %s or run scripts/setup.sh.\n' \
+      "$ruff_version" >&2
+    return 127
+  fi
+}
+
+cd "$repo_root"
+if run_ruff; then
+  exit 0
+fi
+confirm_commit
