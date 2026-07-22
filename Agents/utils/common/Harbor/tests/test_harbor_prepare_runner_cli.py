@@ -61,13 +61,24 @@ class RunnerValidationTest(unittest.TestCase):
             self.python,
             "#!/bin/sh\n"
             f"[ \"$#\" = 2 ] && echo {python_version} && exit 0\n"
-            f"[ \"$3\" = harbor ] && echo {harbor_version} || echo 2.1.32\n",
+            f"[ \"$3\" = harbor ] && echo {harbor_version} && exit 0\n"
+            "[ \"$3\" = opik ] && echo 2.1.32 && exit 0\n"
+            "[ \"$3\" = pip ] && echo 25.2 && exit 0\n"
+            "[ \"$3\" = s3cmd ] && echo 2.4.0 && exit 0\n"
+            "[ \"$3\" = yicloud-sdk-python ] && echo 0.3.1 && exit 0\n"
+            "exit 1\n",
         )
 
     def test_manifest_contains_only_exact_production_versions(self) -> None:
         self.assertEqual(
             MODULE.load_requirements(self.requirements),
-            [("harbor", "0.18.0"), ("opik", "2.1.32")],
+            [
+                ("harbor", "0.18.0"),
+                ("opik", "2.1.32"),
+                ("pip", "25.2"),
+                ("s3cmd", "2.4.0"),
+                ("yicloud-sdk-python", "0.3.1"),
+            ],
         )
         invalid = self.root / "invalid.txt"
         invalid.write_text("harbor>=0.18.0\n", encoding="utf-8")

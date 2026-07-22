@@ -1,0 +1,42 @@
+#!/usr/bin/env sh
+set -eu
+
+# Some benchmark verifier scripts unconditionally run the official uv
+# installer even when Agent Fleet has already provided uv/uvx. Intercept only
+# that installer URL and emit a local installer compatible with
+# `curl ... | sh`. All unrelated curl traffic keeps using the system binary.
+uv_installer_url=""
+for argument in "$@"; do
+  case "$argument" in
+    https://astral.sh/uv/install.sh|https://astral.sh/uv/*/install.sh)
+      uv_installer_url="$argument"
+      ;;
+  esac
+done
+
+if [ -n "$uv_installer_url" ]; then
+  cat <<'INSTALL'
+set -eu
+offline_uv_dir="${TB_VERIFIER_UV_BIN_DIR:-/opt/tb-uv-backup/bin}"
+if [ ! -x "$offline_uv_dir/uv" ] || [ ! -x "$offline_uv_dir/uvx" ]; then
+  echo "[agent-fleet] preloaded verifier uv/uvx are missing from $offline_uv_dir" >&2
+  exit 1
+fi
+mkdir -p "$HOME/.local/bin"
+cp -f "$offline_uv_dir/uv" "$HOME/.local/bin/uv"
+cp -f "$offline_uv_dir/uvx" "$HOME/.local/bin/uvx"
+chmod +x "$HOME/.local/bin/uv" "$HOME/.local/bin/uvx"
+printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH"' >"$HOME/.local/bin/env"
+echo "[agent-fleet] installed verifier uv/uvx from preloaded offline tools" >&2
+INSTALL
+  exit 0
+fi
+
+for system_curl in /usr/bin/curl /bin/curl /usr/local/bin/curl; do
+  if [ -x "$system_curl" ]; then
+    exec "$system_curl" "$@"
+  fi
+done
+
+echo "[agent-fleet] system curl is unavailable" >&2
+exit 127

@@ -49,6 +49,12 @@ harbor_is_native_registry_main() {
     && [[ "${HARBOR_QUEUE_WORKER:-0}" != "1" ]]
 }
 
+harbor_uses_local_opensandbox_dataset() {
+  [[ "$TB_ENVIRONMENT_TYPE" == "opensandbox" ]] \
+    && [[ -n "${TB_PATH:-}" ]] \
+    && [[ -d "$TB_PATH" ]]
+}
+
 write_harbor_registry_summary() {
   local exit_code="$1"
   local job_dir=""
@@ -202,7 +208,122 @@ append_rust_package_mirror_env() {
 }
 
 append_harbor_unprivileged_docker_compose() {
-  cmd+=( --extra-docker-compose "$SCRIPT_DIR/overlays/unprivileged-task.yaml" )
+  if [[ "$TB_ENVIRONMENT_TYPE" == "docker" ]]; then
+    cmd+=( --extra-docker-compose "$SCRIPT_DIR/overlays/unprivileged-task.yaml" )
+  fi
+}
+
+validate_environment_backend() {
+  case "$TB_ENVIRONMENT_TYPE" in
+    docker)
+      ;;
+    opensandbox)
+      local name
+      for name in YICLOUD_PUBLIC_KEY YICLOUD_SECRET_KEY YICLOUD_PROJECT_NAME; do
+        if [[ -z "${!name:-}" ]]; then
+          echo "[ERROR] required environment variable is unset: $name" >&2
+          exit 1
+        fi
+      done
+      if [[ -z "${YICLOUD_SANDBOX_ENVIRONMENT_ID:-}" \
+        && -z "${YICLOUD_SANDBOX_ENVIRONMENT_NAME:-}" ]]; then
+        echo '[ERROR] OpenSandbox requires YICLOUD_SANDBOX_ENVIRONMENT_ID or YICLOUD_SANDBOX_ENVIRONMENT_NAME' >&2
+        echo '[ERROR] refusing to create an instance without an explicit environment binding' >&2
+        exit 1
+      fi
+      echo "[INFO] OpenSandbox environment binding: id=${YICLOUD_SANDBOX_ENVIRONMENT_ID:-<resolved-by-name>} name=${YICLOUD_SANDBOX_ENVIRONMENT_NAME:-<lookup-by-id>}"
+      if [[ -z "$HARBOR_OPENSANDBOX_IMAGE_REF" ]]; then
+        if [[ -z "$HARBOR_OPENSANDBOX_IMAGE_REPOSITORY" ]]; then
+          echo "[ERROR] HARBOR_OPENSANDBOX_IMAGE_REPOSITORY is required when HARBOR_OPENSANDBOX_IMAGE_REF is unset" >&2
+          exit 1
+        fi
+        if [[ ! -f "$HARBOR_OPENSANDBOX_IMAGE_MANAGER" ]]; then
+          echo "[ERROR] OpenSandbox image manager not found: $HARBOR_OPENSANDBOX_IMAGE_MANAGER" >&2
+          exit 1
+        fi
+      fi
+      ;;
+    *)
+      echo "[ERROR] TB_ENVIRONMENT_TYPE must be docker or opensandbox, got: $TB_ENVIRONMENT_TYPE" >&2
+      exit 1
+      ;;
+  esac
+}
+
+ensure_environment_backend() {
+  validate_environment_backend
+  if [[ "$TB_ENVIRONMENT_TYPE" == "docker" ]]; then
+    ensure_docker_daemon
+  fi
+}
+
+prepare_opensandbox_image_ref() {
+  if [[ "$TB_ENVIRONMENT_TYPE" != "opensandbox" || -n "$HARBOR_OPENSANDBOX_IMAGE_REF" ]]; then
+    return 0
+  fi
+  # DATASET_NAME can have a Harbor Registry alias (for example, seta ->
+  # seta-env) while rollout workers still provide a real local TB_PATH.
+  # OpenSandbox image preparation needs the local task definition, so decide
+  # from the path itself instead of the dataset's registry capability.
+  if [[ -z "${TB_PATH:-}" || ! -d "$TB_PATH" ]]; then
+    echo "[ERROR] automatic OpenSandbox image preparation currently requires a local dataset path" >&2
+    exit 1
+  fi
+
+  local manager_python="${HARBOR_OPIK_PYTHON:-}"
+  if [[ -z "$manager_python" || ! -x "$manager_python" ]]; then
+    manager_python="$(command -v python3)"
+  fi
+  local -a manager_cmd=(
+    "$manager_python" "$HARBOR_OPENSANDBOX_IMAGE_MANAGER"
+    --dataset-root "$TB_PATH"
+    --include "$INCLUDE_TASKS"
+    --registry "$HARBOR_OPENSANDBOX_REGISTRY"
+    --repository "$HARBOR_OPENSANDBOX_IMAGE_REPOSITORY"
+    --sandbox-image-prefix "$HARBOR_OPENSANDBOX_SANDBOX_IMAGE_PREFIX"
+    --docker-config "$HARBOR_OPENSANDBOX_DOCKER_CONFIG"
+    --cache-root "$HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT"
+    --platform "$HARBOR_OPENSANDBOX_IMAGE_PLATFORM"
+    --tag-prefix "$HARBOR_OPENSANDBOX_IMAGE_TAG_PREFIX"
+    --dockerhub-mirror-prefix "$HARBOR_OPENSANDBOX_DOCKERHUB_MIRROR_PREFIX"
+    --apt-mirror "$HARBOR_OPENSANDBOX_APT_MIRROR"
+    --build-args-json "$HARBOR_OPENSANDBOX_BUILD_ARGS_JSON"
+  )
+  if [[ "${TB_FORCE_BUILD:-0}" == "1" ]]; then
+    manager_cmd+=( --force )
+  fi
+  if [[ "$HARBOR_OPENSANDBOX_BUILD_USE_PROXY" == "1" ]]; then
+    manager_cmd+=( --use-proxy )
+  fi
+  if [[ "$TB_DRY_RUN" == "1" ]]; then
+    manager_cmd+=( --dry-run )
+  else
+    ensure_docker_daemon
+  fi
+
+  echo "[INFO] preparing OpenSandbox image for task: $INCLUDE_TASKS" >&2
+  if ! HARBOR_OPENSANDBOX_IMAGE_REF="$("${manager_cmd[@]}")"; then
+    echo "[ERROR] OpenSandbox image preparation failed" >&2
+    exit 1
+  fi
+  if [[ -z "$HARBOR_OPENSANDBOX_IMAGE_REF" ]]; then
+    echo "[ERROR] OpenSandbox image manager returned an empty image reference" >&2
+    exit 1
+  fi
+  export HARBOR_OPENSANDBOX_IMAGE_REF
+  echo "[INFO] OpenSandbox image ready: $HARBOR_OPENSANDBOX_IMAGE_REF" >&2
+}
+
+append_environment_backend_args() {
+  if [[ "$TB_ENVIRONMENT_TYPE" == "opensandbox" ]]; then
+    cmd+=(
+      --env "$TB_ENVIRONMENT_SPEC"
+      --ek "image_ref=$HARBOR_OPENSANDBOX_IMAGE_REF"
+      --ek "lifecycle_minutes=$YICLOUD_SANDBOX_LIFECYCLE_MINUTES"
+    )
+  else
+    append_harbor_unprivileged_docker_compose
+  fi
 }
 
 ensure_trace_plugin_source_if_needed() {
@@ -236,14 +357,19 @@ ensure_trace_plugin_source_if_needed() {
 
 prepare_verifier_uv_bin() {
   local target_dir="$1"
-  local uv_bin uvx_bin
+  local uv_bin uvx_bin curl_shim
   if [[ -z "$target_dir" ]]; then
     return 1
   fi
   uv_bin="$(command -v uv || true)"
   uvx_bin="$(command -v uvx || true)"
+  curl_shim="$SCRIPT_DIR/verifier-tools/curl"
   if [[ -z "$uv_bin" || -z "$uvx_bin" ]]; then
     echo "[WARN] uv/uvx not found on host; verifier will use its normal uv install path" >&2
+    return 1
+  fi
+  if [[ ! -x "$curl_shim" ]]; then
+    echo "[WARN] verifier offline curl shim is missing or not executable: $curl_shim" >&2
     return 1
   fi
   if [[ "$(uname -s 2>/dev/null || true)" != "Linux" ]]; then
@@ -263,10 +389,12 @@ prepare_verifier_uv_bin() {
   mkdir -p "$target_dir"
   cp -f "$uv_bin" "$target_dir/uv"
   cp -f "$uvx_bin" "$target_dir/uvx"
-  chmod +x "$target_dir/uv" "$target_dir/uvx"
-  # Keep the backup outside $HOME/.local/bin so the verifier's normal uv
-  # installer can write there first. PATH puts this directory after common
-  # installer locations, so it only wins when the verifier has no uv of its own.
+  cp -f "$curl_shim" "$target_dir/curl"
+  chmod +x "$target_dir/uv" "$target_dir/uvx" "$target_dir/curl"
+  # The curl shim makes benchmark boilerplate such as
+  # `curl https://astral.sh/uv/.../install.sh | sh` install these local
+  # binaries without touching the network. The common installer locations
+  # remain ahead of this directory so the task observes its expected layout.
   cat >"$target_dir/env" <<EOF
 export PATH="\$HOME/.local/bin:$TB_VERIFIER_UV_BIN_DIR_MOUNT_PATH:\$PATH"
 EOF
@@ -434,6 +562,9 @@ verify_opik_ingestion_route() {
 }
 
 docker_hub_preflight_check() {
+  if [[ "$TB_ENVIRONMENT_TYPE" != "docker" ]]; then
+    return 0
+  fi
   if [[ "$TB_SKIP_DOCKERHUB_PREFLIGHT" == "1" ]]; then
     echo "[INFO] TB_SKIP_DOCKERHUB_PREFLIGHT=1, skip Docker Hub connectivity preflight"
     return 0
@@ -514,6 +645,111 @@ apply_min_test_defaults() {
   fi
 
   echo "[INFO] MIN_TEST=1 enabled (runs=$TB_RUNS, limit=$TB_LIMIT, include_tasks=$INCLUDE_TASKS)"
+}
+
+run_oracle_task() {
+  local effective_jobs_root="$JOBS_ROOT"
+  if ! mkdir -p "$effective_jobs_root" 2>/dev/null; then
+    effective_jobs_root="$HOME/harbor_jobs"
+    mkdir -p "$effective_jobs_root"
+    echo "[WARN] unable to use JOBS_ROOT=$JOBS_ROOT, fallback to $effective_jobs_root"
+  fi
+
+  local job_name out_dir
+  job_name="$(date +%Y-%m-%d__%H-%M-%S)"
+  out_dir="$effective_jobs_root/$job_name"
+  mkdir -p "$out_dir"
+
+  if [[ "$TB_DRY_RUN" != "1" ]]; then
+    harbor_prepare_runner_cli
+  fi
+  prepare_opensandbox_image_ref
+
+  local cmd=(
+    "$HARBOR_CLI_BIN" run
+    -y
+    --env "$TB_ENVIRONMENT_SPEC"
+    --n-concurrent "$TB_N_CONCURRENT"
+    --max-retries "$TB_MAX_RETRIES"
+    -o "$out_dir"
+    -k "$TB_RUNS"
+    -a oracle
+    --timeout-multiplier "$TB_TIMEOUT_MULTIPLIER"
+    --agent-setup-timeout-multiplier "$TB_AGENT_SETUP_TIMEOUT_MULTIPLIER"
+  )
+  if harbor_uses_local_opensandbox_dataset; then
+    cmd+=( --path "$TB_PATH" )
+  elif harbor_uses_registry_dataset; then
+    cmd+=( --dataset "$(harbor_registry_dataset_name)" )
+  else
+    cmd+=( --path "$TB_PATH" )
+  fi
+  if [[ "$TB_ENVIRONMENT_TYPE" == "opensandbox" ]]; then
+    cmd+=(
+      --ek "image_ref=$HARBOR_OPENSANDBOX_IMAGE_REF"
+      --ek "lifecycle_minutes=$YICLOUD_SANDBOX_LIFECYCLE_MINUTES"
+    )
+  fi
+  if [[ -n "${PIP_INDEX_URL:-}" ]]; then
+    cmd+=( --ve "PIP_INDEX_URL=$PIP_INDEX_URL" )
+  fi
+  if [[ -n "${PIP_EXTRA_INDEX_URL:-}" ]]; then
+    cmd+=( --ve "PIP_EXTRA_INDEX_URL=$PIP_EXTRA_INDEX_URL" )
+  fi
+  if [[ -n "${PIP_TRUSTED_HOST:-}" ]]; then
+    cmd+=( --ve "PIP_TRUSTED_HOST=$PIP_TRUSTED_HOST" )
+  fi
+  if [[ -n "${UV_INDEX_URL:-}" ]]; then
+    cmd+=( --ve "UV_INDEX_URL=$UV_INDEX_URL" )
+  fi
+  if [[ -n "${UV_DEFAULT_INDEX:-}" ]]; then
+    cmd+=( --ve "UV_DEFAULT_INDEX=$UV_DEFAULT_INDEX" )
+  fi
+  if [[ -n "${UV_PYTHON_DOWNLOADS:-}" ]]; then
+    cmd+=( --ve "UV_PYTHON_DOWNLOADS=$UV_PYTHON_DOWNLOADS" )
+  fi
+  if [[ -n "${UV_PYTHON_PREFERENCE:-}" ]]; then
+    cmd+=( --ve "UV_PYTHON_PREFERENCE=$UV_PYTHON_PREFERENCE" )
+  fi
+  if [[ -n "$TB_LIMIT" ]]; then
+    cmd+=( -l "$TB_LIMIT" )
+  fi
+  if [[ -n "$INCLUDE_TASKS" ]]; then
+    local task_name
+    local -a include_arr
+    IFS=',' read -r -a include_arr <<< "$INCLUDE_TASKS"
+    for task_name in "${include_arr[@]}"; do
+      task_name="${task_name#"${task_name%%[![:space:]]*}"}"
+      task_name="${task_name%"${task_name##*[![:space:]]}"}"
+      if [[ -n "$task_name" ]]; then
+        cmd+=( -i "$(harbor_registry_task_name "$task_name")" )
+      fi
+    done
+  fi
+  if [[ "$TB_DEBUG" == "1" ]]; then
+    cmd+=( --debug )
+  fi
+  if [[ "$TB_FORCE_BUILD" == "1" || "$TB_FORCE_BUILD" == "true" ]]; then
+    cmd+=( --force-build )
+  fi
+
+  echo "[INFO] running Harbor Oracle"
+  echo "[INFO] environment: $TB_ENVIRONMENT_TYPE ($TB_ENVIRONMENT_SPEC)"
+  echo "[INFO] output dir: $out_dir"
+  echo "[INFO] n_concurrent: $TB_N_CONCURRENT | max_retries: $TB_MAX_RETRIES"
+
+  if [[ "$TB_DRY_RUN" == "1" ]]; then
+    echo "[INFO] TB_DRY_RUN=1, skip execution"
+    printf '[INFO] command:'
+    printf ' %q' "${cmd[@]}"
+    printf '\n'
+    return 0
+  fi
+
+  export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+  "${cmd[@]}"
+  echo "[INFO] Oracle completed"
+  echo "[INFO] results: $out_dir"
 }
 
 run_tb() {
@@ -664,12 +900,15 @@ PY
       --ae "OPIK_WORKSPACE=$OPIK_WORKSPACE"
     )
   fi
-  if harbor_uses_registry_dataset; then
+  if harbor_uses_local_opensandbox_dataset; then
+    cmd+=( --path "$TB_PATH" )
+  elif harbor_uses_registry_dataset; then
     cmd+=( --dataset "$(harbor_registry_dataset_name)" )
   else
     cmd+=( --path "$TB_PATH" )
   fi
-  append_harbor_unprivileged_docker_compose
+  prepare_opensandbox_image_ref
+  append_environment_backend_args
   if [[ -n "${TB_VERIFIER_UV_HOME:-}" ]]; then
     cmd+=( --ve "HOME=$TB_VERIFIER_UV_HOME" )
   fi
@@ -783,6 +1022,7 @@ PY
     fi
     cmd+=(
       --ve "PATH=$verifier_uv_path_prefix:$TB_VERIFIER_UV_BIN_DIR_MOUNT_PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      --ve "TB_VERIFIER_UV_BIN_DIR=$TB_VERIFIER_UV_BIN_DIR_MOUNT_PATH"
     )
   fi
 
@@ -878,7 +1118,9 @@ PY
 
   echo "[INFO] running TB with real-time Opik tracking"
   echo "[INFO] project: $OPIK_PROJECT_NAME"
-  if harbor_uses_registry_dataset; then
+  if harbor_uses_local_opensandbox_dataset; then
+    echo "[INFO] agent: $TB_AGENT | runs: $TB_RUNS | path: $TB_PATH"
+  elif harbor_uses_registry_dataset; then
     echo "[INFO] agent: $TB_AGENT | runs: $TB_RUNS | dataset: $(harbor_registry_dataset_name)"
   else
     echo "[INFO] agent: $TB_AGENT | runs: $TB_RUNS | path: $TB_PATH"
@@ -917,6 +1159,12 @@ PY
 
 run_opencode_task() {
   harbor_apply_effective_wheel_source
+  VERIFIER_UV_BIN_DIR_SOURCE="$(mktemp -d "${RUNTIME_DIR%/}/verifier-uv.opencode.XXXXXX" 2>/dev/null || true)"
+  if [[ -n "$VERIFIER_UV_BIN_DIR_SOURCE" ]]; then
+    prepare_verifier_uv_bin "$VERIFIER_UV_BIN_DIR_SOURCE" || true
+  else
+    echo "[WARN] failed to create verifier uv backup dir; verifier will use its normal uv install path" >&2
+  fi
   if harbor_trace_to_opik_enabled; then
     normalize_opik_url_override
   fi
@@ -1013,12 +1261,15 @@ PY
         --ae "OPIK_WORKSPACE=$OPIK_WORKSPACE"
       )
     fi
-    if harbor_uses_registry_dataset; then
+    if harbor_uses_local_opensandbox_dataset; then
+      cmd+=( --path "$TB_PATH" )
+    elif harbor_uses_registry_dataset; then
       cmd+=( --dataset "$(harbor_registry_dataset_name)" )
     else
       cmd+=( --path "$TB_PATH" )
     fi
-    append_harbor_unprivileged_docker_compose
+    prepare_opensandbox_image_ref
+    append_environment_backend_args
 
     if [[ -n "${TB_AGENT_TIMEOUT_MULTIPLIER:-}" ]]; then
       cmd+=( --agent-timeout-multiplier "$TB_AGENT_TIMEOUT_MULTIPLIER" )
@@ -1039,13 +1290,15 @@ PY
 
     local mounts_json
     mounts_json="$(
-      python3 - "$TB_CC_PY_WHEEL_DIR_SOURCE" "$TB_CC_PY_WHEEL_DIR_MOUNT_PATH" <<'PY'
+      python3 - "$TB_CC_PY_WHEEL_DIR_SOURCE" "$TB_CC_PY_WHEEL_DIR_MOUNT_PATH" "$VERIFIER_UV_BIN_DIR_SOURCE" "$TB_VERIFIER_UV_BIN_DIR_MOUNT_PATH" <<'PY'
 import json
 import os
 import sys
 
 src = sys.argv[1]
 dst = sys.argv[2]
+uv_src = sys.argv[3]
+uv_dst = sys.argv[4]
 mounts = []
 if src and os.path.exists(src):
     mounts.append({
@@ -1054,11 +1307,29 @@ if src and os.path.exists(src):
         "target": dst,
         "read_only": True,
     })
+if (
+    uv_src
+    and os.path.isdir(uv_src)
+    and os.path.exists(os.path.join(uv_src, "uv"))
+    and os.path.exists(os.path.join(uv_src, "uvx"))
+):
+    mounts.append({
+        "type": "bind",
+        "source": uv_src,
+        "target": uv_dst,
+        "read_only": True,
+    })
 print(json.dumps(mounts, ensure_ascii=True))
 PY
     )"
     if [[ "$mounts_json" != "[]" ]]; then
       cmd+=( --mounts-json "$mounts_json" )
+    fi
+    if [[ -n "$VERIFIER_UV_BIN_DIR_SOURCE" && -x "$VERIFIER_UV_BIN_DIR_SOURCE/uv" && -x "$VERIFIER_UV_BIN_DIR_SOURCE/uvx" ]]; then
+      cmd+=(
+        --ve "PATH=/root/.local/bin:/home/oai/.local/bin:/home/agent/.local/bin:/home/ubuntu/.local/bin:$TB_VERIFIER_UV_BIN_DIR_MOUNT_PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        --ve "TB_VERIFIER_UV_BIN_DIR=$TB_VERIFIER_UV_BIN_DIR_MOUNT_PATH"
+      )
     fi
 
     for env_name in OC_OPIK_DEBUG OC_OPIK_DRY_RUN OC_OPIK_MAX_TEXT_CHARS OC_OPIK_FLUSH_INTERVAL_S; do
@@ -1118,7 +1389,9 @@ PY
   echo "[INFO] opencode run attempts=$N_ATTEMPTS"
   echo "[INFO] project: $OPIK_PROJECT_NAME"
   echo "[INFO] output dir: $out_dir"
-  if harbor_uses_registry_dataset; then
+  if harbor_uses_local_opensandbox_dataset; then
+    echo "[INFO] path: $TB_PATH"
+  elif harbor_uses_registry_dataset; then
     echo "[INFO] dataset: $(harbor_registry_dataset_name)"
   else
     echo "[INFO] path: $TB_PATH"
@@ -1158,6 +1431,20 @@ main() {
   harbor_validate_agent
   harbor_validate_generation_controls
   configure_trace_disabled_runtime
+  if [[ "$AGENT" == "oracle" ]]; then
+    need_cmd python3
+    need_cmd uv
+    ensure_environment_backend
+    harbor_init_run_dirs
+    apply_min_test_defaults
+    if ! harbor_uses_registry_dataset && [[ ! -d "$TB_PATH" ]]; then
+      echo "[ERROR] local dataset path not found: $TB_PATH" >&2
+      exit 1
+    fi
+    run_oracle_task
+    return $?
+  fi
+
   if harbor_agent_is_opencode; then
     need_cmd curl
     need_cmd python3
@@ -1173,7 +1460,7 @@ main() {
       return $?
     fi
 
-    ensure_docker_daemon
+    ensure_environment_backend
     docker_hub_preflight_check
 
     if ! harbor_trace_to_opik_enabled; then
@@ -1207,7 +1494,7 @@ main() {
   need_cmd git
   need_cmd curl
   need_cmd python3
-  ensure_docker_daemon
+  ensure_environment_backend
   if harbor_trace_to_opik_enabled; then
     normalize_opik_url_override
   fi

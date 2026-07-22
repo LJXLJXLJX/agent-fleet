@@ -44,7 +44,18 @@ SH
 exit 0
 SH
 
-  chmod +x "$fake_bin"/docker "$fake_bin"/curl "$fake_bin"/git "$fake_bin"/uv "$fake_bin"/uvx
+  cat >"$fake_bin/file" <<'SH'
+#!/usr/bin/env bash
+printf 'ELF 64-bit LSB executable\n'
+SH
+
+  chmod +x \
+    "$fake_bin"/docker \
+    "$fake_bin"/curl \
+    "$fake_bin"/file \
+    "$fake_bin"/git \
+    "$fake_bin"/uv \
+    "$fake_bin"/uvx
 }
 
 make_capture_bin() {
@@ -73,6 +84,21 @@ connection_fields = (
 )
 inherited = {name: os.environ[name] for name in connection_fields if name in os.environ}
 Path(f"{capture}.opik-environment").write_text(json.dumps(inherited, sort_keys=True))
+
+if "--mounts-json" in args:
+    mounts = json.loads(args[args.index("--mounts-json") + 1])
+    verifier_mount = next(
+        (
+            mount
+            for mount in mounts
+            if mount.get("target") == "/opt/tb-uv-backup/bin"
+        ),
+        None,
+    )
+    if verifier_mount:
+        source = Path(verifier_mount["source"])
+        names = sorted(path.name for path in source.iterdir())
+        Path(f"{capture}.verifier-tools").write_text(",".join(names))
 
 if os.environ.get("HARBOR_CAPTURE_RESULT") == "1":
     pid_file = Path(os.environ["HARBOR_BENCHMARK_PID_FILE"])
@@ -187,6 +213,10 @@ assert_file_content() {
   local path="$1"
   local expected="$2"
   local actual
+  if [[ ! -f "$path" ]]; then
+    echo "expected file is missing: $path" >&2
+    return 1
+  fi
   actual="$(cat "$path")"
   if [[ "$actual" != "$expected" ]]; then
     echo "unexpected content in $path: '$actual' (expected '$expected')" >&2
@@ -367,6 +397,13 @@ main() {
     "codepde@1.0"
   assert_extra_compose_arg "$claude_capture" "$default_overlay"
   assert_arg_pair "$claude_capture" "--dataset" "codepde@1.0"
+  assert_file_content \
+    "${claude_capture}.verifier-tools" \
+    "curl,env,uv,uvx"
+  assert_arg_pair \
+    "$claude_capture" \
+    "--ve" \
+    "TB_VERIFIER_UV_BIN_DIR=/opt/tb-uv-backup/bin"
 
   registry_capture="$tmp/claude-registry.args"
   run_harboropik \
@@ -387,6 +424,13 @@ main() {
     "$opencode_capture" \
     "$tmp/opencode-default/wheels" \
     "/opt/tb-opik/python-wheels"
+  assert_file_content \
+    "${opencode_capture}.verifier-tools" \
+    "curl,env,uv,uvx"
+  assert_arg_pair \
+    "$opencode_capture" \
+    "--ve" \
+    "TB_VERIFIER_UV_BIN_DIR=/opt/tb-uv-backup/bin"
 
   seta_capture="$tmp/seta-default.args"
   run_harboropik \

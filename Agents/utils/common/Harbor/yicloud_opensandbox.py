@@ -1,0 +1,1375 @@
+"""YiCloud provider adapter for Harbor's OpenSandbox environment contract.
+
+Harbor 0.18 ships an OpenSandbox backend for the upstream ``opensandbox`` SDK.
+YiCloud exposes compatible sandbox execution semantics behind its own OpenAPI
+control plane and OGW request signing, so Agent Fleet loads this class through
+Harbor's custom environment import-path support instead of patching Harbor.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import json
+import os
+import re
+import shlex
+import subprocess
+import tarfile
+import tempfile
+import time
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+import requests
+from harbor.environments.base import BaseEnvironment, ExecResult
+from harbor.environments.capabilities import (
+    EnvironmentCapabilities,
+    EnvironmentResourceCapabilities,
+)
+from opensandbox_s3_upload import S3UploadArtifact, S3UploadStore
+
+
+EXPECTED_YICLOUD_SDK_VERSION = "0.3.1"
+EXIT_MARKER = "__HARBOR_YICLOUD_OPENSANDBOX_EXIT_CODE__="
+TERMINAL_FAILURE_STATES = {
+    "failed",
+    "error",
+    "stopped",
+    "terminated",
+    "killed",
+    "expired",
+}
+# The YiCloud gateway currently rejects multipart bodies around 1 MiB and
+# above. Base64 expands each chunk by 4/3, so 512 KiB leaves enough room for
+# multipart metadata while avoiding thousands of tiny requests.
+UPLOAD_CHUNK_BYTES = 512 * 1024
+S3_HTTP_BOOTSTRAP_PATH = "/tmp/.harbor-s3-http-get-v1.sh"
+# Current YiCloud task images are Linux/amd64 glibc images and normally carry
+# curl, wget, or python3. A few minimal images only carry Bash. For those
+# images, upload this small downloader once per Sandbox instead of uploading a
+# Python/Node runtime or baking an agent-specific tool into every task image.
+S3_HTTP_BOOTSTRAP = r"""#!/usr/bin/env bash
+set -euo pipefail
+
+url=${HARBOR_S3_URL:?HARBOR_S3_URL is required}
+output=${1:?output path is required}
+case "$url" in
+  http://*) rest=${url#http://} ;;
+  *) echo "minimal S3 downloader only supports plain HTTP URLs" >&2; exit 64 ;;
+esac
+authority=${rest%%/*}
+if [[ "$rest" == */* ]]; then
+  request_path=/${rest#*/}
+else
+  request_path=/
+fi
+if [[ "$authority" == *:* ]]; then
+  host=${authority%%:*}
+  port=${authority##*:}
+else
+  host=$authority
+  port=80
+fi
+[[ -n "$host" && -n "$port" ]] || {
+  echo "invalid S3 download URL" >&2
+  exit 64
+}
+
+exec 3<>"/dev/tcp/$host/$port"
+printf 'GET %s HTTP/1.1\r\nHost: %s\r\nAccept: */*\r\nConnection: close\r\n\r\n' \
+  "$request_path" "$authority" >&3
+IFS= read -r status <&3
+status=${status%$'\r'}
+[[ "$status" == HTTP/1.0\ 200\ * || "$status" == HTTP/1.1\ 200\ * ]] || {
+  echo "S3 download failed: $status" >&2
+  exit 65
+}
+while IFS= read -r header <&3; do
+  header=${header%$'\r'}
+  [[ -z "$header" ]] && break
+  [[ "${header,,}" != transfer-encoding:*chunked* ]] || {
+    echo "chunked S3 response is unsupported by minimal downloader" >&2
+    exit 66
+  }
+done
+cat <&3 >"$output"
+"""
+
+
+class YiCloudSandboxReadyTimeoutError(RuntimeError):
+    """The YiCloud control plane did not schedule a Sandbox before our deadline."""
+
+
+def _required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"required environment variable is unset: {name}")
+    return value
+
+
+def _require_yicloud_sdk() -> None:
+    try:
+        installed = version("yicloud-sdk-python")
+    except PackageNotFoundError as exc:
+        raise RuntimeError("yicloud-sdk-python is not installed") from exc
+    if installed != EXPECTED_YICLOUD_SDK_VERSION:
+        raise RuntimeError(
+            f"expected yicloud-sdk-python=={EXPECTED_YICLOUD_SDK_VERSION}, "
+            f"found {installed}"
+        )
+
+
+def _bypass_local_proxy_for_api_host() -> None:
+    api_host = os.environ.get("YICLOUD_API_HOST", "https://gate.yicloud.com.cn")
+    hostname = urlsplit(api_host).hostname
+    if not hostname:
+        raise ValueError(f"unable to parse YICLOUD_API_HOST hostname: {api_host!r}")
+    for key in ("NO_PROXY", "no_proxy"):
+        entries = [item.strip() for item in os.environ.get(key, "").split(",")]
+        if hostname not in entries:
+            os.environ[key] = ",".join(item for item in [*entries, hostname] if item)
+
+
+def _state_of(data: Any) -> str:
+    status = getattr(data, "Status", None)
+    state = getattr(status, "State", "") or getattr(data, "RunState", "")
+    # yicloud-sdk-python 0.3.1 declares lowercase state values, while older
+    # gateways returned title-case values. Normalize both representations so a
+    # running sandbox is not mistaken for a pending one until ready timeout.
+    return str(state or "").strip().lower()
+
+
+def _status_reason_of(data: Any) -> str:
+    status = getattr(data, "Status", None)
+    return str(getattr(status, "Reason", "") or "").strip()
+
+
+def _positive_int(value: Any, name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}") from exc
+    if parsed <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return parsed
+
+
+def _bool_setting(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(
+        f"{name} must be one of 1/0, true/false, yes/no, or on/off; "
+        f"got {value!r}"
+    )
+
+
+def _access_token_of(data: Any) -> str:
+    endpoints = getattr(data, "Endpoints", None)
+    return str(
+        getattr(data, "AccessToken", "")
+        or getattr(endpoints, "AccessToken", "")
+        or ""
+    )
+
+
+def _image_ref_of(data: Any) -> str:
+    return str(getattr(getattr(data, "Image", None), "Ref", "") or "").strip()
+
+
+def _environment_id_by_exact_name(
+    sandbox: Any, project_name: str, environment_name: str
+) -> str:
+    listed = sandbox.list_sandbox_environments(
+        None,
+        sandbox.models.ListSandboxEnvironmentsReq(
+            ProjectName=project_name,
+            Keyword=environment_name,
+            Limit=100,
+            Offset=0,
+        ),
+    )
+    matches = [
+        item
+        for item in (getattr(listed, "Items", None) or [])
+        if str(getattr(item, "Name", "") or "").strip() == environment_name
+    ]
+    if not matches:
+        raise RuntimeError(
+            f"YiCloud Sandbox environment not found by exact name: "
+            f"{environment_name!r}"
+        )
+    if len(matches) != 1:
+        ids = sorted(str(getattr(item, "Id", "") or "") for item in matches)
+        raise RuntimeError(
+            f"YiCloud Sandbox environment name is ambiguous: "
+            f"{environment_name!r}; ids={ids}"
+        )
+    environment_id = str(getattr(matches[0], "Id", "") or "").strip()
+    if not environment_id:
+        raise RuntimeError(
+            f"YiCloud Sandbox environment has no ID: {environment_name!r}"
+        )
+    return environment_id
+
+
+def _validate_sandbox_binding(
+    data: Any, expected_environment_id: str, expected_image_ref: str
+) -> None:
+    actual_environment_id = str(
+        getattr(data, "EnvironmentId", "") or ""
+    ).strip()
+    actual_image_ref = _image_ref_of(data)
+    if actual_environment_id != expected_environment_id:
+        raise RuntimeError(
+            "YiCloud Sandbox environment binding mismatch: "
+            f"expected={expected_environment_id!r}, "
+            f"actual={actual_environment_id!r}"
+        )
+    if actual_image_ref != expected_image_ref:
+        raise RuntimeError(
+            "YiCloud Sandbox image binding mismatch: "
+            f"expected={expected_image_ref!r}, actual={actual_image_ref!r}"
+        )
+
+
+def _command_url_of(data: Any) -> str:
+    endpoints = getattr(data, "Endpoints", None)
+    for endpoint in (getattr(endpoints, "Endpoints", None) or {}).values():
+        proxy_url = str(getattr(endpoint, "ProxyUrl", "") or "")
+        if not proxy_url.startswith(("http://", "https://")):
+            continue
+        parsed = urlsplit(proxy_url)
+        path = parsed.path.rstrip("/")
+        if path.endswith("/ping"):
+            path = path[: -len("/ping")]
+        path += "/command"
+        return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+    raise RuntimeError("running YiCloud Sandbox returned no execd proxy endpoint")
+
+
+def _parse_sse(text: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("data:"):
+            line = line[len("data:") :].strip()
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            events.append({"type": "unparsed", "text": line})
+            continue
+        if isinstance(value, dict):
+            events.append(value)
+    return events
+
+
+class YiCloudOpenSandboxEnvironment(BaseEnvironment):
+    """Run one Harbor task in a YiCloud-managed OpenSandbox instance."""
+
+    def __init__(
+        self,
+        *args,
+        image_ref: str | None = None,
+        project_name: str | None = None,
+        lifecycle_minutes: int | str | None = None,
+        ready_timeout_sec: int | None = None,
+        request_timeout_sec: int = 180,
+        cleanup_wait_sec: int = 45,
+        status_log_interval_sec: int | None = None,
+        retain_on_start_failure: bool | str | None = None,
+        retain_after_trial: bool | str | None = None,
+        cpu: str | None = None,
+        memory: str | None = None,
+        **kwargs,
+    ) -> None:
+        self._image_ref_override = (image_ref or "").strip()
+        self._project_name = (
+            project_name or os.environ.get("YICLOUD_PROJECT_NAME", "")
+        ).strip()
+        self._environment_id = os.environ.get(
+            "YICLOUD_SANDBOX_ENVIRONMENT_ID", ""
+        ).strip()
+        self._environment_name = os.environ.get(
+            "YICLOUD_SANDBOX_ENVIRONMENT_NAME", ""
+        ).strip()
+        self._lifecycle_minutes = _positive_int(
+            lifecycle_minutes
+            if lifecycle_minutes is not None
+            else os.environ.get("YICLOUD_SANDBOX_LIFECYCLE_MINUTES", "120"),
+            "lifecycle_minutes",
+        )
+        self._ready_timeout_sec = _positive_int(
+            ready_timeout_sec
+            if ready_timeout_sec is not None
+            else os.environ.get("YICLOUD_SANDBOX_READY_TIMEOUT_SEC", "300"),
+            "ready_timeout_sec",
+        )
+        self._request_timeout_sec = request_timeout_sec
+        self._cleanup_wait_sec = cleanup_wait_sec
+        self._status_log_interval_sec = _positive_int(
+            status_log_interval_sec
+            if status_log_interval_sec is not None
+            else os.environ.get(
+                "YICLOUD_SANDBOX_STATUS_LOG_INTERVAL_SEC", "30"
+            ),
+            "status_log_interval_sec",
+        )
+        self._retain_on_start_failure = _bool_setting(
+            retain_on_start_failure
+            if retain_on_start_failure is not None
+            else os.environ.get(
+                "YICLOUD_SANDBOX_RETAIN_ON_START_FAILURE", "0"
+            ),
+            "retain_on_start_failure",
+        )
+        self._retain_after_trial = _bool_setting(
+            retain_after_trial
+            if retain_after_trial is not None
+            else os.environ.get(
+                "YICLOUD_SANDBOX_RETAIN_AFTER_TRIAL", "0"
+            ),
+            "retain_after_trial",
+        )
+        self._request_cpu = (
+            cpu or os.environ.get("YICLOUD_SANDBOX_CPU", "2")
+        ).strip()
+        self._request_memory = (
+            memory or os.environ.get("YICLOUD_SANDBOX_MEMORY", "8Gi")
+        ).strip()
+        if not self._request_cpu:
+            raise ValueError("cpu must not be empty")
+        if not self._request_memory:
+            raise ValueError("memory must not be empty")
+        self._upload_backend = os.environ.get(
+            "YICLOUD_SANDBOX_UPLOAD_BACKEND", "http"
+        ).strip().lower()
+        if self._upload_backend not in {"http", "s3"}:
+            raise ValueError(
+                "YICLOUD_SANDBOX_UPLOAD_BACKEND must be http or s3"
+            )
+        self._s3_download_timeout_sec = _positive_int(
+            os.environ.get(
+                "YICLOUD_SANDBOX_S3_DOWNLOAD_TIMEOUT_SEC", "1800"
+            ),
+            "YICLOUD_SANDBOX_S3_DOWNLOAD_TIMEOUT_SEC",
+        )
+        self._s3_upload_store = (
+            S3UploadStore.from_environment()
+            if self._upload_backend == "s3"
+            else None
+        )
+        self._s3_downloader_ready = False
+        self._s3_downloader_lock: asyncio.Lock | None = None
+        self._base_client: Any | None = None
+        self._sandbox_service: Any | None = None
+        self._sandbox_id = ""
+        self._sandbox_name = ""
+        self._command_url = ""
+        self._access_token = ""
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def type() -> str:
+        return "opensandbox"
+
+    @property
+    def capabilities(self) -> EnvironmentCapabilities:
+        return EnvironmentCapabilities(gpus=False, disable_internet=False, mounted=False)
+
+    @classmethod
+    def resource_capabilities(cls) -> EnvironmentResourceCapabilities:
+        return EnvironmentResourceCapabilities(cpu_limit=True, memory_limit=True)
+
+    @classmethod
+    def preflight(cls) -> None:
+        _require_yicloud_sdk()
+        for name in (
+            "YICLOUD_PUBLIC_KEY",
+            "YICLOUD_SECRET_KEY",
+            "YICLOUD_PROJECT_NAME",
+        ):
+            _required_env(name)
+        if not (
+            os.environ.get("YICLOUD_SANDBOX_ENVIRONMENT_ID", "").strip()
+            or os.environ.get(
+                "YICLOUD_SANDBOX_ENVIRONMENT_NAME", ""
+            ).strip()
+        ):
+            raise RuntimeError(
+                "YICLOUD_SANDBOX_ENVIRONMENT_ID or "
+                "YICLOUD_SANDBOX_ENVIRONMENT_NAME is required"
+            )
+
+    @property
+    def _image_ref(self) -> str:
+        return self._image_ref_override or str(
+            self.task_env_config.docker_image or ""
+        ).strip()
+
+    def _validate_definition(self) -> None:
+        compose_paths = (
+            self.environment_dir / "docker-compose.yaml",
+            self.environment_dir / "docker-compose.yml",
+        )
+        if any(path.exists() for path in compose_paths):
+            raise ValueError("YiCloud OpenSandbox does not support docker-compose tasks")
+        if not self._image_ref:
+            raise ValueError(
+                "YiCloud OpenSandbox requires a prebuilt image via "
+                "task.environment.docker_image or environment kwarg image_ref"
+            )
+
+    def _initialize_service(self) -> None:
+        _require_yicloud_sdk()
+        _bypass_local_proxy_for_api_host()
+        if not self._project_name:
+            raise RuntimeError("YICLOUD_PROJECT_NAME is unset")
+
+        from yicloud import base
+        from yicloud.services import sandbox
+
+        self._base_client = base.new_client()
+        sandbox.use_client(self._base_client)
+        self._sandbox_service = sandbox
+
+    def _resolve_environment_id(self) -> str:
+        sandbox = self._sandbox_service
+        if sandbox is None:
+            raise RuntimeError("YiCloud Sandbox service is not initialized")
+        if not self._environment_id and not self._environment_name:
+            raise RuntimeError(
+                "YiCloud Sandbox environment is unset; configure "
+                "YICLOUD_SANDBOX_ENVIRONMENT_ID or "
+                "YICLOUD_SANDBOX_ENVIRONMENT_NAME"
+            )
+        if self._environment_name:
+            resolved = _environment_id_by_exact_name(
+                sandbox, self._project_name, self._environment_name
+            )
+            if self._environment_id and self._environment_id != resolved:
+                raise RuntimeError(
+                    "YiCloud Sandbox environment ID/name mismatch: "
+                    f"id={self._environment_id!r}, "
+                    f"name={self._environment_name!r}, "
+                    f"resolved_id={resolved!r}"
+                )
+            self._environment_id = resolved
+        else:
+            environment = sandbox.get_sandbox_environment(
+                None,
+                sandbox.models.GetSandboxEnvironmentReq(
+                    ProjectName=self._project_name,
+                    EnvironmentId=self._environment_id,
+                ),
+            )
+            actual_id = str(getattr(environment, "Id", "") or "").strip()
+            if actual_id != self._environment_id:
+                raise RuntimeError(
+                    "YiCloud Sandbox environment lookup mismatch: "
+                    f"expected={self._environment_id!r}, actual={actual_id!r}"
+                )
+            self._environment_name = str(
+                getattr(environment, "Name", "") or ""
+            ).strip()
+        return self._environment_id
+
+    def _make_sandbox_name(self) -> str:
+        raw = f"harbor-{self.session_id}".lower()
+        normalized = re.sub(r"[^a-z0-9-]+", "-", raw).strip("-")
+        return (normalized or "harbor-trial")[:63].rstrip("-")
+
+    async def _wait_until_running(self, created: Any) -> Any:
+        sandbox = self._sandbox_service
+        assert sandbox is not None
+        started_at = time.monotonic()
+        deadline = started_at + self._ready_timeout_sec
+        next_progress_log = started_at
+        last_logged_state = ""
+        current = created
+        last_state = _state_of(current) or "unknown"
+        last_reason = _status_reason_of(current)
+
+        while time.monotonic() < deadline:
+            current = await asyncio.to_thread(
+                sandbox.get_sandbox,
+                None,
+                sandbox.models.GetSandboxReq(
+                    ProjectName=self._project_name,
+                    SandboxId=self._sandbox_id,
+                ),
+            )
+            now = time.monotonic()
+            state = _state_of(current) or "unknown"
+            reason = _status_reason_of(current)
+            elapsed = max(0, int(now - started_at))
+            if state != last_logged_state or now >= next_progress_log:
+                self.logger.info(
+                    "YiCloud Sandbox waiting sandbox_id=%s state=%s "
+                    "elapsed_sec=%s ready_timeout_sec=%s reason=%s",
+                    self._sandbox_id,
+                    state,
+                    elapsed,
+                    self._ready_timeout_sec,
+                    reason or "<none>",
+                )
+                last_logged_state = state
+                next_progress_log = now + self._status_log_interval_sec
+            last_state = state
+            last_reason = reason
+            if state == "running":
+                return current
+            if state in TERMINAL_FAILURE_STATES:
+                raise RuntimeError(
+                    f"YiCloud Sandbox {self._sandbox_id} entered terminal "
+                    f"state={state}; reason={reason or '<none>'}"
+                )
+            await asyncio.sleep(3)
+
+        elapsed = max(0, int(time.monotonic() - started_at))
+        raise YiCloudSandboxReadyTimeoutError(
+            f"YiCloud Sandbox {self._sandbox_id} scheduling timed out after "
+            f"{elapsed}s (configured ready_timeout_sec="
+            f"{self._ready_timeout_sec}); last_state={last_state}; "
+            f"reason={last_reason or '<none>'}; environment_id="
+            f"{self._environment_id}; image_ref={self._image_ref}"
+        )
+
+    def _detach_sandbox(self) -> None:
+        self._sandbox_id = ""
+        self._command_url = ""
+        self._access_token = ""
+        self._s3_downloader_ready = False
+
+    async def _handle_start_failure(self) -> None:
+        sandbox_id = self._sandbox_id
+        if not sandbox_id:
+            return
+        if self._retain_on_start_failure:
+            self.logger.warning(
+                "YiCloud Sandbox retained after start failure for debugging: "
+                "sandbox_id=%s environment_id=%s; automatic cleanup skipped",
+                sandbox_id,
+                self._environment_id,
+            )
+            self._detach_sandbox()
+            return
+        try:
+            await self._delete_sandbox()
+        except Exception as cleanup_error:
+            # Preserve the original scheduling/start exception. Cleanup
+            # failures remain visible without replacing the root cause.
+            self.logger.warning(
+                "YiCloud Sandbox cleanup after start failure failed: "
+                "sandbox_id=%s error=%s",
+                sandbox_id,
+                cleanup_error,
+            )
+            self._detach_sandbox()
+
+    async def start(self, force_build: bool) -> None:
+        if force_build:
+            self.logger.warning(
+                "YiCloud OpenSandbox ignores force_build and uses prebuilt images"
+            )
+        self._initialize_service()
+        sandbox = self._sandbox_service
+        assert sandbox is not None
+        await asyncio.to_thread(self._resolve_environment_id)
+        self._sandbox_name = self._make_sandbox_name()
+
+        created = await asyncio.to_thread(
+            sandbox.create_sandbox,
+            None,
+            sandbox.models.CreateSandboxReq(
+                ProjectName=self._project_name,
+                EnvironmentId=self._environment_id,
+                Name=self._sandbox_name,
+                Image=sandbox.models.CreateSandboxReqImageInput(Ref=self._image_ref),
+                Entrypoint=["sh", "-c", "while :; do sleep 60; done"],
+                Env=dict(self._persistent_env),
+                Resources=sandbox.models.CreateSandboxReqResources(
+                    Cpu=self._request_cpu,
+                    Memory=self._request_memory,
+                ),
+                LifecycleMinutes=self._lifecycle_minutes,
+                RequestTimeoutSeconds=self._request_timeout_sec,
+            ),
+        )
+        self._sandbox_id = str(getattr(created, "Id", "") or "")
+        if not self._sandbox_id:
+            raise RuntimeError("YiCloud CreateSandbox returned no sandbox ID")
+        created_token = _access_token_of(created)
+        self.logger.info(
+            "YiCloud Sandbox create accepted sandbox_id=%s "
+            "environment_id=%s environment_name=%s image_ref=%s "
+            "cpu=%s memory=%s ready_timeout_sec=%s "
+            "lifecycle_minutes=%s retain_on_start_failure=%s",
+            self._sandbox_id,
+            self._environment_id,
+            self._environment_name,
+            self._image_ref,
+            self._request_cpu,
+            self._request_memory,
+            self._ready_timeout_sec,
+            self._lifecycle_minutes,
+            self._retain_on_start_failure,
+        )
+
+        try:
+            current = await self._wait_until_running(created)
+            _validate_sandbox_binding(
+                current, self._environment_id, self._image_ref
+            )
+            self.logger.info(
+                "YiCloud Sandbox binding confirmed environment_id=%s "
+                "environment_name=%s image_ref=%s",
+                self._environment_id,
+                self._environment_name,
+                self._image_ref,
+            )
+            self._access_token = created_token or _access_token_of(current)
+            if not self._access_token:
+                raise RuntimeError("YiCloud Sandbox returned no access token")
+            self._command_url = _command_url_of(current)
+            setup = await self.exec(
+                "mkdir -p /logs/agent /logs/verifier /logs/artifacts /artifacts && "
+                "chmod 777 /logs/agent /logs/verifier /logs/artifacts /artifacts",
+                cwd="/",
+                timeout_sec=60,
+                user="root",
+            )
+            if setup.return_code != 0:
+                raise RuntimeError(
+                    "failed to initialize Harbor log directories: "
+                    f"{setup.stderr or setup.stdout}"
+                )
+            await self._upload_environment_dir_after_start()
+            await self._materialize_read_only_mounts()
+        except BaseException:
+            await self._handle_start_failure()
+            raise
+
+    async def _delete_sandbox(self) -> None:
+        sandbox = self._sandbox_service
+        sandbox_id = self._sandbox_id
+        if sandbox is None or not sandbox_id:
+            return
+        try:
+            self.logger.info(
+                "YiCloud Sandbox cleanup requested sandbox_id=%s", sandbox_id
+            )
+            await asyncio.to_thread(
+                sandbox.delete_sandbox,
+                None,
+                sandbox.models.DeleteSandboxReq(
+                    ProjectName=self._project_name,
+                    SandboxId=sandbox_id,
+                ),
+            )
+            deadline = time.monotonic() + self._cleanup_wait_sec
+            while time.monotonic() < deadline:
+                listed = await asyncio.to_thread(
+                    sandbox.list_sandboxes,
+                    None,
+                    sandbox.models.ListSandboxesReq(
+                        ProjectName=self._project_name,
+                        EnvironmentId=self._environment_id,
+                        Keyword=self._sandbox_name,
+                        Limit=100,
+                        Offset=0,
+                    ),
+                )
+                remaining_ids = {
+                    str(getattr(item, "Id", "") or "")
+                    for item in (getattr(listed, "Items", None) or [])
+                }
+                if sandbox_id not in remaining_ids:
+                    self.logger.info(
+                        "YiCloud Sandbox cleanup confirmed sandbox_id=%s",
+                        sandbox_id,
+                    )
+                    break
+                await asyncio.sleep(3)
+            else:
+                self.logger.warning(
+                    "YiCloud Sandbox deletion not confirmed within %ss: %s",
+                    self._cleanup_wait_sec,
+                    sandbox_id,
+                )
+        finally:
+            self._detach_sandbox()
+
+    async def stop(self, delete: bool) -> None:
+        if self._retain_after_trial and self._sandbox_id:
+            self.logger.warning(
+                "YiCloud Sandbox retained after trial sandbox_id=%s "
+                "environment_id=%s; it remains subject to platform lifecycle expiry",
+                self._sandbox_id,
+                self._environment_id,
+            )
+            self._detach_sandbox()
+            return
+        if delete:
+            await self._delete_sandbox()
+        else:
+            self._detach_sandbox()
+
+    def _signed_headers(
+        self,
+        body: str | bytes,
+        *,
+        url: str | None = None,
+        content_type: str = "application/json",
+        accept: str = "text/event-stream",
+    ) -> dict[str, str]:
+        if self._base_client is None:
+            raise RuntimeError("YiCloud client is not initialized")
+        now = time.localtime()
+        timestamp = str(int(time.mktime(now) * 1000))
+        query = urlsplit(url or self._command_url).query
+        signature = self._base_client.crede.sign(now, query, body)
+        return {
+            "X-OGW-PUBLIC-KEY": self._base_client.crede.public_key,
+            "X-OGW-TICK": timestamp,
+            "X-OGW-SIGN": signature,
+            "X-Sandbox-Access-Token": self._access_token,
+            "Content-Type": content_type,
+            "Accept": accept,
+        }
+
+    def _execd_url(self, suffix: str) -> str:
+        if not self._command_url:
+            raise RuntimeError("YiCloud Sandbox is not running")
+        parsed = urlsplit(self._command_url)
+        base_path = parsed.path.rsplit("/", 1)[0]
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                f"{base_path}/{suffix.lstrip('/')}",
+                parsed.query,
+                "",
+            )
+        )
+
+    def _upload_chunk_sync(
+        self,
+        content: bytes,
+        target_path: str,
+        filename: str,
+    ) -> None:
+        upload_url = self._execd_url("/files/upload")
+        encoded_content = base64.b64encode(content)
+        metadata = json.dumps(
+            {
+                "path": target_path,
+                # Execd parses this value as octal text, so pass 600 rather
+                # than Python's decimal representation of 0o600 (384).
+                "mode": 600,
+            },
+            separators=(",", ":"),
+        )
+        session = requests.Session()
+        session.trust_env = False
+        request = requests.Request(
+            "POST",
+            upload_url,
+            files=[
+                (
+                    "metadata",
+                    (
+                        "metadata.json",
+                        io.BytesIO(metadata.encode()),
+                        "application/json",
+                    ),
+                ),
+                (
+                    "file",
+                    (
+                        f"{filename}.b64",
+                        io.BytesIO(encoded_content),
+                        "text/plain",
+                    ),
+                ),
+            ],
+        )
+        prepared = session.prepare_request(request)
+        if not isinstance(prepared.body, bytes):
+            raise RuntimeError("execd multipart upload did not produce a binary body")
+        content_type = prepared.headers.get("Content-Type", "")
+        prepared.headers.update(
+            self._signed_headers(
+                prepared.body.decode("ascii"),
+                url=upload_url,
+                content_type=content_type,
+                accept="application/json",
+            )
+        )
+        response = session.send(
+            prepared,
+            timeout=self._request_timeout_sec + 300,
+        )
+        if not response.ok:
+            raise RuntimeError(
+                "YiCloud execd file upload failed "
+                f"status={response.status_code} body={response.text[:1000]!r}"
+            )
+
+    def _fast_upload_url(self) -> str:
+        origin = os.environ.get(
+            "YICLOUD_SANDBOX_FAST_UPLOAD_ORIGIN",
+            "https://sandbox.yicloud.com.cn",
+        ).strip()
+        if not origin:
+            return ""
+        if not self._sandbox_id:
+            raise RuntimeError("YiCloud Sandbox is not running")
+        parsed = urlsplit(origin)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(
+                "YICLOUD_SANDBOX_FAST_UPLOAD_ORIGIN must be an HTTP(S) origin"
+            )
+        return (
+            f"{origin.rstrip('/')}/sandboxes/{self._sandbox_id}"
+            "/proxy/44772/files/upload"
+        )
+
+    def _upload_file_fast_sync(
+        self,
+        source: Path,
+        target_path: str,
+        upload_url: str,
+    ) -> None:
+        timeout_sec = _positive_int(
+            os.environ.get("YICLOUD_SANDBOX_UPLOAD_TIMEOUT_SEC", "1800"),
+            "YICLOUD_SANDBOX_UPLOAD_TIMEOUT_SEC",
+        )
+        metadata_payload = {
+            "path": target_path,
+            "owner": "root",
+            "group": "root",
+            "mode": 600,
+        }
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory(prefix="yicloud-fast-upload-") as tmp:
+            tmp_dir = Path(tmp)
+            metadata = tmp_dir / "metadata.json"
+            headers = tmp_dir / "headers.txt"
+            response_body = tmp_dir / "response.txt"
+            metadata.write_text(
+                json.dumps(metadata_payload, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            headers.write_text(
+                f"X-Sandbox-Access-Token: {self._access_token}\n",
+                encoding="utf-8",
+            )
+            headers.chmod(0o600)
+            completed = subprocess.run(
+                [
+                    "curl",
+                    "--noproxy",
+                    "*",
+                    "--silent",
+                    "--show-error",
+                    "--connect-timeout",
+                    "20",
+                    "--max-time",
+                    str(timeout_sec),
+                    "--request",
+                    "POST",
+                    upload_url,
+                    "--header",
+                    f"@{headers}",
+                    "--form",
+                    (
+                        f"metadata=@{metadata};type=application/json;"
+                        "filename=metadata.json"
+                    ),
+                    "--form",
+                    f"file=@{source};filename={source.name}",
+                    "--output",
+                    str(response_body),
+                    "--write-out",
+                    "%{http_code}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec + 30,
+                check=False,
+            )
+            status_text = completed.stdout.strip()
+            status = int(status_text) if status_text.isdigit() else 0
+            if completed.returncode != 0 or not 200 <= status < 300:
+                body = response_body.read_text(
+                    encoding="utf-8", errors="replace"
+                )[:1000]
+                raise RuntimeError(
+                    "YiCloud fast file upload failed "
+                    f"curl_rc={completed.returncode} status={status} "
+                    f"stderr={completed.stderr.strip()[:1000]!r} body={body!r}"
+                )
+        elapsed = max(time.monotonic() - started, 0.001)
+        size = source.stat().st_size
+        self.logger.info(
+            "YiCloud fast upload complete path=%s size_bytes=%s "
+            "elapsed_seconds=%.3f speed_mib_per_second=%.2f",
+            target_path,
+            size,
+            elapsed,
+            size / elapsed / 1024 / 1024,
+        )
+
+    def _run_command_sync(
+        self,
+        command: str,
+        cwd: str,
+        env: dict[str, str],
+        timeout_sec: int | None,
+        uid: int | None = None,
+    ) -> ExecResult:
+        if not self._command_url or not self._access_token:
+            raise RuntimeError("YiCloud Sandbox is not running")
+        wrapped = (
+            "set +e; "
+            f"{command}; "
+            "harbor_rc=$?; "
+            f"printf '\\n{EXIT_MARKER}%s\\n' \"$harbor_rc\"; "
+            "exit \"$harbor_rc\""
+        )
+        payload = {
+            "command": wrapped,
+            "cwd": cwd,
+            "background": False,
+            "timeout": (timeout_sec or 3600) * 1000,
+            "envs": env,
+        }
+        if uid is not None:
+            payload["uid"] = uid
+        body = json.dumps(payload, separators=(",", ":"))
+        session = requests.Session()
+        session.trust_env = False
+        response = session.post(
+            self._command_url,
+            headers=self._signed_headers(body),
+            data=body,
+            timeout=(timeout_sec or 3600) + 60,
+        )
+        response.raise_for_status()
+        events = _parse_sse(response.text)
+        stdout = "".join(
+            str(event.get("text", ""))
+            for event in events
+            if event.get("type") == "stdout"
+        )
+        stderr = "".join(
+            str(event.get("text", ""))
+            for event in events
+            if event.get("type") == "stderr"
+        )
+        matches = re.findall(rf"{re.escape(EXIT_MARKER)}(\d+)", stdout)
+        return_code = int(matches[-1]) if matches else 1
+        stdout = re.sub(
+            rf"\n?{re.escape(EXIT_MARKER)}\d+\n?", "", stdout
+        )
+        return ExecResult(stdout=stdout, stderr=stderr, return_code=return_code)
+
+    def _resolve_exec_uid(self, user: str | int | None) -> int | None:
+        if user is None:
+            return None
+        if isinstance(user, bool):
+            raise ValueError(f"invalid exec user: {user!r}")
+        if isinstance(user, int):
+            if user < 0:
+                raise ValueError(f"exec uid must be non-negative: {user}")
+            return user
+        if user == "root":
+            return 0
+        if user.isdigit():
+            return int(user)
+        self.logger.debug(
+            "YiCloud execd only supports numeric UIDs (or 'root'); "
+            "got username %r, using the sandbox default user",
+            user,
+        )
+        return None
+
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        uid = self._resolve_exec_uid(user)
+        effective_cwd = cwd or self.task_env_config.workdir or "/app"
+        result = await asyncio.to_thread(
+            self._run_command_sync,
+            command,
+            effective_cwd,
+            self._merge_env(env),
+            timeout_sec,
+            uid,
+        )
+        callback = self._output_callback()
+        if callback is not None:
+            if result.stdout:
+                await callback(result.stdout, "stdout")
+            if result.stderr:
+                await callback(result.stderr, "stderr")
+        return result
+
+    def _uses_s3_upload(self) -> bool:
+        return getattr(self, "_upload_backend", "http") == "s3"
+
+    def _s3_store(self) -> S3UploadStore:
+        store = getattr(self, "_s3_upload_store", None)
+        if store is None:
+            raise RuntimeError("YiCloud S3 upload backend is not configured")
+        return store
+
+    async def _ensure_s3_downloader(self, signed_url: str) -> None:
+        if getattr(self, "_s3_downloader_ready", False):
+            return
+        lock = getattr(self, "_s3_downloader_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._s3_downloader_lock = lock
+        async with lock:
+            if getattr(self, "_s3_downloader_ready", False):
+                return
+            probe = await self.exec(
+                "if command -v curl >/dev/null 2>&1 || "
+                "command -v wget >/dev/null 2>&1 || "
+                "command -v python3 >/dev/null 2>&1; then "
+                "printf native; "
+                "elif command -v bash >/dev/null 2>&1; then "
+                "printf bootstrap; "
+                "else printf missing; exit 45; fi",
+                cwd="/",
+                timeout_sec=30,
+                user="root",
+            )
+            mode = str(getattr(probe, "stdout", "") or "").strip()
+            if probe.return_code == 0 and mode == "native":
+                self._s3_downloader_ready = True
+                return
+            if probe.return_code != 0 or mode != "bootstrap":
+                raise RuntimeError(
+                    "task image cannot download S3 artifacts: install curl, "
+                    "wget, python3, or bash"
+                )
+            if urlsplit(signed_url).scheme != "http":
+                raise RuntimeError(
+                    "task image only has bash, but the minimal S3 downloader "
+                    "requires an HTTP signed URL"
+                )
+            upload_url = self._fast_upload_url()
+            if not upload_url:
+                raise RuntimeError(
+                    "task image needs the minimal S3 downloader, but "
+                    "YICLOUD_SANDBOX_FAST_UPLOAD_ORIGIN is disabled"
+                )
+            with tempfile.TemporaryDirectory(
+                prefix="yicloud-s3-bootstrap-"
+            ) as tmp:
+                source = Path(tmp) / "http-get.sh"
+                source.write_text(S3_HTTP_BOOTSTRAP, encoding="utf-8")
+                await asyncio.to_thread(
+                    self._upload_file_fast_sync,
+                    source,
+                    S3_HTTP_BOOTSTRAP_PATH,
+                    upload_url,
+                )
+            prepared = await self.exec(
+                f"chmod 700 {shlex.quote(S3_HTTP_BOOTSTRAP_PATH)}",
+                cwd="/",
+                timeout_sec=30,
+                user="root",
+            )
+            if prepared.return_code != 0:
+                raise RuntimeError(
+                    "failed to prepare minimal S3 downloader: "
+                    f"return_code={prepared.return_code} "
+                    f"stderr={getattr(prepared, 'stderr', '')!r}"
+                )
+            self._s3_downloader_ready = True
+            self.logger.info(
+                "YiCloud S3 downloader bootstrap uploaded once "
+                "path=%s size_bytes=%s",
+                S3_HTTP_BOOTSTRAP_PATH,
+                len(S3_HTTP_BOOTSTRAP.encode("utf-8")),
+            )
+
+    def _s3_download_command(
+        self, artifact: S3UploadArtifact, temporary: str
+    ) -> str:
+        target = shlex.quote(temporary)
+        timeout = self._s3_download_timeout_sec
+        return (
+            f"rm -f {target}; "
+            "if command -v curl >/dev/null 2>&1; then "
+            f"curl --noproxy '*' --fail --silent --show-error --location "
+            f"--retry 3 --connect-timeout 30 --max-time {timeout} "
+            f"--output {target} \"$HARBOR_S3_URL\" || exit 48; "
+            "elif command -v wget >/dev/null 2>&1; then "
+            f"wget --no-proxy -q -O {target} \"$HARBOR_S3_URL\" || exit 48; "
+            "elif command -v python3 >/dev/null 2>&1; then "
+            "python3 -c 'import shutil,sys,urllib.request; "
+            "opener=urllib.request.build_opener(urllib.request.ProxyHandler({})); "
+            "response=opener.open(sys.argv[1]); "
+            "output=open(sys.argv[2],\"wb\"); "
+            "shutil.copyfileobj(response,output); output.close(); response.close()' "
+            f"\"$HARBOR_S3_URL\" {target} || exit 48; "
+            f"elif [ -x {shlex.quote(S3_HTTP_BOOTSTRAP_PATH)} ]; then "
+            f"bash {shlex.quote(S3_HTTP_BOOTSTRAP_PATH)} {target} || exit 48; "
+            "else exit 45; fi; "
+            f"actual_size=$(wc -c < {target} | tr -d ' '); "
+            f"[ \"$actual_size\" = {artifact.payload_size} ] || "
+            f"{{ rm -f {target}; exit 46; }}; "
+            f"actual_digest=$(sha256sum {target} | awk '{{print $1}}'); "
+            f"[ \"$actual_digest\" = "
+            f"{shlex.quote(artifact.payload_digest)} ] || "
+            f"{{ rm -f {target}; exit 47; }}"
+        )
+
+    async def _materialize_s3_file(
+        self, artifact: S3UploadArtifact, target_path: str
+    ) -> None:
+        await self._ensure_s3_downloader(artifact.signed_url)
+        parent = str(Path(target_path).parent)
+        temporary = f"{target_path}.harbor-upload-{time.time_ns()}.tmp"
+        command = (
+            f"mkdir -p {shlex.quote(parent)} && "
+            f"({self._s3_download_command(artifact, temporary)}) && "
+            f"chmod 600 {shlex.quote(temporary)} && "
+            f"mv -f {shlex.quote(temporary)} {shlex.quote(target_path)}"
+        )
+        result = await self.exec(
+            command,
+            cwd="/",
+            env={"HARBOR_S3_URL": artifact.signed_url},
+            timeout_sec=self._s3_download_timeout_sec + 60,
+            user="root",
+        )
+        if result.return_code != 0:
+            raise RuntimeError(
+                f"failed to materialize S3 file to {target_path!r}: "
+                f"return_code={result.return_code} "
+                f"stdout={getattr(result, 'stdout', '')!r} "
+                f"stderr={getattr(result, 'stderr', '')!r}"
+            )
+
+    async def _materialize_s3_directory(
+        self, artifact: S3UploadArtifact, target_dir: str
+    ) -> None:
+        await self._ensure_s3_downloader(artifact.signed_url)
+        temporary = f"/tmp/harbor-s3-{time.time_ns()}.tar"
+        command = (
+            f"({self._s3_download_command(artifact, temporary)}) && "
+            f"mkdir -p {shlex.quote(target_dir)} && "
+            f"tar xf {shlex.quote(temporary)} "
+            f"-C {shlex.quote(target_dir)} && "
+            f"rm -f {shlex.quote(temporary)}"
+        )
+        result = await self.exec(
+            command,
+            cwd="/",
+            env={"HARBOR_S3_URL": artifact.signed_url},
+            timeout_sec=self._s3_download_timeout_sec + 300,
+            user="root",
+        )
+        if result.return_code != 0:
+            raise RuntimeError(
+                f"failed to materialize S3 directory to {target_dir!r}: "
+                f"return_code={result.return_code} "
+                f"stdout={getattr(result, 'stdout', '')!r} "
+                f"stderr={getattr(result, 'stderr', '')!r}"
+            )
+
+    async def upload_file(self, source_path: Path | str, target_path: str) -> None:
+        source = Path(source_path)
+        if not source.is_file():
+            raise RuntimeError(f"upload source is not a file: {source}")
+        if self._uses_s3_upload():
+            started = time.monotonic()
+            artifact = await asyncio.to_thread(
+                self._s3_store().stage_file, source
+            )
+            await self._materialize_s3_file(artifact, target_path)
+            elapsed = max(time.monotonic() - started, 0.001)
+            self.logger.info(
+                "YiCloud upload complete backend=s3 kind=file "
+                "target=%s digest=%s size_bytes=%s elapsed_seconds=%.3f",
+                target_path,
+                artifact.logical_digest,
+                artifact.payload_size,
+                elapsed,
+            )
+            return
+        parent = str(Path(target_path).parent)
+        fast_upload_url = self._fast_upload_url()
+        remote_chunk = f"/tmp/harbor-upload-{time.time_ns()}.chunk"
+        prepare = await self.exec(
+            f"mkdir -p {shlex.quote(parent)} && : > {shlex.quote(target_path)}",
+            cwd="/",
+            timeout_sec=60,
+            user="root",
+        )
+        if prepare.return_code != 0:
+            raise RuntimeError(f"failed to prepare upload target {target_path!r}")
+        if fast_upload_url:
+            await asyncio.to_thread(
+                self._upload_file_fast_sync,
+                source,
+                target_path,
+                fast_upload_url,
+            )
+            return
+        try:
+            with source.open("rb") as handle:
+                while chunk := handle.read(UPLOAD_CHUNK_BYTES):
+                    await asyncio.to_thread(
+                        self._upload_chunk_sync,
+                        chunk,
+                        remote_chunk,
+                        source.name,
+                    )
+                    append = await self.exec(
+                        f"base64 -d {shlex.quote(remote_chunk)} >> "
+                        f"{shlex.quote(target_path)} && "
+                        f"rm -f {shlex.quote(remote_chunk)}",
+                        cwd="/",
+                        timeout_sec=120,
+                        user="root",
+                    )
+                    if append.return_code != 0:
+                        raise RuntimeError(
+                            f"failed to append upload chunk to {target_path!r}: "
+                            f"{append.stderr}"
+                        )
+        finally:
+            await self.exec(
+                f"rm -f {shlex.quote(remote_chunk)}",
+                cwd="/",
+                timeout_sec=60,
+                user="root",
+            )
+
+    async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
+        source = Path(source_dir)
+        if not source.is_dir():
+            raise RuntimeError(f"upload source is not a directory: {source}")
+        if self._uses_s3_upload():
+            started = time.monotonic()
+            artifact = await asyncio.to_thread(
+                self._s3_store().stage_directory, source
+            )
+            await self._materialize_s3_directory(artifact, target_dir)
+            elapsed = max(time.monotonic() - started, 0.001)
+            self.logger.info(
+                "YiCloud upload complete backend=s3 kind=directory "
+                "target=%s digest=%s payload_bytes=%s compression=%s "
+                "elapsed_seconds=%.3f",
+                target_dir,
+                artifact.logical_digest,
+                artifact.payload_size,
+                artifact.compression,
+                elapsed,
+            )
+            return
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            archive = Path(tmp_dir) / "upload.tar.gz"
+            with tarfile.open(archive, "w:gz") as tar:
+                tar.add(source, arcname=".")
+            remote_archive = f"/tmp/harbor-upload-{time.time_ns()}.tar.gz"
+            await self.upload_file(archive, remote_archive)
+            result = await self.exec(
+                f"mkdir -p {shlex.quote(target_dir)} && "
+                f"tar xzf {shlex.quote(remote_archive)} -C {shlex.quote(target_dir)} && "
+                f"rm -f {shlex.quote(remote_archive)}",
+                cwd="/",
+                timeout_sec=180,
+                user="root",
+            )
+            if result.return_code != 0:
+                raise RuntimeError(f"failed to upload directory to {target_dir!r}")
+
+    async def _materialize_read_only_mounts(self) -> None:
+        """Copy immutable host bind mounts into a non-mounted Sandbox."""
+        for mount in getattr(self, "_mounts", []):
+            if mount.get("type") != "bind" or not mount.get("read_only"):
+                continue
+
+            source_value = str(mount.get("source") or "").strip()
+            target = str(mount.get("target") or "").strip()
+            if not source_value or not target:
+                raise RuntimeError(
+                    "read-only OpenSandbox bind mounts require source and target"
+                )
+            if not target.startswith("/"):
+                raise RuntimeError(
+                    f"OpenSandbox mount target must be absolute: {target!r}"
+                )
+
+            source = Path(source_value)
+            if not source.exists():
+                raise RuntimeError(
+                    f"OpenSandbox mount source does not exist: {source}"
+                )
+
+            self.logger.info(
+                "Materializing read-only mount source=%s target=%s",
+                source,
+                target,
+            )
+            if source.is_dir():
+                await self.upload_dir(source, target)
+            elif source.is_file():
+                await self.upload_file(source, target)
+            else:
+                raise RuntimeError(
+                    f"unsupported OpenSandbox mount source type: {source}"
+                )
+
+    async def download_file(self, source_path: str, target_path: Path | str) -> None:
+        result = await self.exec(
+            f"base64 -w0 {shlex.quote(source_path)}",
+            cwd="/",
+            timeout_sec=180,
+            user="root",
+        )
+        if result.return_code != 0:
+            raise RuntimeError(f"failed to download {source_path!r}: {result.stderr}")
+        target = Path(target_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(base64.b64decode(result.stdout or "", validate=True))
+
+    async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
+        result = await self.exec(
+            f"tar czf - -C {shlex.quote(source_dir)} . | base64 -w0",
+            cwd="/",
+            timeout_sec=300,
+            user="root",
+        )
+        if result.return_code != 0:
+            raise RuntimeError(f"failed to download directory {source_dir!r}")
+        target = Path(target_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            archive = Path(tmp_dir) / "download.tar.gz"
+            archive.write_bytes(base64.b64decode(result.stdout or "", validate=True))
+            with tarfile.open(archive, "r:gz") as tar:
+                tar.extractall(target, filter="data")

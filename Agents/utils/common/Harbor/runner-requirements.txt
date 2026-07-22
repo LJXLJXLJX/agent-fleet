@@ -2,3 +2,6 @@
 # Keep this list small; task-container dependencies are prepared separately.
 harbor==0.18.0
 opik==2.1.32
+pip==25.2
+s3cmd==2.4.0
+yicloud-sdk-python==0.3.1

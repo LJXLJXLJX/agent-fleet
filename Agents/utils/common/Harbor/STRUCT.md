@@ -21,6 +21,8 @@ Agents/utils/common/Harbor/
 ├── setup_runner_env.sh         # Explicit host setup / image validation
 ├── harbor_prepare_runner_cli.py # Startup validation for the configured CLI
 ├── harbor_worker_utils.py
+├── OPENSANDBOX_IMAGE_MANAGER.md # OpenSandbox task image build/cache/publish flow
+├── prebuild_opensandbox_dataset.sh # Batch prebuild/publish local dataset images
 └── scripts/
     ├── monitor.py              # Monitor CLI entrypoint and path resolution
     ├── analyzer_subagent.py    # Analyzer entrypoint for Pi/GLM-5.2 root-cause analysis
@@ -145,6 +147,23 @@ Typical dataset paths:
 | `TB_TIMEOUT_MULTIPLIER` | General Harbor timeout multiplier |
 | `TB_AGENT_TIMEOUT_MULTIPLIER` | Agent execution timeout override |
 | `TB_AGENT_SETUP_TIMEOUT_MULTIPLIER` | Agent setup timeout multiplier |
+| `YICLOUD_SANDBOX_CPU` | OpenSandbox request CPU flavor, default `2` to match the current prewarm pool |
+| `YICLOUD_SANDBOX_MEMORY` | OpenSandbox request memory flavor, default `8Gi` to match the current prewarm pool |
+| `YICLOUD_SANDBOX_LIFECYCLE_MINUTES` | Maximum OpenSandbox lifetime, default `120`; normal trials still delete on completion unless retention is enabled |
+| `YICLOUD_SANDBOX_READY_TIMEOUT_SEC` | YiCloud scheduling deadline before a dedicated ready-timeout error, default `300` |
+| `YICLOUD_SANDBOX_STATUS_LOG_INTERVAL_SEC` | Interval for Pending/state progress diagnostics, default `30` |
+| `YICLOUD_SANDBOX_RETAIN_ON_START_FAILURE` | Debug-only switch that skips automatic deletion after environment start failure, default `0` |
+| `YICLOUD_SANDBOX_RETAIN_AFTER_TRIAL` | Debug-only switch that retains a completed trial Sandbox until platform expiry, default `0` |
+| `YICLOUD_SANDBOX_UPLOAD_BACKEND` | Agent/task input transport: `http` or direct object-store `s3`; generic default `http`, YiCloud launcher default `s3` |
+| `YICLOUD_SANDBOX_S3_CONFIG` | Read-only s3cmd configuration path inside the Harbor runner |
+| `YICLOUD_SANDBOX_S3_BUCKET` | Bucket for immutable Agent and task input objects |
+| `YICLOUD_SANDBOX_S3_PREFIX` | Versioned content-addressed object prefix, default `agent-fleet-upload/v1` |
+| `YICLOUD_SANDBOX_S3_CACHE_ROOT` | H-local persistent cache for deterministic file and directory payloads |
+| `YICLOUD_SANDBOX_S3_LOCK_ROOT` | H-local lock and publication index directory; never store it in S3 |
+| `YICLOUD_SANDBOX_S3_SIGNED_URL_TTL_SEC` | Lifetime of per-object signed GET URLs, default `3600` |
+| `YICLOUD_SANDBOX_S3_DOWNLOAD_TIMEOUT_SEC` | Sandbox download and verification timeout, default `1800` |
+| `YICLOUD_SANDBOX_S3_DIRECTORY_COMPRESSION` | Deterministic directory snapshot mode: `auto`, `none`, or `gzip`; default `auto` |
+| `YICLOUD_SANDBOX_S3CMD` | s3cmd executable used by the Harbor runner; defaults to the pinned runner environment |
 | `HARBOR_ONLINE_ANALYSIS` | Enables console-only online analysis, default `0` |
 | `HARBOR_EARLY_STOP` | Stops the current SETA task on matching task-blocking online-analysis events when set to `1`, default `0` |
 | `HARBOR_ANALYZER_ENABLED` | Starts the Pi-backed analyzer from `start.sh` after the monitor is ready, defaults to `HARBOR_MONITOR_ENABLED` |
