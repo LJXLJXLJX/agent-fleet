@@ -57,10 +57,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -280,13 +280,13 @@ def parse_build_args(raw: str) -> dict[str, str]:
         return {}
     data = json.loads(raw)
     if not isinstance(data, dict):
-        raise ValueError("build args must be a JSON object")
+        raise TypeError("build args must be a JSON object")
     result: dict[str, str] = {}
     for key, value in data.items():
         if not isinstance(key, str) or not BUILD_ARG_NAME.fullmatch(key):
             raise ValueError(f"invalid build arg name: {key!r}")
         if not isinstance(value, (str, int, float, bool)):
-            raise ValueError(f"invalid build arg value for {key!r}")
+            raise TypeError(f"invalid build arg value for {key!r}")
         result[key] = str(value).lower() if isinstance(value, bool) else str(value)
     return result
 
@@ -679,7 +679,7 @@ def prepare(args: argparse.Namespace) -> str:
 
     cache_root = args.cache_root.resolve()
     target_key = hashlib.sha256(
-        f"{args.registry}/{args.repository}".encode("utf-8")
+        f"{args.registry}/{args.repository}".encode()
     ).hexdigest()[:16]
     lock_path = cache_root / "locks" / f"{target_key}-{tag}.lock"
     record_path = cache_root / "records" / target_key / f"{tag}.json"
@@ -869,6 +869,8 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except Exception as exc:
+    # This is the CLI boundary: report any operational failure without a
+    # traceback while preserving KeyboardInterrupt and other BaseExceptions.
+    except Exception as exc:  # noqa: BLE001
         log(f"failed: {type(exc).__name__}: {exc}")
         raise SystemExit(1)

@@ -9,7 +9,6 @@ from argparse import Namespace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-
 HARBOR_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HARBOR_DIR))
 

@@ -32,7 +32,6 @@ from harbor.environments.capabilities import (
 )
 from opensandbox_s3_upload import S3UploadArtifact, S3UploadStore
 
-
 EXPECTED_YICLOUD_SDK_VERSION = "0.3.1"
 EXIT_MARKER = "__HARBOR_YICLOUD_OPENSANDBOX_EXIT_CODE__="
 TERMINAL_FAILURE_STATES = {
@@ -249,8 +248,7 @@ def _command_url_of(data: Any) -> str:
             continue
         parsed = urlsplit(proxy_url)
         path = parsed.path.rstrip("/")
-        if path.endswith("/ping"):
-            path = path[: -len("/ping")]
+        path = path.removesuffix("/ping")
         path += "/command"
         return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
     raise RuntimeError("running YiCloud Sandbox returned no execd proxy endpoint")
@@ -566,9 +564,10 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             return
         try:
             await self._delete_sandbox()
-        except Exception as cleanup_error:
+        except Exception as cleanup_error:  # noqa: BLE001
             # Preserve the original scheduling/start exception. Cleanup
-            # failures remain visible without replacing the root cause.
+            # can fail through any SDK/transport exception; keep it visible
+            # without replacing the original start failure.
             self.logger.warning(
                 "YiCloud Sandbox cleanup after start failure failed: "
                 "sandbox_id=%s error=%s",
@@ -806,7 +805,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         )
         prepared = session.prepare_request(request)
         if not isinstance(prepared.body, bytes):
-            raise RuntimeError("execd multipart upload did not produce a binary body")
+            raise TypeError("execd multipart upload did not produce a binary body")
         content_type = prepared.headers.get("Content-Type", "")
         prepared.headers.update(
             self._signed_headers(
@@ -989,7 +988,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         if user is None:
             return None
         if isinstance(user, bool):
-            raise ValueError(f"invalid exec user: {user!r}")
+            raise TypeError(f"invalid exec user: {user!r}")
         if isinstance(user, int):
             if user < 0:
                 raise ValueError(f"exec uid must be non-negative: {user}")
@@ -1238,29 +1237,34 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
                 fast_upload_url,
             )
             return
+        handle = None
         try:
-            with source.open("rb") as handle:
-                while chunk := handle.read(UPLOAD_CHUNK_BYTES):
-                    await asyncio.to_thread(
-                        self._upload_chunk_sync,
-                        chunk,
-                        remote_chunk,
-                        source.name,
+            handle = await asyncio.to_thread(source.open, "rb")
+            while chunk := await asyncio.to_thread(
+                handle.read, UPLOAD_CHUNK_BYTES
+            ):
+                await asyncio.to_thread(
+                    self._upload_chunk_sync,
+                    chunk,
+                    remote_chunk,
+                    source.name,
+                )
+                append = await self.exec(
+                    f"base64 -d {shlex.quote(remote_chunk)} >> "
+                    f"{shlex.quote(target_path)} && "
+                    f"rm -f {shlex.quote(remote_chunk)}",
+                    cwd="/",
+                    timeout_sec=120,
+                    user="root",
+                )
+                if append.return_code != 0:
+                    raise RuntimeError(
+                        f"failed to append upload chunk to {target_path!r}: "
+                        f"{append.stderr}"
                     )
-                    append = await self.exec(
-                        f"base64 -d {shlex.quote(remote_chunk)} >> "
-                        f"{shlex.quote(target_path)} && "
-                        f"rm -f {shlex.quote(remote_chunk)}",
-                        cwd="/",
-                        timeout_sec=120,
-                        user="root",
-                    )
-                    if append.return_code != 0:
-                        raise RuntimeError(
-                            f"failed to append upload chunk to {target_path!r}: "
-                            f"{append.stderr}"
-                        )
         finally:
+            if handle is not None:
+                await asyncio.to_thread(handle.close)
             await self.exec(
                 f"rm -f {shlex.quote(remote_chunk)}",
                 cwd="/",

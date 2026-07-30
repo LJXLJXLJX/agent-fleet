@@ -6,7 +6,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-
 HARBOR_DIR = Path(__file__).resolve().parents[1]
 if str(HARBOR_DIR) not in os.sys.path:
     os.sys.path.insert(0, str(HARBOR_DIR))

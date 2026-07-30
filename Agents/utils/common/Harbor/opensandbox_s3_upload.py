@@ -21,13 +21,12 @@ import subprocess
 import tarfile
 import tempfile
 import time
-import uuid
 import zlib
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Iterator
+from typing import BinaryIO
 from urllib.parse import urlsplit, urlunsplit
-
 
 BUFFER_SIZE = 4 * 1024 * 1024
 SAMPLE_SIZE = 4 * 1024 * 1024
@@ -138,7 +137,7 @@ class S3UploadStore:
             raise ValueError("YICLOUD_SANDBOX_S3CMD must not be empty")
 
     @classmethod
-    def from_environment(cls) -> "S3UploadStore":
+    def from_environment(cls) -> S3UploadStore:
         return cls(
             config_path=os.environ.get("YICLOUD_SANDBOX_S3_CONFIG", ""),
             bucket=os.environ.get("YICLOUD_SANDBOX_S3_BUCKET", ""),
@@ -547,9 +546,8 @@ class S3UploadStore:
                     mode="wb",
                     compresslevel=1,
                     mtime=0,
-                ) as compressed:
-                    with tarfile.open(fileobj=compressed, mode="w|") as tar:
-                        populate(tar)
+                ) as compressed, tarfile.open(fileobj=compressed, mode="w|") as tar:
+                    populate(tar)
                 _fsync_file(raw)
         else:
             with payload.open("xb") as raw:

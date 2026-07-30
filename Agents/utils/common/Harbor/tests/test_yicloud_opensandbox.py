@@ -10,7 +10,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-
 HARBOR_DIR = Path(__file__).resolve().parents[1]
 MODULE_PATH = HARBOR_DIR / "yicloud_opensandbox.py"
 sys.path.insert(0, str(HARBOR_DIR))
