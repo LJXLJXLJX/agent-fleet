@@ -2,6 +2,9 @@
 
 This directory contains the shared Harbor runner for Claude Code and OpenCode.
 
+For YiCloud OpenSandbox, start with the
+[OpenSandbox quick start](OPENSANDBOX_README.md).
+
 The normal workflow is:
 
 ```bash
