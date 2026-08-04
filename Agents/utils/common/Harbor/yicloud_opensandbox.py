@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -858,7 +859,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             "path": target_path,
             "owner": "root",
             "group": "root",
-            "mode": 600,
+            "mode": int(f"{stat.S_IMODE(source.stat().st_mode):o}"),
         }
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="yicloud-fast-upload-") as tmp:
@@ -933,7 +934,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
     def _run_command_sync(
         self,
         command: str,
-        cwd: str,
+        cwd: str | None,
         env: dict[str, str],
         timeout_sec: int | None,
         uid: int | None = None,
@@ -941,19 +942,22 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         if not self._command_url or not self._access_token:
             raise RuntimeError("YiCloud Sandbox is not running")
         wrapped = (
-            "set +e; "
-            f"{command}; "
-            "harbor_rc=$?; "
-            f"printf '\\n{EXIT_MARKER}%s\\n' \"$harbor_rc\"; "
-            "exit \"$harbor_rc\""
+            "set +e\n"
+            "(\n"
+            f"{command}\n"
+            ")\n"
+            "harbor_rc=$?\n"
+            f"printf '\\n{EXIT_MARKER}%s\\n' \"$harbor_rc\"\n"
+            "exit \"$harbor_rc\"\n"
         )
         payload = {
             "command": wrapped,
-            "cwd": cwd,
             "background": False,
             "timeout": (timeout_sec or 3600) * 1000,
             "envs": env,
         }
+        if cwd is not None:
+            payload["cwd"] = cwd
         if uid is not None:
             payload["uid"] = uid
         body = json.dumps(payload, separators=(",", ":"))
@@ -1012,8 +1016,8 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         timeout_sec: int | None = None,
         user: str | int | None = None,
     ) -> ExecResult:
-        uid = self._resolve_exec_uid(user)
-        effective_cwd = cwd or self.task_env_config.workdir or "/app"
+        uid = self._resolve_exec_uid(self._resolve_user(user))
+        effective_cwd = cwd or self.task_env_config.workdir
         result = await asyncio.to_thread(
             self._run_command_sync,
             command,
@@ -1145,7 +1149,10 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         )
 
     async def _materialize_s3_file(
-        self, artifact: S3UploadArtifact, target_path: str
+        self,
+        artifact: S3UploadArtifact,
+        target_path: str,
+        mode: str,
     ) -> None:
         await self._ensure_s3_downloader(artifact.signed_url)
         parent = str(Path(target_path).parent)
@@ -1153,7 +1160,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         command = (
             f"mkdir -p {shlex.quote(parent)} && "
             f"({self._s3_download_command(artifact, temporary)}) && "
-            f"chmod 600 {shlex.quote(temporary)} && "
+            f"chmod {mode} {shlex.quote(temporary)} && "
             f"mv -f {shlex.quote(temporary)} {shlex.quote(target_path)}"
         )
         result = await self.exec(
@@ -1202,12 +1209,13 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         source = Path(source_path)
         if not source.is_file():
             raise RuntimeError(f"upload source is not a file: {source}")
+        mode = f"{stat.S_IMODE(source.stat().st_mode):o}"
         if self._uses_s3_upload():
             started = time.monotonic()
             artifact = await asyncio.to_thread(
                 self._s3_store().stage_file, source
             )
-            await self._materialize_s3_file(artifact, target_path)
+            await self._materialize_s3_file(artifact, target_path, mode)
             elapsed = max(time.monotonic() - started, 0.001)
             self.logger.info(
                 "YiCloud upload complete backend=s3 kind=file "
@@ -1270,6 +1278,17 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
                 cwd="/",
                 timeout_sec=60,
                 user="root",
+            )
+        finalize = await self.exec(
+            f"chmod {mode} {shlex.quote(target_path)}",
+            cwd="/",
+            timeout_sec=60,
+            user="root",
+        )
+        if finalize.return_code != 0:
+            raise RuntimeError(
+                f"failed to preserve upload mode for {target_path!r}: "
+                f"{finalize.stderr}"
             )
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:

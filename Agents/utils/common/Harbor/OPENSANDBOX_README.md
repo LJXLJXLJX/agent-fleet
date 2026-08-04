@@ -34,7 +34,6 @@ Set at least the following values in `config.local.env`:
 BASE_URL=https://model-gateway.example.com
 API_KEY=your-model-api-key
 MODEL=your-model-id
-TRACE_TO_OPIK=false
 
 RL_ENVIRONMENT_TYPE=opensandbox
 YICLOUD_PUBLIC_KEY=your-yicloud-public-key

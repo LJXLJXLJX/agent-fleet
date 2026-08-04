@@ -289,7 +289,7 @@ prepare_opensandbox_image_ref() {
     --apt-mirror "$HARBOR_OPENSANDBOX_APT_MIRROR"
     --build-args-json "$HARBOR_OPENSANDBOX_BUILD_ARGS_JSON"
   )
-  if [[ "${TB_FORCE_BUILD:-0}" == "1" ]]; then
+  if [[ "${TB_FORCE_BUILD:-0}" == "1" || "${TB_FORCE_BUILD:-0}" == "true" ]]; then
     manager_cmd+=( --force )
   fi
   if [[ "$HARBOR_OPENSANDBOX_BUILD_USE_PROXY" == "1" ]]; then
@@ -660,15 +660,21 @@ run_oracle_task() {
   out_dir="$effective_jobs_root/$job_name"
   mkdir -p "$out_dir"
 
+  VERIFIER_UV_BIN_DIR_SOURCE="$(mktemp -d "${RUNTIME_DIR%/}/verifier-uv.oracle.XXXXXX" 2>/dev/null || true)"
+  if [[ -n "$VERIFIER_UV_BIN_DIR_SOURCE" ]]; then
+    prepare_verifier_uv_bin "$VERIFIER_UV_BIN_DIR_SOURCE" || true
+  else
+    echo "[WARN] failed to create verifier uv backup dir; verifier will use its normal uv install path" >&2
+  fi
+
   if [[ "$TB_DRY_RUN" != "1" ]]; then
-    harbor_prepare_runner_cli
+    harbor_validate_runner_cli
   fi
   prepare_opensandbox_image_ref
 
   local cmd=(
     "$HARBOR_CLI_BIN" run
     -y
-    --env "$TB_ENVIRONMENT_SPEC"
     --n-concurrent "$TB_N_CONCURRENT"
     --max-retries "$TB_MAX_RETRIES"
     -o "$out_dir"
@@ -684,10 +690,30 @@ run_oracle_task() {
   else
     cmd+=( --path "$TB_PATH" )
   fi
-  if [[ "$TB_ENVIRONMENT_TYPE" == "opensandbox" ]]; then
+  append_environment_backend_args
+  if [[ -n "$VERIFIER_UV_BIN_DIR_SOURCE" && -x "$VERIFIER_UV_BIN_DIR_SOURCE/uv" && -x "$VERIFIER_UV_BIN_DIR_SOURCE/uvx" ]]; then
+    local verifier_mounts_json verifier_uv_path_prefix
+    verifier_mounts_json="$(
+      python3 - "$VERIFIER_UV_BIN_DIR_SOURCE" "$TB_VERIFIER_UV_BIN_DIR_MOUNT_PATH" <<'PY'
+import json
+import sys
+
+print(json.dumps([{
+    "type": "bind",
+    "source": sys.argv[1],
+    "target": sys.argv[2],
+    "read_only": True,
+}]))
+PY
+    )"
+    verifier_uv_path_prefix="/root/.local/bin:/home/oai/.local/bin:/home/agent/.local/bin:/home/ubuntu/.local/bin"
+    if [[ -n "${TB_VERIFIER_UV_HOME:-}" ]]; then
+      verifier_uv_path_prefix="$TB_VERIFIER_UV_HOME/.local/bin:$verifier_uv_path_prefix"
+    fi
     cmd+=(
-      --ek "image_ref=$HARBOR_OPENSANDBOX_IMAGE_REF"
-      --ek "lifecycle_minutes=$YICLOUD_SANDBOX_LIFECYCLE_MINUTES"
+      --mounts-json "$verifier_mounts_json"
+      --ve "PATH=$verifier_uv_path_prefix:$TB_VERIFIER_UV_BIN_DIR_MOUNT_PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      --ve "TB_VERIFIER_UV_BIN_DIR=$TB_VERIFIER_UV_BIN_DIR_MOUNT_PATH"
     )
   fi
   if [[ -n "${PIP_INDEX_URL:-}" ]]; then

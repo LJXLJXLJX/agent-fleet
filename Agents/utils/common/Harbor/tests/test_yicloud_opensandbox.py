@@ -2,6 +2,7 @@ import asyncio
 import base64
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import types
@@ -22,7 +23,10 @@ def install_harbor_stubs() -> None:
     capabilities = types.ModuleType("harbor.environments.capabilities")
 
     class BaseEnvironment:
-        pass
+        default_user = None
+
+        def _resolve_user(self, user):
+            return user if user is not None else self.default_user
 
     class ExecResult:
         def __init__(self, **kwargs):
@@ -102,10 +106,17 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             signed_url="http://ceph.example/cache/object?secret=signature",
         )
 
-        asyncio.run(instance._materialize_s3_file(artifact, "/tmp/agent.tgz"))
+        asyncio.run(
+            instance._materialize_s3_file(
+                artifact,
+                "/tmp/agent.tgz",
+                "755",
+            )
+        )
 
         call = instance.exec.await_args
         self.assertNotIn("secret=signature", call.args[0])
+        self.assertIn("chmod 755", call.args[0])
         self.assertEqual(
             call.kwargs["env"]["HARBOR_S3_URL"],
             artifact.signed_url,
@@ -176,14 +187,14 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
                 SimpleNamespace(Id="env-other", Name="other"),
                 SimpleNamespace(
                     Id="env-dedicated",
-                    Name="jianxiao-sandbox-0",
+                    Name="dedicated-test-environment",
                 ),
             ]
         )
         environment_id = yicloud_opensandbox._environment_id_by_exact_name(
             sandbox,
-            "fdj-infra",
-            "jianxiao-sandbox-0",
+            "test-project",
+            "dedicated-test-environment",
         )
         self.assertEqual(environment_id, "env-dedicated")
 
@@ -241,6 +252,130 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
         self.assertEqual(captured["payload"]["uid"], 0)
 
+    def test_wrapped_command_preserves_exit_code_after_exit_or_exec(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._command_url = "https://sandbox.example/command"
+        instance._access_token = "test-token"
+        instance._signed_headers = Mock(return_value={})
+
+        class StopAfterCapture(RuntimeError):
+            pass
+
+        for command, expected_code in (
+            ("exit 0", 0),
+            ("exit 7", 7),
+            ("exec sh -c 'exit 9'", 9),
+        ):
+            with self.subTest(command=command):
+                captured = {}
+
+                class FakeSession:
+                    trust_env = True
+
+                    def post(self, _url, *, headers, data, timeout):
+                        captured["payload"] = json.loads(data)
+                        raise StopAfterCapture
+
+                with (
+                    patch.object(
+                        yicloud_opensandbox.requests,
+                        "Session",
+                        return_value=FakeSession(),
+                    ),
+                    self.assertRaises(StopAfterCapture),
+                ):
+                    instance._run_command_sync(command, "/", {}, 30)
+
+                completed = subprocess.run(
+                    ["sh", "-c", captured["payload"]["command"]],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, expected_code)
+                self.assertIn(
+                    f"{yicloud_opensandbox.EXIT_MARKER}{expected_code}",
+                    completed.stdout,
+                )
+
+    def test_exec_uses_harbor_default_user_when_user_is_unset(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance.default_user = "1234"
+        instance.task_env_config = SimpleNamespace(workdir="/app")
+        instance._merge_env = Mock(return_value={})
+        instance._run_command_sync = Mock(
+            return_value=SimpleNamespace(
+                stdout="",
+                stderr="",
+                return_code=0,
+            )
+        )
+        instance._output_callback = Mock(return_value=None)
+
+        async def run_inline(function, *args):
+            return function(*args)
+
+        with patch.object(
+            yicloud_opensandbox.asyncio,
+            "to_thread",
+            side_effect=run_inline,
+        ):
+            asyncio.run(instance.exec("id -u"))
+
+        self.assertEqual(instance._run_command_sync.call_args.args[1], "/app")
+        self.assertEqual(instance._run_command_sync.call_args.args[-1], 1234)
+
+    def test_exec_omits_cwd_when_no_cwd_or_task_workdir_is_set(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance.default_user = None
+        instance.task_env_config = SimpleNamespace(workdir=None)
+        instance._merge_env = Mock(return_value={})
+        instance._output_callback = Mock(return_value=None)
+        instance._command_url = "https://sandbox.example/command"
+        instance._access_token = "test-token"
+        instance._signed_headers = Mock(return_value={})
+        captured = {}
+
+        class FakeResponse:
+            text = ""
+
+            @staticmethod
+            def raise_for_status() -> None:
+                return None
+
+        class FakeSession:
+            trust_env = True
+
+            def post(self, _url, *, headers, data, timeout):
+                captured["payload"] = json.loads(data)
+                return FakeResponse()
+
+        async def run_inline(function, *args):
+            return function(*args)
+
+        with (
+            patch.object(
+                yicloud_opensandbox.requests,
+                "Session",
+                return_value=FakeSession(),
+            ),
+            patch.object(
+                yicloud_opensandbox.asyncio,
+                "to_thread",
+                side_effect=run_inline,
+            ),
+        ):
+            result = asyncio.run(instance.exec("pwd"))
+
+        self.assertNotIn("cwd", captured["payload"])
+        self.assertEqual(result.return_code, 1)
+
     def test_fast_upload_keeps_access_token_out_of_argv(self) -> None:
         instance = object.__new__(
             yicloud_opensandbox.YiCloudOpenSandboxEnvironment
@@ -254,11 +389,21 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             captured["command"] = command
             header_path = Path(command[command.index("--header") + 1][1:])
             captured["headers"] = header_path.read_text(encoding="utf-8")
+            metadata_form = next(
+                value
+                for value in command
+                if value.startswith("metadata=@")
+            )
+            metadata_path = Path(
+                metadata_form.removeprefix("metadata=@").split(";", 1)[0]
+            )
+            captured["metadata"] = json.loads(metadata_path.read_text())
             return SimpleNamespace(returncode=0, stdout="200", stderr="")
 
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "agent.tgz"
             source.write_bytes(b"agent-package")
+            source.chmod(0o755)
             with patch.object(
                 yicloud_opensandbox.subprocess,
                 "run",
@@ -278,6 +423,35 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             "X-Sandbox-Access-Token: secret-sandbox-token",
             captured["headers"],
         )
+        self.assertEqual(captured["metadata"]["mode"], 755)
+
+    def test_chunked_upload_restores_source_mode(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._uses_s3_upload = Mock(return_value=False)
+        instance._fast_upload_url = Mock(return_value="")
+        instance._upload_chunk_sync = Mock()
+        instance.exec = AsyncMock(
+            return_value=SimpleNamespace(return_code=0, stdout="", stderr="")
+        )
+
+        async def run_inline(function, *args):
+            return function(*args)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "tool"
+            source.write_bytes(b"#!/bin/sh\n")
+            source.chmod(0o755)
+            with patch.object(
+                yicloud_opensandbox.asyncio,
+                "to_thread",
+                side_effect=run_inline,
+            ):
+                asyncio.run(instance.upload_file(source, "/opt/tools/tool"))
+
+        commands = [call.args[0] for call in instance.exec.await_args_list]
+        self.assertIn("chmod 755 /opt/tools/tool", commands)
 
     def test_execd_upload_uses_binary_multipart_metadata(self) -> None:
         instance = object.__new__(

@@ -171,8 +171,8 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
                 dataset_root=root,
                 include="0",
                 registry="registry.gate.yicloud.com.cn",
-                repository="fdj-infra/example",
-                sandbox_image_prefix="fdj-infra/example",
+                repository="test-project/example",
+                sandbox_image_prefix="test-project/example",
                 docker_config=root / "missing-config.json",
                 cache_root=root / "cache",
                 platform="linux/amd64",
@@ -185,7 +185,7 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
                 dry_run=True,
             )
             image_ref = prepare(args)
-        self.assertRegex(image_ref, r"^fdj-infra/example:harbor-0-[0-9a-f]{20}$")
+        self.assertRegex(image_ref, r"^test-project/example:harbor-0-[0-9a-f]{20}$")
 
 
 if __name__ == "__main__":
