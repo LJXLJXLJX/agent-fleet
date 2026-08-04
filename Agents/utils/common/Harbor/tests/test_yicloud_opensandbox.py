@@ -274,15 +274,18 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
                 class FakeSession:
                     trust_env = True
 
+                    def __init__(self, request_capture):
+                        self._request_capture = request_capture
+
                     def post(self, _url, *, headers, data, timeout):
-                        captured["payload"] = json.loads(data)
+                        self._request_capture["payload"] = json.loads(data)
                         raise StopAfterCapture
 
                 with (
                     patch.object(
                         yicloud_opensandbox.requests,
                         "Session",
-                        return_value=FakeSession(),
+                        return_value=FakeSession(captured),
                     ),
                     self.assertRaises(StopAfterCapture),
                 ):
