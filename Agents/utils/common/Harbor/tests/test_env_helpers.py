@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import tarfile
 import tempfile
@@ -12,10 +14,13 @@ HARBOR_DIR = Path(__file__).parents[1]
 ENV_PY = HARBOR_DIR / "env.py"
 
 
-def run_env_helper(*args: str | Path) -> subprocess.CompletedProcess[str]:
+def run_env_helper(
+    *args: str | Path, environment: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["python3", str(ENV_PY), *(str(arg) for arg in args)],
         capture_output=True,
+        env=environment,
         text=True,
         check=False,
     )
@@ -34,6 +39,28 @@ class _CacheHandler(BaseHTTPRequestHandler):
 
 
 class HarborEnvHelperTests(unittest.TestCase):
+    def test_opencode_config_applies_model_request_headers(self) -> None:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "TB_ANTHROPIC_BASE_URL": "http://model.example",
+                "TB_ANTHROPIC_AUTH_TOKEN": "test-key",
+                "TB_MODEL": "custom/test-model",
+                "TB_LLM_KWARGS": (
+                    '{"extra_headers":{"X-Route-Key":"deployment-a"}}'
+                ),
+            }
+        )
+
+        result = run_env_helper("opencode-config", environment=environment)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(result.stdout)
+        self.assertEqual(
+            config["provider"]["custom"]["options"]["headers"],
+            {"X-Route-Key": "deployment-a"},
+        )
+
     def test_generate_task_file_lists_supported_tasks_in_sorted_order(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

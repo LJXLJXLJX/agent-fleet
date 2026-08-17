@@ -196,6 +196,7 @@ zellij run.  `env.sh` then sources `Agents/utils/rl/RL-env.sh` through
 | `RL_AGENT` | Agent used by rollout workers, normally `claude-code` or `opencode` |
 | `RL_MODEL_NAME` | Model name used when a request does not provide one |
 | `RL_API_BASE` / `RL_API_KEY` | Model gateway defaults for rollout requests |
+| `MODEL_REQUEST_CONFIG_JSON` | Trusted, versioned host-side model-request customization; version 1 supports `headers.set` and cannot be overridden by `/run_trial` |
 | `RL_MODEL_INFO` / `RL_MAX_NEW_TOKENS` | Harbor model/token budgets applied to rollout tasks |
 | `RL_MAX_TURNS` | Mapped to Harbor `max_turns` for claude-code rollout tasks |
 | `RL_FORCE_BUILD` | Mapped to `TB_FORCE_BUILD`; request `force_build` can override it |
