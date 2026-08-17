@@ -26,13 +26,26 @@ ensure_zellij_web_sharing_config() {
 submission_storage_id="${RL_ZELLIJ_SUBMISSION_STORAGE_ID:-$ray_submission_id}"
 submission_slug="$(safe_name "$submission_storage_id")"
 agent_slug="$(safe_name "${RL_AGENT:-claude-code}")"
-# Keep the Zellij name below its Unix-socket path limit. submission_slug is a
-# storage-safe `submission-<128-bit digest>`, so the compact name remains
-# deterministic and collision-resistant without agent/dataset prefixes.
-session_name="hr-${submission_slug#submission-}"
-job_runtime_dir="${RL_JOB_RUNTIME_ROOT}/${submission_slug}"
-layout_file="${job_runtime_dir}/harbor-rollout-${submission_slug}.kdl"
-lock_file="${RL_JOB_RUNTIME_ROOT}/${submission_slug}.lock"
+session_name="${RL_ZELLIJ_SESSION_NAME:-}"
+if [[ -z "$session_name" ]]; then
+  # Standalone fallback matching rollout_remote_harbor.py. The normal listener
+  # path passes RL_ZELLIJ_SESSION_NAME explicitly so one side owns the value.
+  session_digest="$(
+    printf '%s\0%s\0%s\0%s\0%s' \
+      "${RL_AGENT:-claude-code}" "$dataset_name" "$RL_JOB_QUEUE_ROOT" \
+      "$RL_JOB_RUNTIME_ROOT" "$ray_submission_id" \
+      | sha256sum | cut -c1-32
+  )"
+  session_name="hr-${session_digest}"
+fi
+if [[ ! "$session_name" =~ ^hr-[0-9a-f]{32}$ ]]; then
+  echo "invalid rollout zellij session name: $session_name" >&2
+  exit 2
+fi
+session_slug="session-${session_name#hr-}"
+job_runtime_dir="${RL_JOB_RUNTIME_ROOT}/${session_slug}"
+layout_file="${job_runtime_dir}/harbor-rollout-${session_slug}.kdl"
+lock_file="${RL_JOB_RUNTIME_ROOT}/${session_slug}.lock"
 
 mkdir -p "$job_queue_dir/pending" "$job_queue_dir/active" "$job_queue_dir/results" "$job_runtime_dir" "$RL_JOB_RUNTIME_ROOT"
 

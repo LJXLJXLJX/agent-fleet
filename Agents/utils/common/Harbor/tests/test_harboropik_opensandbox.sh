@@ -6,7 +6,7 @@ MANAGER_PYTHON="${HARBOR_OPIK_PYTHON:-$(command -v python3)}"
 tmp="$(mktemp -d)"
 trap 'rm -rf -- "$tmp"' EXIT
 
-mkdir -p "$tmp/bin" "$tmp/dataset/0/environment" "$tmp/home"
+mkdir -p "$tmp/bin" "$tmp/dataset/0/environment" "$tmp/deps/wheels" "$tmp/home"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/bin/uv"
 chmod +x "$tmp/bin/uv"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/bin/uvx"
@@ -21,8 +21,15 @@ fi
 exit 0
 SH
 chmod +x "$tmp/bin/docker"
+cat >"$tmp/bin/fake-harbor" <<'SH'
+#!/usr/bin/env bash
+printf 'FAKE_HARBOR_ARG=%s\n' "$@"
+SH
+chmod +x "$tmp/bin/fake-harbor"
 printf '[environment]\nbuild_timeout_sec = 60\n' > "$tmp/dataset/0/task.toml"
 printf 'FROM ubuntu:24.04\n' > "$tmp/dataset/0/environment/Dockerfile"
+printf 'fake package\n' > "$tmp/deps/claude.tgz"
+printf 'fake wheel\n' > "$tmp/deps/wheels/dependency.whl"
 
 run_dry() {
   local image_ref="$1"
@@ -31,26 +38,50 @@ run_dry() {
   local dataset_name="${4:-auto}"
   local environment_type="${5:-opensandbox}"
   local force_build="${6:-0}"
+  local agent="${7:-oracle}"
+  local dry_run="${8:-1}"
+  local runtime_dir="$tmp/runtime/$agent"
+  local queue_dir="$tmp/queue/$agent"
+  local harbor_python="$MANAGER_PYTHON"
+  if [[ "$agent" == "opencode" && "$dry_run" == "0" ]]; then
+    harbor_python="$tmp/bin/fake-harbor"
+  fi
+  mkdir -p "$queue_dir" "$runtime_dir"
   if [[ -z "$build_args_json" ]]; then
     build_args_json='{}'
   fi
   env -i \
     PATH="$tmp/bin:/usr/bin:/bin" \
     HOME="$tmp/home" \
-    AGENT=oracle \
+    AGENT="$agent" \
+    TB_AGENT="$agent" \
     DATASET_NAME="$dataset_name" \
     DATASET_PATH="$tmp/dataset" \
     INCLUDE_TASKS=0 \
     OUTPUT_PATH="$tmp/output" \
-    TB_DRY_RUN=1 \
+    QUEUE_DIR="$queue_dir" \
+    RUNTIME_DIR="$runtime_dir" \
+    TB_DRY_RUN="$dry_run" \
     TB_FORCE_BUILD="$force_build" \
     TB_N_CONCURRENT=1 \
     TB_MAX_RETRIES=0 \
+    API_KEY=fake-api-key \
+    BASE_URL=https://model.example \
+    MODEL=test-model \
+    TB_ANTHROPIC_AUTH_TOKEN=fake-api-key \
+    TB_LLM_KWARGS='{"temperature":1.0}' \
+    TB_CC_CLAUDE_TGZ_SOURCE="$tmp/deps/claude.tgz" \
+    TB_CC_PY_WHEEL_DIR_SOURCE="$tmp/deps/wheels" \
+    TRACE_TO_OPIK=false \
+    TB_TRACE_TO_OPIK=false \
     TB_ENVIRONMENT_TYPE="$environment_type" \
     HARBOR_OPENSANDBOX_IMAGE_REF="$image_ref" \
     HARBOR_OPENSANDBOX_IMAGE_REPOSITORY=test-project/test-repository \
     HARBOR_OPENSANDBOX_IMAGE_MANAGER="$manager" \
-    HARBOR_OPIK_PYTHON="$MANAGER_PYTHON" \
+    HARBOR_OPIK_BIN="$tmp/bin/fake-harbor" \
+    HARBOR_CLI_BIN="$tmp/bin/fake-harbor" \
+    HARBOR_RUNNER_PREPARE=0 \
+    HARBOR_OPIK_PYTHON="$harbor_python" \
     HARBOR_OPENSANDBOX_BUILD_ARGS_JSON="$build_args_json" \
     YICLOUD_PUBLIC_KEY=fake-public \
     YICLOUD_SECRET_KEY=fake-secret \
@@ -111,3 +142,21 @@ if grep -F -- '[INFO] preparing OpenSandbox image' <<< "$manual" >/dev/null; the
   echo 'manual image override unexpectedly invoked the image manager' >&2
   exit 1
 fi
+
+claude_opensandbox="$(run_dry \
+  'test-project/manual:immutable' "$tmp/does-not-exist.py" '{}' auto \
+  opensandbox 0 claude-code 0)"
+grep -F -- 'FAKE_HARBOR_ARG=--mounts-json' <<< "$claude_opensandbox" >/dev/null
+grep -F -- 'FAKE_HARBOR_ARG=CC_OPIK_CLAUDE_TGZ_PATH=' \
+  <<< "$claude_opensandbox" >/dev/null
+grep -F -- 'FAKE_HARBOR_ARG=TB_VERIFIER_UV_BIN_DIR=/opt/tb-uv-backup/bin' \
+  <<< "$claude_opensandbox" >/dev/null
+
+opencode_opensandbox="$(run_dry \
+  'test-project/manual:immutable' "$tmp/does-not-exist.py" '{}' auto \
+  opensandbox 0 opencode 0)"
+grep -F -- 'FAKE_HARBOR_ARG=--mounts-json' <<< "$opencode_opensandbox" >/dev/null
+grep -F -- 'FAKE_HARBOR_ARG=OPENCODE_TGZ_PATH=' \
+  <<< "$opencode_opensandbox" >/dev/null
+grep -F -- 'FAKE_HARBOR_ARG=TB_VERIFIER_UV_BIN_DIR=/opt/tb-uv-backup/bin' \
+  <<< "$opencode_opensandbox" >/dev/null

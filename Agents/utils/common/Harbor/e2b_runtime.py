@@ -149,6 +149,9 @@ def patch_e2b_sandbox_timeout_from_env() -> bool:
     its public environment or trial configuration.
     """
 
+    if os.environ.get("TB_ENVIRONMENT_TYPE", "docker").strip().lower() != "e2b":
+        return False
+
     raw_timeout = os.environ.get("TB_E2B_SANDBOX_TIMEOUT_SEC", "").strip()
     if not raw_timeout:
         return False

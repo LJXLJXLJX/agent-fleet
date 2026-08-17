@@ -242,13 +242,22 @@ def _queue_for_submission(ray_submission_id: str) -> Path:
     return _require_contained_path(JOB_QUEUE_ROOT / _storage_id(ray_submission_id, prefix="submission"), JOB_QUEUE_ROOT, label="queue dir")
 
 
-def _submission_session_name(ray_submission_id: str, _dataset_name: str) -> str:
-    submission_slug = _storage_id(ray_submission_id, prefix="submission")
+def _submission_session_name(ray_submission_id: str, dataset_name: str) -> str:
+    listener_identity = "\0".join(
+        (
+            os.environ.get("RL_AGENT", "claude-code"),
+            dataset_name,
+            str(JOB_QUEUE_ROOT),
+            str(JOB_RUNTIME_ROOT),
+            ray_submission_id,
+        )
+    )
+    session_slug = _storage_id(listener_identity, prefix="session")
     # Zellij includes the session name in its Unix socket path. Keep the name
-    # compact even when the storage-safe submission id already contains a full
-    # digest; long descriptive prefixes can exceed Zellij's socket-path budget.
-    submission_digest = submission_slug.removeprefix("submission-")
-    return f"hr-{submission_digest}"
+    # compact while preserving the listener namespace in the digest. Zellij
+    # sessions are global to the local user, not scoped to one listener process.
+    session_digest = session_slug.removeprefix("session-")
+    return f"hr-{session_digest}"
 
 
 def _job_lock(job_slug: str) -> threading.Lock:
@@ -328,19 +337,20 @@ def _ensure_submission_zellij(
         raise RuntimeError("RL_DYNAMIC_JOB_ZELLIJ=0 is unsupported without a prestarted worker pool")
     submission_slug = _storage_id(ray_submission_id, prefix="submission")
     expected_session = _submission_session_name(ray_submission_id, dataset_name)
-    ready_session = _cached_job_session(submission_slug)
+    session_key = expected_session
+    ready_session = _cached_job_session(session_key)
     if ready_session:
         if _zellij_session_exists(ready_session):
             return ready_session
-        _clear_cached_job_session(submission_slug, ready_session)
+        _clear_cached_job_session(session_key, ready_session)
 
-    lock = _job_lock(submission_slug)
+    lock = _job_lock(session_key)
     with lock:
-        ready_session = _cached_job_session(submission_slug)
+        ready_session = _cached_job_session(session_key)
         if ready_session:
             if _zellij_session_exists(ready_session):
                 return ready_session
-            _clear_cached_job_session(submission_slug, ready_session)
+            _clear_cached_job_session(session_key, ready_session)
 
         script = SCRIPT_DIR / "ensure_rl_job_zellij.sh"
         if not script.exists():
@@ -349,7 +359,9 @@ def _ensure_submission_zellij(
         env.update({
             "RL_ZELLIJ_SUBMISSION_ID": ray_submission_id,
             "RL_ZELLIJ_SUBMISSION_STORAGE_ID": submission_slug,
+            "RL_ZELLIJ_SESSION_NAME": expected_session,
             "RL_ZELLIJ_JOB_QUEUE_DIR": str(queue_dir),
+            "RL_JOB_QUEUE_ROOT": str(JOB_QUEUE_ROOT),
             "RL_JOB_RUNTIME_ROOT": str(JOB_RUNTIME_ROOT),
             "RL_MODEL_NAME": model_name,
             "OPIK_PROJECT_NAME": opik_project_name,
@@ -366,8 +378,13 @@ def _ensure_submission_zellij(
                 f"for ray_submission_id={ray_submission_id!r}: {stderr or stdout}"
             )
         session_name = stdout.strip().splitlines()[-1] if stdout.strip() else expected_session
+        if session_name != expected_session:
+            raise RuntimeError(
+                "job zellij helper returned an unexpected session name: "
+                f"expected={expected_session!r}, actual={session_name!r}"
+            )
         with JOB_ZELLIJ_LOCKS_GUARD:
-            JOB_ZELLIJ_READY[submission_slug] = session_name
+            JOB_ZELLIJ_READY[session_key] = session_name
         return session_name
 
 

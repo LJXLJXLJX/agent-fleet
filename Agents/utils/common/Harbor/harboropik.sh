@@ -885,7 +885,7 @@ run_tb() {
     echo "[ERROR] current TB_LLM_KWARGS: $TB_LLM_KWARGS" >&2
     exit 1
   fi
-  if [[ "$TB_ENVIRONMENT_TYPE" == "docker" || "$TB_ENVIRONMENT_TYPE" == "e2b" ]]; then
+  if [[ "$TB_ENVIRONMENT_TYPE" == "docker" || "$TB_ENVIRONMENT_TYPE" == "e2b" || "$TB_ENVIRONMENT_TYPE" == "opensandbox" ]]; then
     VERIFIER_UV_BIN_DIR_SOURCE="$(mktemp -d "${RUNTIME_DIR%/}/verifier-uv.${job_name}.XXXXXX" 2>/dev/null || true)"
     if [[ -n "$VERIFIER_UV_BIN_DIR_SOURCE" ]]; then
       prepare_verifier_uv_bin "$VERIFIER_UV_BIN_DIR_SOURCE" || true
@@ -1065,7 +1065,7 @@ PY
   fi
 
   local mounts_json="[]"
-  if [[ "$TB_ENVIRONMENT_TYPE" == "docker" ]]; then
+  if [[ "$TB_ENVIRONMENT_TYPE" == "docker" || "$TB_ENVIRONMENT_TYPE" == "opensandbox" ]]; then
     mounts_json="$(
     python3 - "$hook_mount_enabled" "$TB_CC_HOOK_SOURCE" "$TB_CC_HOOK_MOUNT_PATH" "$TB_CC_CLAUDE_TGZ_SOURCE" "$TB_CC_CLAUDE_TGZ_MOUNT_PATH" "$TB_CC_PY_WHEEL_DIR_SOURCE" "$TB_CC_PY_WHEEL_DIR_MOUNT_PATH" "$VERIFIER_UV_BIN_DIR_SOURCE" "$TB_VERIFIER_UV_BIN_DIR_MOUNT_PATH" <<'PY'
 import json
@@ -1105,13 +1105,13 @@ if (
 print(json.dumps(mounts, ensure_ascii=True))
 PY
     )"
-  else
+  elif [[ "$TB_ENVIRONMENT_TYPE" == "e2b" ]]; then
     echo "[INFO] E2B environment does not support host bind mounts; skip hook, dependency, and verifier uv mounts"
   fi
   if [[ "$mounts_json" != "[]" ]]; then
     cmd+=( --mounts-json "$mounts_json" )
   fi
-  if [[ "$TB_ENVIRONMENT_TYPE" == "docker" || "$TB_ENVIRONMENT_TYPE" == "e2b" ]] && verifier_uv_bin_ready; then
+  if [[ "$TB_ENVIRONMENT_TYPE" == "docker" || "$TB_ENVIRONMENT_TYPE" == "e2b" || "$TB_ENVIRONMENT_TYPE" == "opensandbox" ]] && verifier_uv_bin_ready; then
     local verifier_uv_path_prefix
     verifier_uv_path_prefix="/root/.local/bin:/home/oai/.local/bin:/home/agent/.local/bin:/home/ubuntu/.local/bin"
     if [[ -n "${TB_VERIFIER_UV_HOME:-}" ]]; then
@@ -1396,7 +1396,7 @@ PY
     fi
 
     local mounts_json="[]"
-    if [[ "$TB_ENVIRONMENT_TYPE" == "docker" ]]; then
+    if [[ "$TB_ENVIRONMENT_TYPE" == "docker" || "$TB_ENVIRONMENT_TYPE" == "opensandbox" ]]; then
       mounts_json="$(
       python3 - "$TB_CC_PY_WHEEL_DIR_SOURCE" "$TB_CC_PY_WHEEL_DIR_MOUNT_PATH" "$VERIFIER_UV_BIN_DIR_SOURCE" "$TB_VERIFIER_UV_BIN_DIR_MOUNT_PATH" <<'PY'
 import json
@@ -1434,7 +1434,7 @@ PY
     if [[ "$mounts_json" != "[]" ]]; then
       cmd+=( --mounts-json "$mounts_json" )
     fi
-    if [[ "$TB_ENVIRONMENT_TYPE" == "docker" || "$TB_ENVIRONMENT_TYPE" == "e2b" ]] \
+    if [[ "$TB_ENVIRONMENT_TYPE" == "docker" || "$TB_ENVIRONMENT_TYPE" == "e2b" || "$TB_ENVIRONMENT_TYPE" == "opensandbox" ]] \
       && verifier_uv_bin_ready; then
       cmd+=(
         --ve "PATH=/root/.local/bin:/home/oai/.local/bin:/home/agent/.local/bin:/home/ubuntu/.local/bin:$TB_VERIFIER_UV_BIN_DIR_MOUNT_PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

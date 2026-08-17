@@ -8,12 +8,19 @@ import os
 import sys
 import types
 import unittest
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import patch
 
 MODULE_PATH = Path(__file__).parents[1] / "e2b_prebuilt.py"
+
+
+class FakeNetworkMode(str, Enum):
+    NO_NETWORK = "no-network"
+    PUBLIC = "public"
+    ALLOWLIST = "allowlist"
 
 
 class FakeConnectionConfig:
@@ -46,9 +53,14 @@ class FakeE2BEnvironment:
     def __init__(self, *args, **kwargs) -> None:
         self._workdir = Path("/app")
         self._sandbox = None
+        self.network_policy = SimpleNamespace(network_mode=FakeNetworkMode.PUBLIC)
+        self._network_options = None
 
     async def start(self, force_build: bool) -> None:
         await self._create_sandbox()
+
+    def _sandbox_create_network_options(self):
+        return self._network_options
 
 
 def load_module():
@@ -60,12 +72,19 @@ def load_module():
     environments = types.ModuleType("harbor.environments")
     harbor_e2b = types.ModuleType("harbor.environments.e2b")
     harbor_e2b.E2BEnvironment = FakeE2BEnvironment
+    harbor_models = types.ModuleType("harbor.models")
+    harbor_task = types.ModuleType("harbor.models.task")
+    harbor_task_config = types.ModuleType("harbor.models.task.config")
+    harbor_task_config.NetworkMode = FakeNetworkMode
     modules = {
         "e2b": e2b,
         "e2b.connection_config": connection_config,
         "harbor": harbor,
         "harbor.environments": environments,
         "harbor.environments.e2b": harbor_e2b,
+        "harbor.models": harbor_models,
+        "harbor.models.task": harbor_task,
+        "harbor.models.task.config": harbor_task_config,
     }
     spec = importlib.util.spec_from_file_location("fleet_e2b_prebuilt", MODULE_PATH)
     assert spec and spec.loader
@@ -95,12 +114,68 @@ class PrebuiltE2BEnvironmentTest(unittest.TestCase):
 
         self.assertEqual(
             FakeAsyncSandbox.calls,
-            [{"template": "template-test", "timeout": 900}],
+            [
+                {
+                    "template": "template-test",
+                    "timeout": 900,
+                    "allow_internet_access": True,
+                    "network": None,
+                }
+            ],
         )
         command, kwargs = FakeAsyncSandbox.sandbox.commands.calls[0]
         self.assertEqual(command, "mkdir -p -- /app && chmod 0777 -- /app")
         self.assertEqual(kwargs["user"], "root")
         self.assertEqual(kwargs["cwd"], "/")
+
+    def test_disables_internet_for_no_network_policy(self) -> None:
+        module = load_module()
+        with patch.dict(
+            os.environ,
+            {"TB_E2B_PREBUILT_TEMPLATE": "template-test"},
+            clear=True,
+        ):
+            environment = module.PrebuiltE2BEnvironment()
+            environment.network_policy = SimpleNamespace(
+                network_mode=FakeNetworkMode.NO_NETWORK
+            )
+            asyncio.run(environment.start(False))
+
+        self.assertFalse(FakeAsyncSandbox.calls[0]["allow_internet_access"])
+        self.assertIsNone(FakeAsyncSandbox.calls[0]["network"])
+
+    def test_forwards_allowlist_network_options(self) -> None:
+        module = load_module()
+        network_options = {
+            "allow_out": ["api.example.com"],
+            "deny_out": ["0.0.0.0/0"],
+        }
+        with patch.dict(
+            os.environ,
+            {"TB_E2B_PREBUILT_TEMPLATE": "template-test"},
+            clear=True,
+        ):
+            environment = module.PrebuiltE2BEnvironment()
+            environment.network_policy = SimpleNamespace(
+                network_mode=FakeNetworkMode.ALLOWLIST
+            )
+            environment._network_options = network_options
+            asyncio.run(environment.start(False))
+
+        self.assertTrue(FakeAsyncSandbox.calls[0]["allow_internet_access"])
+        self.assertIs(FakeAsyncSandbox.calls[0]["network"], network_options)
+
+    def test_default_timeout_matches_harbor_e2b_lifetime(self) -> None:
+        module = load_module()
+        with patch.dict(
+            os.environ,
+            {"TB_E2B_PREBUILT_TEMPLATE": "template-test"},
+            clear=True,
+        ):
+            environment = module.PrebuiltE2BEnvironment()
+            asyncio.run(environment.start(False))
+
+        self.assertEqual(FakeAsyncSandbox.calls[0]["timeout"], 86_400)
 
     def test_force_build_is_rejected(self) -> None:
         module = load_module()

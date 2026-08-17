@@ -248,10 +248,10 @@ class RolloutRequestContextTest(unittest.TestCase):
         queue_dir = root_path / "queue" / MODULE._storage_id("ray-submission-test", prefix="submission")
         runtime_root = root_path / "runtime"
         storage_id = MODULE._storage_id("ray-submission-test", prefix="submission")
-        expected_session = MODULE._submission_session_name("ray-submission-test", "seta")
-        helper = mock.Mock(return_value=(0, f"{expected_session}\n", ""))
 
         self.stack.enter_context(mock.patch.object(MODULE, "JOB_RUNTIME_ROOT", runtime_root))
+        expected_session = MODULE._submission_session_name("ray-submission-test", "seta")
+        helper = mock.Mock(return_value=(0, f"{expected_session}\n", ""))
         self.stack.enter_context(mock.patch.object(MODULE, "JOB_ZELLIJ_LOCKS", {}))
         self.stack.enter_context(mock.patch.object(MODULE, "JOB_ZELLIJ_READY", {}))
         self.stack.enter_context(mock.patch.object(MODULE, "_zellij_session_exists", mock.Mock(return_value=False)))
@@ -269,24 +269,42 @@ class RolloutRequestContextTest(unittest.TestCase):
         env = helper.call_args.kwargs["env"]
         self.assertEqual(env["RL_ZELLIJ_SUBMISSION_ID"], "ray-submission-test")
         self.assertEqual(env["RL_ZELLIJ_SUBMISSION_STORAGE_ID"], storage_id)
+        self.assertEqual(env["RL_ZELLIJ_SESSION_NAME"], expected_session)
         self.assertEqual(env["RL_ZELLIJ_JOB_QUEUE_DIR"], str(queue_dir))
 
     def test_submission_zellij_session_name_is_compact_and_stable(self) -> None:
         first = MODULE._submission_session_name("ray-submission-test", "seta")
-        repeated = MODULE._submission_session_name("ray-submission-test", "other-dataset")
+        repeated = MODULE._submission_session_name("ray-submission-test", "seta")
+        other_dataset = MODULE._submission_session_name("ray-submission-test", "other-dataset")
         other = MODULE._submission_session_name("other-submission", "seta")
 
         self.assertEqual(first, repeated)
         self.assertTrue(first.startswith("hr-"))
         self.assertLessEqual(len(first), 40)
+        self.assertNotEqual(first, other_dataset)
         self.assertNotEqual(first, other)
 
+    def test_submission_zellij_session_name_preserves_agent_identity(self) -> None:
+        with mock.patch.dict(os.environ, {"RL_AGENT": "claude-code"}):
+            claude_session = MODULE._submission_session_name("ray-submission-test", "seta")
+        with mock.patch.dict(os.environ, {"RL_AGENT": "opencode"}):
+            opencode_session = MODULE._submission_session_name("ray-submission-test", "seta")
+
+        self.assertNotEqual(claude_session, opencode_session)
+
+    def test_submission_zellij_session_name_preserves_runtime_identity(self) -> None:
+        with mock.patch.object(MODULE, "JOB_RUNTIME_ROOT", Path("/tmp/listener-a")):
+            first = MODULE._submission_session_name("ray-submission-test", "seta")
+        with mock.patch.object(MODULE, "JOB_RUNTIME_ROOT", Path("/tmp/listener-b")):
+            second = MODULE._submission_session_name("ray-submission-test", "seta")
+
+        self.assertNotEqual(first, second)
+
     def test_existing_hashed_zellij_session_is_reused_without_helper(self) -> None:
-        storage_id = MODULE._storage_id("ray-submission-test", prefix="submission")
         expected_session = MODULE._submission_session_name("ray-submission-test", "seta")
 
         self.stack.enter_context(mock.patch.object(MODULE, "JOB_ZELLIJ_LOCKS", {}))
-        self.stack.enter_context(mock.patch.object(MODULE, "JOB_ZELLIJ_READY", {storage_id: expected_session}))
+        self.stack.enter_context(mock.patch.object(MODULE, "JOB_ZELLIJ_READY", {expected_session: expected_session}))
         self.stack.enter_context(mock.patch.object(MODULE, "_zellij_session_exists", mock.Mock(return_value=True)))
         helper = self.stack.enter_context(mock.patch.object(MODULE, "_run_helper"))
 
@@ -324,13 +342,34 @@ class RolloutRequestContextTest(unittest.TestCase):
         helper.assert_called_once()
 
     def test_different_submission_cached_session_is_not_reused(self) -> None:
-        other_storage_id = MODULE._storage_id("other-submission", prefix="submission")
         other_session = MODULE._submission_session_name("other-submission", "seta")
         current_session = MODULE._submission_session_name("ray-submission-test", "seta")
         helper = mock.Mock(return_value=(0, f"{current_session}\n", ""))
 
         self.stack.enter_context(mock.patch.object(MODULE, "JOB_ZELLIJ_LOCKS", {}))
-        self.stack.enter_context(mock.patch.object(MODULE, "JOB_ZELLIJ_READY", {other_storage_id: other_session}))
+        self.stack.enter_context(mock.patch.object(MODULE, "JOB_ZELLIJ_READY", {other_session: other_session}))
+        exists = self.stack.enter_context(mock.patch.object(MODULE, "_zellij_session_exists", mock.Mock(return_value=True)))
+        self.stack.enter_context(mock.patch.object(MODULE, "_run_helper", helper))
+
+        session = MODULE._ensure_submission_zellij(
+            "ray-submission-test",
+            "seta",
+            Path("/tmp/queue"),
+            "model-from-request",
+            "ray-submission-test",
+        )
+
+        self.assertEqual(session, current_session)
+        self.assertNotIn(mock.call(other_session), exists.call_args_list)
+        helper.assert_called_once()
+
+    def test_different_listener_cached_session_is_not_reused(self) -> None:
+        other_session = MODULE._submission_session_name("ray-submission-test", "other-dataset")
+        current_session = MODULE._submission_session_name("ray-submission-test", "seta")
+        helper = mock.Mock(return_value=(0, f"{current_session}\n", ""))
+
+        self.stack.enter_context(mock.patch.object(MODULE, "JOB_ZELLIJ_LOCKS", {}))
+        self.stack.enter_context(mock.patch.object(MODULE, "JOB_ZELLIJ_READY", {other_session: other_session}))
         exists = self.stack.enter_context(mock.patch.object(MODULE, "_zellij_session_exists", mock.Mock(return_value=True)))
         self.stack.enter_context(mock.patch.object(MODULE, "_run_helper", helper))
 

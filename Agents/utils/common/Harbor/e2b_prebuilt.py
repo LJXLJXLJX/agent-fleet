@@ -8,8 +8,10 @@ import shlex
 from e2b import AsyncSandbox
 from e2b.connection_config import ConnectionConfig
 from harbor.environments.e2b import E2BEnvironment
+from harbor.models.task.config import NetworkMode
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+_HARBOR_E2B_DEFAULT_SANDBOX_TIMEOUT_SEC = 86_400
 
 
 def _patch_http_sandbox_url_from_env() -> None:
@@ -45,7 +47,7 @@ def _sandbox_timeout_sec() -> int:
     raw_timeout = (
         os.environ.get("TB_E2B_SANDBOX_TIMEOUT_SEC", "").strip()
         or os.environ.get("E2B_SANDBOX_TIMEOUT_SEC", "").strip()
-        or "300"
+        or str(_HARBOR_E2B_DEFAULT_SANDBOX_TIMEOUT_SEC)
     )
     try:
         timeout = int(raw_timeout)
@@ -82,6 +84,10 @@ class PrebuiltE2BEnvironment(E2BEnvironment):
         self._sandbox = await AsyncSandbox.create(
             template=self._template_name,
             timeout=_sandbox_timeout_sec(),
+            allow_internet_access=(
+                self.network_policy.network_mode != NetworkMode.NO_NETWORK
+            ),
+            network=self._sandbox_create_network_options(),
         )
         workdir = shlex.quote(str(self._workdir))
         result = await self._sandbox.commands.run(

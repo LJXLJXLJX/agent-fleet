@@ -115,13 +115,40 @@ class E2BRuntimeTest(unittest.TestCase):
 
         fake_e2b = types.SimpleNamespace(AsyncSandbox=FakeAsyncSandbox)
         with patch.dict(sys.modules, {"e2b": fake_e2b}), patch.dict(
-            os.environ, {"TB_E2B_SANDBOX_TIMEOUT_SEC": "3600"}
+            os.environ,
+            {
+                "TB_ENVIRONMENT_TYPE": "e2b",
+                "TB_E2B_SANDBOX_TIMEOUT_SEC": "3600",
+            },
         ):
             self.assertTrue(MODULE.patch_e2b_sandbox_timeout_from_env())
             result = asyncio.run(FakeAsyncSandbox.create(timeout=86_400))
 
         self.assertEqual(result, "sandbox")
         self.assertEqual(calls, [3600])
+
+    def test_does_not_patch_sandbox_timeout_for_non_e2b_backend(self) -> None:
+        calls: list[int | None] = []
+
+        class FakeAsyncSandbox:
+            @classmethod
+            async def create(cls, *args, **kwargs):
+                calls.append(kwargs.get("timeout"))
+                return "sandbox"
+
+        fake_e2b = types.SimpleNamespace(AsyncSandbox=FakeAsyncSandbox)
+        with patch.dict(sys.modules, {"e2b": fake_e2b}), patch.dict(
+            os.environ,
+            {
+                "TB_ENVIRONMENT_TYPE": "opensandbox",
+                "TB_E2B_SANDBOX_TIMEOUT_SEC": "3600",
+            },
+        ):
+            self.assertFalse(MODULE.patch_e2b_sandbox_timeout_from_env())
+            result = asyncio.run(FakeAsyncSandbox.create(timeout=86_400))
+
+        self.assertEqual(result, "sandbox")
+        self.assertEqual(calls, [86_400])
 
     def test_cold_alias_has_one_builder_and_four_sandboxes(self) -> None:
         template_cls = base_template_class()
