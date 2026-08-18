@@ -67,6 +67,7 @@ class RunnerValidationTest(unittest.TestCase):
             "[ \"$3\" = dockerfile-parse ] && echo 2.0.1 && exit 0\n"
             "[ \"$3\" = opik ] && echo 2.1.32 && exit 0\n"
             "[ \"$3\" = pip ] && echo 25.2 && exit 0\n"
+            "[ \"$3\" = PyYAML ] && echo 6.0.3 && exit 0\n"
             "[ \"$3\" = s3cmd ] && echo 2.4.0 && exit 0\n"
             "[ \"$3\" = yicloud-sdk-python ] && echo 0.3.1 && exit 0\n"
             "exit 1\n",
@@ -81,6 +82,7 @@ class RunnerValidationTest(unittest.TestCase):
                 ("dockerfile-parse", "2.0.1"),
                 ("opik", "2.1.32"),
                 ("pip", "25.2"),
+                ("PyYAML", "6.0.3"),
                 ("s3cmd", "2.4.0"),
                 ("yicloud-sdk-python", "0.3.1"),
             ],

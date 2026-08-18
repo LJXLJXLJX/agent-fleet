@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Build and publish content-addressed task images for YiCloud OpenSandbox.
+"""Prepare content-addressed service images and an OpenSandbox task bundle.
 
 Flow:
 
     Harbor selects one local task
                   |
                   v
-    Hash environment files, source policy,
+    Normalize Dockerfile or Compose into named services
+                  |
+                  v
+    Hash each service build/image input, source policy,
     target platform, and explicit build args
                   |
                   v
-    tag = <prefix>-<task>-<content-hash>
-                  |
-                  v
-    Acquire lock for <registry>/<repository>:<tag>
+    Resolve each service to a Registry image
                   |
                   v
          +--------------------------+
@@ -29,18 +29,19 @@ Flow:
                          Build OCI archive
                               |
                               v
-                     Upload blobs + schema2
-                            manifest
+                     skopeo copy + inspect
                               |
               +---------------+
               v
-    Return <sandbox-image-prefix>:<tag>
+    Write a versioned immutable Bundle Manifest
                   |
                   v
-    CreateSandboxReq.Image.Ref selects this image
+    Return the main image ref for legacy callers
 
-The Registry repository is shared. The deterministic tag is the lookup key;
-Registry manifest and layer digests remain the underlying content addresses.
+Each benchmark is a Harbor Project and each task has its own repository.
+Deterministic service tags are cache lookup keys; Registry manifest digests are
+the immutable runtime addresses.
+Single-Dockerfile tasks are represented as one implicit ``main`` service.
 """
 
 from __future__ import annotations
@@ -61,9 +62,26 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
-import requests
+if __package__:
+    from .compose_bundle import (
+        BUNDLE_FORMAT_VERSION,
+        BUNDLE_SCHEMA_VERSION,
+        BuildSpec,
+        BundleSpec,
+        ServiceSpec,
+        resolve_bundle_spec,
+    )
+else:
+    from compose_bundle import (
+        BUNDLE_FORMAT_VERSION,
+        BUNDLE_SCHEMA_VERSION,
+        BuildSpec,
+        BundleSpec,
+        ServiceSpec,
+        resolve_bundle_spec,
+    )
 
 try:
     import tomllib
@@ -76,7 +94,6 @@ DOCKER_CONFIG = "application/vnd.docker.container.image.v1+json"
 DOCKER_LAYER_GZIP = "application/vnd.docker.image.rootfs.diff.tar.gzip"
 OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
 OCI_LAYER_GZIP = "application/vnd.oci.image.layer.v1.tar+gzip"
-MANAGER_FORMAT_VERSION = "opensandbox-image-v1"
 CONTENT_HASH_IGNORE_NAMES = {"__pycache__", ".DS_Store", ".git"}
 BUILD_ARG_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FROM_LINE = re.compile(
@@ -85,6 +102,25 @@ FROM_LINE = re.compile(
     re.IGNORECASE,
 )
 AS_ALIAS = re.compile(r"\s+AS\s+(?P<alias>[A-Za-z0-9_.-]+)\s*$", re.IGNORECASE)
+DOCKERFILE_INSTRUCTION = re.compile(r"^\s*(?P<name>[A-Za-z]+)\b")
+HEREDOC_MARKER = re.compile(
+    r"<<(?P<strip>-)?\s*(?P<quote>['\"]?)"
+    r"(?P<delimiter>[A-Za-z0-9_.-]+)(?P=quote)"
+)
+
+# This is deliberately a small, version-controlled adapter contract rather
+# than an inference based on service names or installed software.  It covers
+# the real Compose task whose SSH sidecar has OCI evidence for port 22 but no
+# image/Compose healthcheck from which readiness can otherwise be derived.
+OPENSANDBOX_ADAPTER_METADATA: dict[str, dict[str, dict[str, dict[str, object]]]] = {
+    "seta": {
+        "973": {
+            "worker": {
+                "readiness": {"type": "tcp", "port": 22},
+            }
+        }
+    }
+}
 
 
 def log(message: str) -> None:
@@ -175,20 +211,19 @@ def load_build_timeout(task_dir: Path) -> float:
     return timeout
 
 
-def validate_single_container_task(task_dir: Path) -> Path:
-    environment_dir = task_dir / "environment"
-    dockerfile = environment_dir / "Dockerfile"
-    compose_paths = (
-        environment_dir / "docker-compose.yaml",
-        environment_dir / "docker-compose.yml",
-    )
-    if any(path.exists() for path in compose_paths):
-        raise ValueError(
-            f"OpenSandbox image preparation does not support compose task {task_dir.name}"
+def apt_404_requires_cache_refresh(log_path: Path) -> bool:
+    try:
+        build_log = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return "404  Not Found" in build_log and any(
+        marker in build_log
+        for marker in (
+            "Failed to fetch",
+            "Unable to fetch",
+            "does not have a Release file",
         )
-    if not dockerfile.is_file():
-        raise ValueError(f"Dockerfile not found under {environment_dir}")
-    return environment_dir
+    )
 
 
 @dataclass(frozen=True)
@@ -233,9 +268,9 @@ def apt_mirror_command(source_image: str, apt_mirror: str) -> str | None:
         )
     elif any(name in image for name in ("bookworm", "debian", "python:", "golang:")):
         replacements = (
-            f"s#https?://deb\\.debian\\.org/debian/?#{mirror}/debian/#g;"
-            f"s#https?://security\\.debian\\.org/debian-security/?#"
-            f"{mirror}/debian-security/#g"
+            f"s#https?://(deb|security)\\.debian\\.org/debian-security/?#"
+            f"{mirror}/debian-security/#g;"
+            f"s#https?://deb\\.debian\\.org/debian/?#{mirror}/debian/#g"
         )
     else:
         return None
@@ -249,29 +284,66 @@ def apt_mirror_command(source_image: str, apt_mirror: str) -> str | None:
     )
 
 
+def rewrite_docker_ce_sources(source: str, apt_mirror: str) -> str:
+    """Route Docker's apt repository through the configured mirror root."""
+    if not apt_mirror:
+        return source
+    docker_ce_mirror = f"{apt_mirror.rstrip('/')}/docker-ce"
+    return re.sub(
+        r"https?://download\.docker\.com(?=/)",
+        lambda _match: docker_ce_mirror,
+        source,
+        flags=re.IGNORECASE,
+    )
+
+
 def render_build_dockerfile(source: str, policy: SourcePolicy) -> str:
     output: list[str] = []
     aliases: set[str] = set()
-    for line in source.splitlines():
-        match = FROM_LINE.match(line)
-        if not match:
-            output.append(line)
+    active_instruction: str | None = None
+    heredocs: list[tuple[str, bool]] = []
+    for source_line in source.splitlines():
+        if heredocs:
+            output.append(source_line)
+            delimiter, strip_tabs = heredocs[0]
+            candidate = source_line.lstrip("\t") if strip_tabs else source_line
+            if candidate == delimiter:
+                heredocs.pop(0)
+                if not heredocs:
+                    active_instruction = None
             continue
 
-        source_image = match.group("image")
-        mirrored_image = mirror_image_ref(
-            source_image, policy.dockerhub_mirror_prefix, aliases
-        )
-        output.append(
-            f"{match.group('prefix')}{mirrored_image}{match.group('suffix')}"
-        )
-        alias_match = AS_ALIAS.search(match.group("suffix"))
-        if alias_match:
-            aliases.add(alias_match.group("alias"))
-        if source_image not in aliases:
-            command = apt_mirror_command(source_image, policy.apt_mirror)
-            if command:
-                output.append(command)
+        instruction = DOCKERFILE_INSTRUCTION.match(source_line)
+        if instruction:
+            active_instruction = instruction.group("name").upper()
+
+        line = rewrite_docker_ce_sources(source_line, policy.apt_mirror)
+        match = FROM_LINE.match(line)
+        if match:
+            source_image = match.group("image")
+            mirrored_image = mirror_image_ref(
+                source_image, policy.dockerhub_mirror_prefix, aliases
+            )
+            output.append(
+                f"{match.group('prefix')}{mirrored_image}{match.group('suffix')}"
+            )
+            alias_match = AS_ALIAS.search(match.group("suffix"))
+            if alias_match:
+                aliases.add(alias_match.group("alias"))
+            if source_image not in aliases:
+                command = apt_mirror_command(source_image, policy.apt_mirror)
+                if command:
+                    output.append(command)
+        else:
+            output.append(line)
+
+        if active_instruction in {"RUN", "COPY", "ADD"}:
+            heredocs.extend(
+                (item.group("delimiter"), bool(item.group("strip")))
+                for item in HEREDOC_MARKER.finditer(source_line)
+            )
+        if not heredocs and not source_line.rstrip().endswith("\\"):
+            active_instruction = None
     return "\n".join(output) + "\n"
 
 
@@ -291,20 +363,53 @@ def parse_build_args(raw: str) -> dict[str, str]:
     return result
 
 
-def proxy_build_args(enabled: bool) -> dict[str, str]:
+def proxy_build_args(
+    enabled: bool, build_network: str = "default"
+) -> dict[str, str]:
     if not enabled:
         return {}
+    configured_proxy = os.environ.get(
+        "HARBOR_OPENSANDBOX_BUILD_PROXY_URL", ""
+    ).strip()
     proxy_names = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
-    result = {name: os.environ[name] for name in proxy_names if os.environ.get(name)}
-    if not result:
-        raise ValueError("--use-proxy requires an HTTP_PROXY/HTTPS_PROXY environment variable")
-    for name, value in result.items():
-        if urlparse(value).hostname in {"127.0.0.1", "localhost", "::1"}:
+    if configured_proxy:
+        parsed_proxy = urlparse(configured_proxy)
+        if parsed_proxy.scheme not in {"http", "https"} or not parsed_proxy.hostname:
             raise ValueError(
-                f"--use-proxy cannot pass loopback proxy {name} into BuildKit; "
-                "use a proxy address reachable from build containers or disable "
-                "proxy forwarding"
+                "HARBOR_OPENSANDBOX_BUILD_PROXY_URL must be an http(s) proxy URL"
             )
+        result = {
+            "HTTP_PROXY": configured_proxy,
+            "HTTPS_PROXY": configured_proxy,
+            "http_proxy": configured_proxy,
+            "https_proxy": configured_proxy,
+        }
+    else:
+        result = {
+            name: os.environ[name] for name in proxy_names if os.environ.get(name)
+        }
+    if not result:
+        raise ValueError(
+            "--use-proxy requires HARBOR_OPENSANDBOX_BUILD_PROXY_URL or an "
+            "HTTP_PROXY/HTTPS_PROXY environment variable"
+        )
+    for name, value in result.items():
+        if (
+            urlparse(value).hostname in {"127.0.0.1", "localhost", "::1"}
+            and build_network != "host"
+        ):
+            raise ValueError(
+                f"--use-proxy cannot pass loopback proxy {name} into BuildKit "
+                "without --build-network=host"
+            )
+    if "HTTP_PROXY" in result:
+        result.setdefault("http_proxy", result["HTTP_PROXY"])
+    if "HTTPS_PROXY" in result:
+        result.setdefault("https_proxy", result["HTTPS_PROXY"])
+    if "http_proxy" in result:
+        result.setdefault("HTTP_PROXY", result["http_proxy"])
+    if "https_proxy" in result:
+        result.setdefault("HTTPS_PROXY", result["https_proxy"])
     for name in ("NO_PROXY", "no_proxy"):
         if os.environ.get(name):
             result[name] = os.environ[name]
@@ -320,6 +425,9 @@ def run_build(
     platform: str,
     timeout_sec: float,
     build_args: dict[str, str],
+    target: str | None = None,
+    no_cache: bool = False,
+    build_network: str = "default",
 ) -> None:
     child_env = os.environ.copy()
     child_env.update(build_args)
@@ -334,18 +442,32 @@ def run_build(
             env=child_env,
             start_new_session=True,
         )
-        try:
-            return_code = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
-            os.killpg(process.pid, signal.SIGTERM)
+
+        def terminate_process_group() -> None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                process.wait()
+                return
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 process.wait()
+
+        try:
+            return_code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            terminate_process_group()
             raise RuntimeError(
                 f"timed out {operation} after {timeout:g}s; see {log_path}"
             ) from exc
+        except BaseException:
+            terminate_process_group()
+            raise
         if return_code != 0:
             raise RuntimeError(
                 f"{operation} failed with exit code {return_code}; see {log_path}"
@@ -378,6 +500,12 @@ def run_build(
         ]
         for name in sorted(build_args):
             command.extend(("--build-arg", name))
+        if build_network != "default":
+            command.append(f"--network={build_network}")
+        if no_cache:
+            command.append("--no-cache")
+        if target:
+            command.append(f"--target={target}")
         command.append(str(environment_dir))
         execute(command, log_handle, "building task image", timeout_sec)
 
@@ -399,170 +527,225 @@ def docker_credentials(config_path: Path, registry: str) -> tuple[str, str]:
     return username, password
 
 
-def request_ok(response: requests.Response, expected: set[int], operation: str) -> None:
-    if response.status_code not in expected:
-        body = response.text[:500].replace("\n", " ")
-        raise RuntimeError(
-            f"{operation} failed with HTTP {response.status_code}: {body}"
+def registry_credentials(config_path: Path, registry: str) -> tuple[str, str]:
+    """Prefer the ignored Harbor credential environment, then Docker config."""
+    username = os.environ.get("YICLOUD_HARBOR_USERNAME", "").strip()
+    password = os.environ.get("YICLOUD_HARBOR_PASSWORD", "")
+    if username or password:
+        if not username or not password:
+            raise RuntimeError(
+                "YICLOUD_HARBOR_USERNAME and YICLOUD_HARBOR_PASSWORD must be set together"
+            )
+        return username, password
+    return docker_credentials(config_path, registry)
+
+
+@dataclass(frozen=True)
+class RegistryTarget:
+    """The immutable address scope for one task's Harbor repository."""
+
+    registry: str
+    project: str
+    task_repository: str
+
+    @property
+    def repository(self) -> str:
+        return f"{self.project}/{self.task_repository}"
+
+    def tag(self, service: str, input_hash: str) -> str:
+        return f"{safe_tag_component(service)}-{input_hash.removeprefix('sha256:')[:20]}"
+
+    def tag_ref(self, service: str, input_hash: str) -> str:
+        return f"{self.registry}/{self.repository}:{self.tag(service, input_hash)}"
+
+    def digest_ref(self, artifact_digest: str) -> str:
+        return f"{self.registry}/{self.repository}@{artifact_digest}"
+
+
+def normalize_task_repository(task_identity: str, *, maximum_length: int = 63) -> str:
+    """Make an OCI/Harbor-safe, collision-resistant task repository name."""
+    raw = task_identity.strip()
+    if not raw:
+        raise ValueError("task identity must not be empty")
+    normalized = re.sub(r"[^a-z0-9._-]+", "-", raw.lower()).strip("._-")
+    normalized = re.sub(r"[-._]{2,}", "-", normalized) or "task"
+    changed = normalized != raw
+    if changed or len(normalized) > maximum_length:
+        suffix = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+        normalized = f"{normalized[: maximum_length - len(suffix) - 1].rstrip('._-')}-{suffix}"
+    return normalized[:maximum_length].rstrip("._-")
+
+
+class SkopeoPublisher:
+    """Thin, task-scoped `skopeo` Registry publisher.
+
+    It intentionally delegates blob probing, mounting and upload mechanics to
+    skopeo; this class only performs login, copy and independent inspection.
+    """
+
+    def __init__(self, target: RegistryTarget, username: str, password: str, *, tls_verify: bool) -> None:
+        self.target = target
+        self.username = username
+        self.password = password
+        self.tls_verify = tls_verify
+        self._logged_in = False
+        # `skopeo login` otherwise writes to the process-wide XDG runtime
+        # auth.json. Batch prebuild has several independent publisher
+        # processes, which can truncate that shared file while logging in.
+        self._auth_dir = tempfile.TemporaryDirectory(
+            prefix="opensandbox-skopeo-auth-"
         )
+        self._authfile = str(Path(self._auth_dir.name) / "auth.json")
+
+    def close(self) -> None:
+        self._auth_dir.cleanup()
+
+    def __del__(self) -> None:
+        # Best effort for callers that abort before `prepare_bundle` returns.
+        self.close()
+
+    def _environment(self) -> dict[str, str]:
+        environment = os.environ.copy()
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            environment.pop(name, None)
+        return environment
+
+    def _run(self, command: list[str], *, input_text: str | None = None) -> str:
+        completed = subprocess.run(
+            command,
+            input=input_text,
+            text=True,
+            stdin=subprocess.DEVNULL if input_text is None else None,
+            capture_output=True,
+            env=self._environment(),
+            check=False,
+            timeout=1800,
+        )
+        if completed.returncode:
+            error = completed.stderr.strip()[-1000:]
+            raise RuntimeError(
+                f"skopeo command failed (exit={completed.returncode}): "
+                f"{' '.join(command)}; {error or '<no stderr>'}"
+            )
+        return completed.stdout
+
+    def login(self) -> None:
+        if self._logged_in:
+            return
+        command = [
+            "skopeo",
+            "login",
+            "--authfile",
+            self._authfile,
+            self.target.registry,
+            "--username",
+            self.username,
+            "--password-stdin",
+        ]
+        command.append("--tls-verify=true" if self.tls_verify else "--tls-verify=false")
+        self._run(command, input_text=self.password)
+        self._logged_in = True
+
+    def _image_url(self, ref: str) -> str:
+        return f"docker://{ref}"
+
+    def inspect(self, ref: str) -> dict[str, str] | None:
+        self.login()
+        # Skopeo 1.4 (the current YiCloud runner package) exposes Digest but
+        # not MediaType in inspect templates. Digest is the required cache and
+        # runtime identity; the v2s2 copy format determines the media type.
+        command = [
+            "skopeo",
+            "inspect",
+            "--authfile",
+            self._authfile,
+            "--format",
+            "{{.Digest}}",
+        ]
+        command.append("--tls-verify=true" if self.tls_verify else "--tls-verify=false")
+        command.append(self._image_url(ref))
+        try:
+            output = self._run(command).strip().split(maxsplit=1)
+        except RuntimeError as exc:
+            # Skopeo emits both a 404 and a clear manifest-not-known error for
+            # cache misses. Keep real registry/auth errors fatal.
+            message = str(exc).lower()
+            if (
+                (("repository " in message or "artifact " in message) and " not found" in message)
+                or any(
+                marker in message
+                for marker in (
+                    "manifest unknown",
+                    "repository not found",
+                    "name unknown",
+                    "status code: 404",
+                )
+                )
+            ):
+                return None
+            raise
+        if not output or not output[0].startswith("sha256:"):
+            raise RuntimeError(f"skopeo inspect returned no manifest digest for {ref}")
+        return {"artifact_digest": output[0], "media_type": DOCKER_MANIFEST}
+
+    def inspect_config(self, ref: str) -> dict[str, object]:
+        """Return the final image config for a published or external image."""
+        self.login()
+        command = ["skopeo", "inspect", "--authfile", self._authfile, "--config"]
+        command.append("--tls-verify=true" if self.tls_verify else "--tls-verify=false")
+        command.append(self._image_url(ref))
+        try:
+            payload = json.loads(self._run(command))
+        except ValueError as exc:
+            raise RuntimeError(f"skopeo inspect --config returned invalid JSON for {ref}") from exc
+        return normalize_oci_image_config(payload)
+
+    def copy(self, source: str, destination: str, *, source_is_archive: bool = False) -> dict[str, str]:
+        self.login()
+        command = [
+            "skopeo",
+            "copy",
+            "--format",
+            "v2s2",
+            "--src-authfile",
+            self._authfile,
+            "--dest-authfile",
+            self._authfile,
+        ]
+        command.append("--dest-tls-verify=true" if self.tls_verify else "--dest-tls-verify=false")
+        if not source_is_archive:
+            command.append("--src-tls-verify=true" if self.tls_verify else "--src-tls-verify=false")
+        source_ref = f"oci-archive:{source}" if source_is_archive else self._image_url(source)
+        # `--digestfile` captures the manifest digest produced by skopeo's
+        # v2s2 conversion. Read it independently from a subsequent inspect so
+        # a successful copy cannot silently record a different target tag.
+        with tempfile.NamedTemporaryFile(prefix="skopeo-digest-", delete=False) as handle:
+            digest_path = Path(handle.name)
+        try:
+            self._run([*command, "--digestfile", str(digest_path), source_ref, self._image_url(destination)])
+            copied_digest = digest_path.read_text(encoding="utf-8").strip()
+        finally:
+            digest_path.unlink(missing_ok=True)
+        inspected = self.inspect(destination)
+        if inspected is None:
+            raise RuntimeError(f"skopeo copy succeeded but target tag cannot be inspected: {destination}")
+        if copied_digest != inspected["artifact_digest"]:
+            raise RuntimeError(
+                "skopeo copy/inspect digest mismatch for "
+                f"{destination}: copy={copied_digest!r} inspect={inspected['artifact_digest']!r}"
+            )
+        return inspected
 
 
 class RegistryClient:
-    def __init__(
-        self,
-        registry: str,
-        repository: str,
-        username: str,
-        password: str,
-    ) -> None:
-        self.registry = registry
-        self.repository = repository
-        self.base_url = f"https://{registry}"
-        self.session = requests.Session()
-        self.headers = {"Authorization": f"Bearer {self._token(username, password)}"}
+    """Task-scoped read client; publishing is intentionally delegated to skopeo."""
 
-    def _token(self, username: str, password: str) -> str:
-        probe = self.session.head(
-            f"{self.base_url}/v2/{self.repository}/manifests/__auth_probe__",
-            timeout=30,
-            allow_redirects=False,
-        )
-        challenge = probe.headers.get("WWW-Authenticate", "")
-        if not challenge.lower().startswith("bearer "):
-            raise RuntimeError(
-                "registry did not return a Bearer challenge "
-                f"(HTTP {probe.status_code})"
-            )
-        params = requests.utils.parse_dict_header(challenge[len("Bearer ") :])
-        realm = params.get("realm")
-        if not realm:
-            raise RuntimeError("registry Bearer challenge has no realm")
-        token_params = {
-            "scope": f"repository:{self.repository}:pull,push",
-            "account": username,
-        }
-        if params.get("service"):
-            token_params["service"] = params["service"]
-        response = self.session.get(
-            realm,
-            params=token_params,
-            auth=(username, password),
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
-        token = data.get("token") or data.get("access_token")
-        if not token:
-            raise RuntimeError("registry token response contained no token")
-        return str(token)
+    def __init__(self, target: RegistryTarget, publisher: SkopeoPublisher) -> None:
+        self.target = target
+        self.publisher = publisher
 
-    def manifest_exists(self, tag: str) -> bool:
-        response = self.session.head(
-            f"{self.base_url}/v2/{self.repository}/manifests/{tag}",
-            headers={**self.headers, "Accept": DOCKER_MANIFEST},
-            timeout=30,
-            allow_redirects=False,
-        )
-        if response.status_code in {200, 307}:
-            return True
-        if response.status_code == 404:
-            return False
-        request_ok(response, {200, 404}, f"checking manifest {tag}")
-        return False
-
-    def _blob_exists(self, digest: str) -> bool:
-        response = self.session.head(
-            f"{self.base_url}/v2/{self.repository}/blobs/{digest}",
-            headers=self.headers,
-            timeout=30,
-            allow_redirects=False,
-        )
-        if response.status_code in {200, 307}:
-            return True
-        if response.status_code == 404:
-            return False
-        request_ok(response, {200, 404}, f"checking blob {digest}")
-        return False
-
-    def ensure_blob(
-        self,
-        archive: tarfile.TarFile,
-        descriptor: dict[str, object],
-        spool_dir: Path,
-    ) -> str:
-        digest = str(descriptor["digest"])
-        if self._blob_exists(digest):
-            return "present"
-        member = archive.extractfile(blob_member_name(digest))
-        if member is None:
-            raise RuntimeError(f"OCI archive is missing blob {digest}")
-        spool_path = spool_dir / digest.replace(":", "-")
-        hasher = hashlib.sha256()
-        size = 0
-        with spool_path.open("wb") as output:
-            while chunk := member.read(1024 * 1024):
-                hasher.update(chunk)
-                size += len(chunk)
-                output.write(chunk)
-        actual = f"sha256:{hasher.hexdigest()}"
-        if actual != digest:
-            raise RuntimeError(f"blob digest mismatch: expected {digest}, got {actual}")
-        expected_size = int(descriptor.get("size") or 0)
-        if expected_size and expected_size != size:
-            raise RuntimeError(
-                f"blob size mismatch for {digest}: expected {expected_size}, got {size}"
-            )
-
-        start = self.session.post(
-            f"{self.base_url}/v2/{self.repository}/blobs/uploads/",
-            headers=self.headers,
-            timeout=30,
-        )
-        request_ok(start, {202}, f"starting upload for {digest}")
-        location = start.headers.get("Location")
-        if not location:
-            raise RuntimeError(f"registry returned no upload location for {digest}")
-        try:
-            with spool_path.open("rb") as data:
-                response = self.session.put(
-                    urljoin(self.base_url, location),
-                    params={"digest": digest},
-                    data=data,
-                    headers={
-                        **self.headers,
-                        "Content-Type": "application/octet-stream",
-                        "Content-Length": str(size),
-                    },
-                    timeout=(30, max(120, min(1800, size // (1024 * 1024) * 10))),
-                )
-            request_ok(response, {201}, f"uploading blob {digest}")
-        finally:
-            spool_path.unlink(missing_ok=True)
-        return "uploaded"
-
-    def publish_archive(self, archive_path: Path, tag: str, spool_dir: Path) -> dict:
-        with tarfile.open(archive_path, "r") as archive:
-            manifest, descriptors = schema2_manifest(archive)
-            statuses = {
-                str(item["digest"]): self.ensure_blob(archive, item, spool_dir)
-                for item in descriptors
-            }
-        manifest_bytes = json.dumps(
-            manifest, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        response = self.session.put(
-            f"{self.base_url}/v2/{self.repository}/manifests/{tag}",
-            data=manifest_bytes,
-            headers={**self.headers, "Content-Type": DOCKER_MANIFEST},
-            timeout=60,
-        )
-        request_ok(response, {201}, f"uploading manifest {tag}")
-        return {
-            "blob_status": statuses,
-            "manifest_digest": response.headers.get("Docker-Content-Digest")
-            or digest_bytes(manifest_bytes),
-            "manifest_media_type": DOCKER_MANIFEST,
-        }
+    def manifest(self, tag: str) -> dict[str, str] | None:
+        return self.publisher.inspect(f"{self.target.registry}/{self.target.repository}:{tag}")
 
 
 def blob_member_name(digest: str) -> str:
@@ -641,143 +824,687 @@ def image_identity(
     platform: str,
     build_args: dict[str, str],
 ) -> str:
-    payload = "\0".join(
-        (
-            MANAGER_FORMAT_VERSION,
-            environment_hash,
-            policy.identity,
-            platform,
-            json.dumps(build_args, sort_keys=True, separators=(",", ":")),
-        )
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+    # Input identity is available before the build.  Never salt it with a
+    # manager/schema version: only inputs which can change the image belong
+    # here.
+    payload = {
+        "build_input": environment_hash,
+        "source_policy": policy.identity,
+        "platform": platform,
+        "build_args": build_args,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
-def build_tag(prefix: str, task_name: str, identity: str, force: bool) -> str:
-    base = f"{safe_tag_component(prefix)}-{safe_tag_component(task_name)}-{identity[:20]}"
+def build_tag(
+    prefix: str,
+    task_name: str,
+    identity: str,
+    force: bool,
+    *,
+    service_name: str | None = None,
+) -> str:
+    # Kept as a small compatibility helper for third-party callers. New code
+    # uses RegistryTarget.tag(), whose service tag deliberately has no
+    # benchmark/task prefix because those belong in the repository path.
+    components = [safe_tag_component(service_name or "main"), identity[:20]]
+    base = "-".join(components)
     if force:
         suffix = datetime.now(timezone.utc).strftime("r%Y%m%d%H%M%S") + f"-{os.getpid()}"
         base = f"{base}-{suffix}"
     return base[:128].rstrip(".-")
 
 
-def prepare(args: argparse.Namespace) -> str:
-    task_dir = resolve_task_dir(args.task_dir, args.dataset_root, args.include)
-    environment_dir = validate_single_container_task(task_dir)
-    policy = SourcePolicy(args.dockerhub_mirror_prefix, args.apt_mirror)
-    explicit_build_args = parse_build_args(args.build_args_json)
-    environment_hash = environment_content_hash(environment_dir)
-    identity = image_identity(
-        environment_hash, policy, args.platform, explicit_build_args
+@dataclass(frozen=True)
+class PreparedBundle:
+    main_image_ref: str
+    manifest: dict[str, object]
+    manifest_path: Path | None
+
+
+def _path_relative_to_environment(path: Path, environment_dir: Path) -> str:
+    try:
+        return path.relative_to(environment_dir).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"build path escapes task environment: {path}") from exc
+
+
+def build_input_hash(build: BuildSpec, environment_dir: Path) -> str:
+    payload = {
+        "context_hash": environment_content_hash(build.context_dir, truncate=64),
+        "context": _path_relative_to_environment(
+            build.context_dir, environment_dir
+        ),
+        "dockerfile": _path_relative_to_environment(
+            build.dockerfile, environment_dir
+        ),
+        "dockerfile_digest": digest_bytes(build.dockerfile.read_bytes()),
+        "target": build.target,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _string_argv(value: object, *, label: str) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise RuntimeError(f"OCI image config {label} must be a string list or null")
+    return list(value)
+
+
+def _oci_port_entries(raw: object) -> list[dict[str, object]]:
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        raise TypeError("OCI image config ExposedPorts must be an object or null")
+    ports: list[dict[str, object]] = []
+    for token in sorted(raw):
+        if not isinstance(token, str):
+            raise TypeError("OCI image config ExposedPorts keys must be strings")
+        raw_port, separator, raw_protocol = token.partition("/")
+        protocol = raw_protocol.lower() if separator else "tcp"
+        if not raw_port.isdigit() or protocol not in {"tcp", "udp"}:
+            raise RuntimeError(f"invalid OCI image config exposed port: {token!r}")
+        port = int(raw_port)
+        if not 1 <= port <= 65535:
+            raise RuntimeError(f"invalid OCI image config exposed port: {token!r}")
+        ports.append({"port": port, "protocol": protocol})
+    return ports
+
+
+def normalize_oci_image_config(raw: object) -> dict[str, object]:
+    """Extract only OCI fields needed by the Bundle runtime contract."""
+    if not isinstance(raw, dict):
+        raise TypeError("OCI image config must be a JSON object")
+    config = raw.get("config", raw)
+    if not isinstance(config, dict):
+        raise TypeError("OCI image config .config must be a JSON object")
+    healthcheck = config.get("Healthcheck")
+    if healthcheck is not None and not isinstance(healthcheck, dict):
+        raise RuntimeError("OCI image config Healthcheck must be an object or null")
+    return {
+        "entrypoint": _string_argv(config.get("Entrypoint"), label="Entrypoint"),
+        "cmd": _string_argv(config.get("Cmd"), label="Cmd"),
+        "exposed_ports": _oci_port_entries(config.get("ExposedPorts")),
+        "healthcheck": dict(healthcheck) if healthcheck is not None else None,
+    }
+
+
+def oci_archive_image_config(archive_path: Path) -> dict[str, object]:
+    """Read the final image config from a local OCI archive before publishing."""
+    with tarfile.open(archive_path, "r") as archive:
+        index = json.loads(read_member_bytes(archive, "index.json"))
+        descriptors = index.get("manifests") or []
+        if len(descriptors) != 1:
+            raise RuntimeError(
+                "expected exactly one platform manifest while reading OCI image config, "
+                f"found {len(descriptors)}"
+            )
+        descriptor = descriptors[0]
+        manifest_bytes = read_member_bytes(
+            archive, blob_member_name(str(descriptor["digest"]))
+        )
+        if digest_bytes(manifest_bytes) != descriptor["digest"]:
+            raise RuntimeError("OCI image manifest digest mismatch")
+        manifest = json.loads(manifest_bytes)
+        config = manifest.get("config")
+        if not isinstance(config, dict) or not isinstance(config.get("digest"), str):
+            raise TypeError("OCI image manifest has no config descriptor")
+        config_bytes = read_member_bytes(
+            archive, blob_member_name(config["digest"])
+        )
+        if digest_bytes(config_bytes) != config["digest"]:
+            raise RuntimeError("OCI image config digest mismatch")
+    return normalize_oci_image_config(json.loads(config_bytes))
+
+
+def _compose_argv(value: object, *, label: str) -> list[str]:
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return list(value)
+    if isinstance(value, str):
+        # The platform only accepts argv.  This matches the existing v1
+        # adapter behavior for Compose scalar commands without adding a
+        # supervisor or an unrelated keepalive process.
+        return ["sh", "-c", value]
+    raise RuntimeError(f"Compose {label} must be a string or string list")
+
+
+def _compose_runtime(
+    service: ServiceSpec,
+    image_config: dict[str, object],
+    *,
+    benchmark: str,
+    task_identity: str,
+    image_config_resolved: bool = True,
+) -> dict[str, object]:
+    """Materialize OCI defaults and Compose overrides for one provider run."""
+    image_entrypoint = image_config.get("entrypoint")
+    image_command = image_config.get("cmd")
+    if image_entrypoint is not None and not isinstance(image_entrypoint, list):
+        raise RuntimeError("normalized OCI image entrypoint is invalid")
+    if image_command is not None and not isinstance(image_command, list):
+        raise RuntimeError("normalized OCI image command is invalid")
+
+    entrypoint_overridden = service.entrypoint_present and service.entrypoint is not None
+    if entrypoint_overridden:
+        effective_entrypoint = _compose_argv(service.entrypoint, label="entrypoint")
+        entrypoint_source = "compose.entrypoint"
+    else:
+        effective_entrypoint = list(image_entrypoint or [])
+        entrypoint_source = "image-config.entrypoint" if image_entrypoint else None
+
+    command_overridden = service.command_present and service.command is not None
+    if command_overridden:
+        effective_command = _compose_argv(service.command, label="command")
+        command_source = "compose.command"
+    elif entrypoint_overridden:
+        # Compose entrypoint override suppresses the image Cmd unless Compose
+        # also explicitly supplies command.
+        effective_command = []
+        command_source = None
+    else:
+        effective_command = list(image_command or [])
+        command_source = "image-config.cmd" if image_command else None
+
+    start_argv = [*effective_entrypoint, *effective_command]
+    sources = [source for source in (entrypoint_source, command_source) if source]
+    start_source = "+".join(sources) if sources else None
+
+    ports: list[dict[str, object]] = []
+    seen_ports: set[tuple[int, str]] = set()
+
+    def add_port(port: int, protocol: str, source: str) -> None:
+        key = (port, protocol)
+        if key not in seen_ports:
+            seen_ports.add(key)
+            ports.append({"port": port, "protocol": protocol, "source": source})
+
+    for item in service.ports:
+        raw_port = item.get("target") if isinstance(item, dict) else item
+        raw_text = str(raw_port).split("/", 1)[0].rsplit(":", 1)[-1]
+        protocol = (
+            str(item.get("protocol", "tcp")).lower()
+            if isinstance(item, dict)
+            else (str(raw_port).split("/", 1)[1].lower() if "/" in str(raw_port) else "tcp")
+        )
+        if raw_text.isdigit() and protocol in {"tcp", "udp"} and 1 <= int(raw_text) <= 65535:
+            add_port(int(raw_text), protocol, "compose.ports.target")
+    for item in service.expose:
+        raw_text, separator, raw_protocol = str(item).partition("/")
+        protocol = raw_protocol.lower() if separator else "tcp"
+        if raw_text.isdigit() and protocol in {"tcp", "udp"} and 1 <= int(raw_text) <= 65535:
+            add_port(int(raw_text), protocol, "compose.expose")
+        else:
+            raise RuntimeError(f"invalid Compose expose port for service {service.name!r}: {item!r}")
+    for item in image_config.get("exposed_ports") or []:
+        if not isinstance(item, dict):
+            raise TypeError("normalized OCI image exposed ports are invalid")
+        add_port(int(item["port"]), str(item["protocol"]), "image-config.exposed-ports")
+
+    healthcheck = service.healthcheck or image_config.get("healthcheck")
+    healthcheck_source = (
+        "compose.healthcheck" if service.healthcheck else "image-config.healthcheck"
+    ) if healthcheck else None
+    readiness: dict[str, object] | None = None
+    if healthcheck:
+        readiness = {"type": "healthcheck", "healthcheck": healthcheck, "source": healthcheck_source}
+    else:
+        metadata = OPENSANDBOX_ADAPTER_METADATA.get(benchmark, {}).get(task_identity, {}).get(service.name, {})
+        candidate = metadata.get("readiness")
+        if isinstance(candidate, dict):
+            port = candidate.get("port")
+            if candidate.get("type") == "tcp" and isinstance(port, int) and any(
+                entry["port"] == port and entry["protocol"] == "tcp" for entry in ports
+            ):
+                readiness = {
+                    "type": "tcp",
+                    "port": port,
+                    "source": f"adapter-metadata:{benchmark}/{task_identity}/{service.name}",
+                }
+            elif image_config_resolved:
+                raise RuntimeError(
+                    f"OpenSandbox adapter readiness metadata has no matching TCP internal port for {service.name!r}"
+                )
+
+    return {
+        "start_argv": start_argv,
+        "start_argv_source": start_source,
+        "internal_ports": ports,
+        "readiness": readiness,
+    }
+
+
+def inspect_external_image(
+    image_ref: str, policy: SourcePolicy, platform: str, *, dry_run: bool
+) -> tuple[str, str]:
+    resolved_ref = mirror_image_ref(
+        image_ref, policy.dockerhub_mirror_prefix, aliases=set()
     )
-    tag = build_tag(args.tag_prefix, task_dir.name, identity, args.force)
-    image_ref = f"{args.sandbox_image_prefix}:{tag}"
-    registry_ref = f"{args.registry}/{args.repository}:{tag}"
+    if dry_run:
+        payload = f"dry-run\0{resolved_ref}\0{platform}".encode()
+        return resolved_ref, digest_bytes(payload)
+    completed = subprocess.run(
+        ["docker", "buildx", "imagetools", "inspect", "--raw", resolved_ref],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+        timeout=180,
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        error = completed.stderr.decode("utf-8", errors="replace")[-500:].strip()
+        raise RuntimeError(
+            f"failed to inspect external image {resolved_ref!r}: "
+            f"exit={completed.returncode} error={error or '<none>'}"
+        )
+    return resolved_ref, digest_bytes(completed.stdout)
 
+
+def _source_policy_record(policy: SourcePolicy) -> dict[str, str]:
+    return {
+        "apt_mirror": policy.apt_mirror,
+        "dockerhub_mirror_prefix": policy.dockerhub_mirror_prefix,
+    }
+
+
+def _read_record(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _service_image_inputs(
+    service: ServiceSpec,
+    *,
+    bundle: BundleSpec,
+    policy: SourcePolicy,
+    platform: str,
+    explicit_build_args: dict[str, str],
+    dry_run: bool,
+) -> tuple[str, dict[str, str], str | None, str | None]:
+    if service.build is not None:
+        build_args = {**service.build.args, **explicit_build_args}
+        source_identity = build_input_hash(service.build, bundle.environment_dir)
+        identity = image_identity(source_identity, policy, platform, build_args)
+        return identity, build_args, None, None
+    if not service.source_image:
+        raise ValueError(f"service {service.name!r} has no build or source image")
+    resolved_ref, source_digest = inspect_external_image(
+        service.source_image, policy, platform, dry_run=dry_run
+    )
+    identity = image_identity(source_digest, policy, platform, {})
+    return identity, {}, resolved_ref, source_digest
+
+
+def _prepare_service_image(
+    *,
+    service: ServiceSpec,
+    bundle: BundleSpec,
+    args: argparse.Namespace,
+    policy: SourcePolicy,
+    explicit_build_args: dict[str, str],
+    proxy_args: dict[str, str],
+    cache_root: Path,
+    target: RegistryTarget,
+    publisher: SkopeoPublisher | None,
+    registry: RegistryClient | None,
+    artifact_cache: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    identity, service_build_args, resolved_external_ref, source_digest = (
+        _service_image_inputs(
+            service,
+            bundle=bundle,
+            policy=policy,
+            platform=args.platform,
+            explicit_build_args=explicit_build_args,
+            dry_run=args.dry_run,
+        )
+    )
+    input_hash = f"sha256:{identity}"
+    tag = target.tag(service.name, input_hash)
+    tag_ref = target.tag_ref(service.name, input_hash)
+    image_source = "build" if service.build is not None else "external-mirror"
+    artifact: dict[str, object] = {
+        "source": image_source,
+        "input_hash": input_hash,
+        "tag": tag,
+        "tag_ref": tag_ref,
+        "artifact_digest": None,
+        "digest_ref": None,
+        "media_type": DOCKER_MANIFEST,
+        "platform": args.platform,
+        "build_arg_names": sorted(service_build_args),
+        "config": {
+            "entrypoint": None,
+            "cmd": None,
+            "exposed_ports": [],
+            "healthcheck": None,
+        },
+        "config_resolved": False,
+    }
+    if source_digest is not None:
+        artifact["source_manifest_digest"] = source_digest
     if args.dry_run:
-        return image_ref
+        artifact["artifact_digest"] = digest_bytes(
+            f"dry-run\0{identity}".encode()
+        )
+        artifact["digest_ref"] = target.digest_ref(str(artifact["artifact_digest"]))
+        return artifact
 
-    cache_root = args.cache_root.resolve()
-    target_key = hashlib.sha256(
-        f"{args.registry}/{args.repository}".encode()
-    ).hexdigest()[:16]
-    lock_path = cache_root / "locks" / f"{target_key}-{tag}.lock"
-    record_path = cache_root / "records" / target_key / f"{tag}.json"
-    log_path = cache_root / "logs" / f"{tag}.log"
+    if publisher is None:
+        raise RuntimeError("Skopeo publisher is unavailable outside dry-run mode")
+    target_key = hashlib.sha256(target.repository.encode("utf-8")).hexdigest()[:16]
+    lock_path = cache_root / "locks" / "images" / f"{target_key}-{tag}.lock"
+    record_path = cache_root / "records" / "images" / target_key / f"{tag}.json"
+    log_path = cache_root / "logs" / bundle.task_identity / f"{tag}.log"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-    username, password = docker_credentials(args.docker_config, args.registry)
     with lock_path.open("a+") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        registry = RegistryClient(
-            args.registry, args.repository, username, password
-        )
-        if not args.force and registry.manifest_exists(tag):
-            log(f"registry cache hit: {image_ref}")
-            existing_record: dict = {}
-            if record_path.is_file():
-                try:
-                    existing_record = json.loads(record_path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    existing_record = {}
+        inspected = None if args.force else registry.manifest(tag) if registry else None
+        if inspected is not None:
+            log(f"registry cache hit service={service.name}: {tag_ref}")
+            existing_record = _read_record(record_path)
+            artifact["artifact_digest"] = inspected["artifact_digest"]
+            artifact["digest_ref"] = target.digest_ref(inspected["artifact_digest"])
+            artifact["media_type"] = inspected["media_type"]
+            artifact["config"] = publisher.inspect_config(tag_ref)
+            artifact["config_resolved"] = True
             atomic_write_json(
                 record_path,
                 {
                     **existing_record,
-                    "environment_hash": environment_hash,
-                    "image_identity": identity,
-                    "image_ref": image_ref,
-                    "manager_format": MANAGER_FORMAT_VERSION,
+                    "input_hash": input_hash,
                     "platform": args.platform,
-                    "registry_ref": registry_ref,
-                    "source": existing_record.get("source", "registry-cache"),
+                    "tag": tag,
+                    "tag_ref": tag_ref,
+                    "artifact_digest": inspected["artifact_digest"],
+                    "digest_ref": artifact["digest_ref"],
+                    "source": existing_record.get("source", image_source),
                     "last_resolution": "registry-cache",
-                    "source_policy": {
-                        "apt_mirror": policy.apt_mirror,
-                        "dockerhub_mirror_prefix": policy.dockerhub_mirror_prefix,
-                    },
-                    "build_arg_names": sorted(explicit_build_args),
-                    "task_dir": str(task_dir),
+                    "source_policy": _source_policy_record(policy),
+                    "build_arg_names": sorted(service_build_args),
+                    "service": service.name,
+                    "task_dir": str(bundle.task_dir),
                     "last_resolved_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
-            return image_ref
+            return artifact
 
-        cache_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix=f"{tag}-", dir=cache_root
-        ) as temporary_dir:
-            temporary = Path(temporary_dir)
-            rendered_dockerfile = temporary / "Dockerfile"
-            rendered_dockerfile.write_text(
-                render_build_dockerfile(
-                    (environment_dir / "Dockerfile").read_text(encoding="utf-8"),
-                    policy,
-                ),
-                encoding="utf-8",
-            )
-            archive_path = temporary / "image.oci.tar"
-            proxy_args = proxy_build_args(args.use_proxy)
-            build_args = {**proxy_args, **explicit_build_args}
-            log(f"building {task_dir.name} for {args.platform}; log={log_path}")
-            run_build(
-                environment_dir=environment_dir,
-                dockerfile=rendered_dockerfile,
-                archive_path=archive_path,
-                log_path=log_path,
-                platform=args.platform,
-                timeout_sec=load_build_timeout(task_dir),
-                build_args=build_args,
-            )
-            log(f"publishing {registry_ref}")
-            published = registry.publish_archive(archive_path, tag, temporary)
-
+        # Equal build inputs can share one Registry artifact within this
+        # Bundle, while every service keeps its own deterministic tag.
+        cached_content = artifact_cache.get(identity)
+        local_image_config: dict[str, object] | None = None
+        if cached_content is not None and not args.force:
+            inspected = publisher.copy(str(cached_content["tag_ref"]), tag_ref)
+            artifact["artifact_digest"] = inspected["artifact_digest"]
+            artifact["digest_ref"] = target.digest_ref(inspected["artifact_digest"])
+            artifact["media_type"] = inspected["media_type"]
+            cached_config = cached_content.get("config")
+            if not isinstance(cached_config, dict):
+                raise RuntimeError("cached artifact has no normalized OCI image config")
+            local_image_config = dict(cached_config)
+            resolution = "service-tag-alias"
+        else:
+            cache_root.mkdir(parents=True, exist_ok=True)
+            if service.build is None:
+                if not resolved_external_ref:
+                    raise RuntimeError("external service resolved without an image ref")
+                inspected = publisher.copy(resolved_external_ref, tag_ref)
+            else:
+                with tempfile.TemporaryDirectory(prefix=f"{tag}-", dir=cache_root) as temporary_dir:
+                    temporary = Path(temporary_dir)
+                    build_context = service.build.context_dir
+                    dockerfile_source = service.build.dockerfile.read_text(encoding="utf-8")
+                    target_stage = service.build.target
+                    rendered_dockerfile = temporary / "Dockerfile"
+                    rendered_dockerfile.write_text(render_build_dockerfile(dockerfile_source, policy), encoding="utf-8")
+                    archive_path = temporary / "image.oci.tar"
+                    effective_build_args = {**proxy_args, **service_build_args}
+                    build_timeout = getattr(args, "build_timeout_sec", None) or load_build_timeout(bundle.task_dir)
+                    log(f"building task={bundle.task_identity} service={service.name} platform={args.platform}; log={log_path}")
+                    run_build(
+                        environment_dir=build_context,
+                        dockerfile=rendered_dockerfile,
+                        archive_path=archive_path,
+                        log_path=log_path,
+                        platform=args.platform,
+                        timeout_sec=build_timeout,
+                        build_args=effective_build_args,
+                        target=target_stage,
+                        no_cache=getattr(args, "no_cache", False),
+                        build_network=getattr(args, "build_network", "default"),
+                    )
+                    local_image_config = oci_archive_image_config(archive_path)
+                    log(f"publishing service={service.name}: {tag_ref}")
+                    inspected = publisher.copy(str(archive_path), tag_ref, source_is_archive=True)
+            artifact["artifact_digest"] = inspected["artifact_digest"]
+            artifact["digest_ref"] = target.digest_ref(inspected["artifact_digest"])
+            artifact["media_type"] = inspected["media_type"]
+            resolution = "built-and-pushed"
+        artifact["config"] = local_image_config or publisher.inspect_config(tag_ref)
+        artifact["config_resolved"] = True
         atomic_write_json(
             record_path,
             {
                 "build_log": str(log_path),
-                "environment_hash": environment_hash,
-                "image_identity": identity,
-                "image_ref": image_ref,
-                "manager_format": MANAGER_FORMAT_VERSION,
-                "manifest_digest": published["manifest_digest"],
-                "manifest_media_type": published["manifest_media_type"],
+                "input_hash": input_hash,
+                "tag": tag,
+                "tag_ref": tag_ref,
+                "artifact_digest": artifact["artifact_digest"],
+                "digest_ref": artifact["digest_ref"],
+                "media_type": artifact["media_type"],
                 "platform": args.platform,
                 "proxy_configured": bool(proxy_args),
-                "registry_ref": registry_ref,
-                "source": "built-and-pushed",
-                "last_resolution": "built-and-pushed",
-                "source_policy": {
-                    "apt_mirror": policy.apt_mirror,
-                    "dockerhub_mirror_prefix": policy.dockerhub_mirror_prefix,
-                },
-                "build_arg_names": sorted(explicit_build_args),
-                "task_dir": str(task_dir),
+                "source": image_source,
+                "source_manifest_digest": source_digest,
+                "last_resolution": resolution,
+                "source_policy": _source_policy_record(policy),
+                "build_arg_names": sorted(service_build_args),
+                "service": service.name,
+                "task_dir": str(bundle.task_dir),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },
         )
-        log(f"ready: {image_ref}")
-        return image_ref
+    artifact_cache.setdefault(identity, dict(artifact))
+    log(f"ready service={service.name}: {artifact['digest_ref']}")
+    return artifact
+
+
+def _service_manifest(
+    service: ServiceSpec,
+    artifact: dict[str, object],
+    environment_dir: Path,
+    *,
+    benchmark: str,
+    task_identity: str,
+) -> dict[str, object]:
+    build: dict[str, object] | None = None
+    if service.build is not None:
+        build = {
+            "context": _path_relative_to_environment(
+                service.build.context_dir, environment_dir
+            ),
+            "dockerfile": _path_relative_to_environment(
+                service.build.dockerfile, environment_dir
+            ),
+            "target": service.build.target,
+            # Values may be credentials.  The immutable manifest only exposes
+            # names; their values affect image_identity but are never persisted.
+            "build_arg_names": artifact["build_arg_names"],
+        }
+    image_config = artifact.get("config")
+    if not isinstance(image_config, dict):
+        raise TypeError(f"service {service.name!r} has no normalized OCI image config")
+    return {
+        "image": artifact,
+        "build": build,
+        "source_image": service.source_image,
+        "entrypoint": service.entrypoint,
+        "entrypoint_present": service.entrypoint_present,
+        "command": service.command,
+        "command_present": service.command_present,
+        "environment": service.environment,
+        "ports": service.ports,
+        "expose": service.expose,
+        "aliases": service.aliases,
+        "depends_on": service.depends_on,
+        "healthcheck": service.healthcheck,
+        "volumes": service.volumes,
+        "networks": service.networks,
+        "cap_add": service.cap_add,
+        "privileged": service.privileged,
+        "container_name": service.container_name,
+        "resources": service.resources,
+        "unsupported_fields": service.unsupported_fields,
+        "runtime": _compose_runtime(
+            service,
+            image_config,
+            benchmark=benchmark,
+            task_identity=task_identity,
+            image_config_resolved=bool(artifact.get("config_resolved", True)),
+        ),
+    }
+
+
+def _bundle_identity(
+    bundle: BundleSpec, services: dict[str, dict[str, object]]
+) -> str:
+    # Registry location/tag/schema are materialization details. A copied
+    # Bundle with identical artifacts and topology retains its identity.
+    images = {
+        name: services[name]["image"]["artifact_digest"]
+        for name in sorted(services)
+    }
+    payload = {
+        "main_service": bundle.main_service,
+        "images": images,
+        "topology": {
+            name: {
+                key: services[name].get(key)
+                for key in (
+                    "entrypoint", "entrypoint_present", "command", "command_present",
+                    "environment", "ports", "expose", "aliases",
+                    "depends_on", "healthcheck", "volumes", "networks", "cap_add",
+                    "privileged", "resources", "unsupported_fields", "runtime",
+                )
+            }
+            for name in sorted(services)
+        },
+    }
+    return digest_bytes(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
+    task_dir = resolve_task_dir(args.task_dir, args.dataset_root, args.include)
+    bundle = resolve_bundle_spec(task_dir)
+    policy = SourcePolicy(args.dockerhub_mirror_prefix, args.apt_mirror)
+    explicit_build_args = parse_build_args(args.build_args_json)
+    cache_root = args.cache_root.resolve()
+    target = RegistryTarget(
+        registry=args.registry,
+        project=args.project,
+        task_repository=args.task_repository or normalize_task_repository(bundle.task_identity),
+    )
+    publisher: SkopeoPublisher | None = None
+    registry: RegistryClient | None = None
+    proxy_args: dict[str, str] = {}
+    build_network = getattr(args, "build_network", "default")
+    if not args.dry_run:
+        username, password = registry_credentials(args.docker_config, args.registry)
+        publisher = SkopeoPublisher(
+            target,
+            username,
+            password,
+            tls_verify=args.registry_tls_verify,
+        )
+        registry = RegistryClient(target, publisher)
+        proxy_args = proxy_build_args(args.use_proxy, build_network)
+
+    artifacts: dict[str, dict[str, object]] = {}
+    artifact_cache: dict[str, dict[str, object]] = {}
+    for name in sorted(bundle.services):
+        artifacts[name] = _prepare_service_image(
+            service=bundle.services[name],
+            bundle=bundle,
+            args=args,
+            policy=policy,
+            explicit_build_args=explicit_build_args,
+            proxy_args=proxy_args,
+            cache_root=cache_root,
+            target=target,
+            publisher=publisher,
+            registry=registry,
+            artifact_cache=artifact_cache,
+        )
+
+    services = {
+        name: _service_manifest(
+            bundle.services[name],
+            artifacts[name],
+            bundle.environment_dir,
+            benchmark=args.benchmark_name or args.project,
+            task_identity=bundle.task_identity,
+        )
+        for name in sorted(bundle.services)
+    }
+    bundle_identity = _bundle_identity(bundle, services)
+    manifest: dict[str, object] = {
+        "schema_version": BUNDLE_SCHEMA_VERSION,
+        "bundle_format": BUNDLE_FORMAT_VERSION,
+        "benchmark": {"name": args.benchmark_name or args.project},
+        "task_identity": bundle.task_identity,
+        "registry": {
+            "host": target.registry,
+            "project": target.project,
+            "task_repository": target.task_repository,
+            "repository": target.repository,
+        },
+        "definition_kind": bundle.definition_kind,
+        "definition_identity": f"sha256:{bundle.definition_identity}",
+        "bundle_identity": bundle_identity,
+        "normalization_backend": bundle.normalization_backend,
+        "main": bundle.main_service,
+        "services": services,
+        "requirements": bundle.requirements,
+    }
+
+    configured_output = getattr(args, "bundle_manifest_output", None)
+    manifest_path: Path | None = None
+    if configured_output is not None:
+        manifest_path = Path(configured_output).expanduser().resolve()
+        atomic_write_json(manifest_path, manifest)
+    elif not args.dry_run:
+        manifest_path = (
+            cache_root
+            / "bundles"
+            / f"{bundle_identity.removeprefix('sha256:')}.json"
+        )
+        atomic_write_json(manifest_path, manifest)
+
+    main_image_ref = str(services[bundle.main_service]["image"]["digest_ref"])
+    prepared = PreparedBundle(
+        main_image_ref=main_image_ref,
+        manifest=manifest,
+        manifest_path=manifest_path,
+    )
+    if publisher is not None:
+        publisher.close()
+    return prepared
+
+
+def prepare(args: argparse.Namespace) -> str:
+    """Backward-compatible single string result used by existing callers."""
+    return prepare_bundle(args).main_image_ref
 
 
 def default_path(env_name: str, fallback: Path) -> Path:
@@ -787,7 +1514,10 @@ def default_path(env_name: str, fallback: Path) -> Path:
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Prebuild one content-addressed YiCloud OpenSandbox task image"
+        description=(
+            "Prepare content-addressed YiCloud OpenSandbox service images and "
+            "an immutable environment bundle"
+        )
     )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--task-dir", type=Path)
@@ -796,17 +1526,30 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--registry",
         default=os.environ.get(
-            "HARBOR_OPENSANDBOX_REGISTRY", "registry.gate.yicloud.com.cn"
+            "YICLOUD_HARBOR_HOST",
+            os.environ.get("HARBOR_OPENSANDBOX_REGISTRY", "registry.gate.yicloud.com.cn"),
         ),
     )
     parser.add_argument(
-        "--repository",
-        default=os.environ.get("HARBOR_OPENSANDBOX_IMAGE_REPOSITORY", ""),
+        "--project",
+        default=os.environ.get("YICLOUD_HARBOR_PROJECT", ""),
+        help="pre-created Harbor Project for this benchmark",
     )
     parser.add_argument(
-        "--sandbox-image-prefix",
-        default=os.environ.get("HARBOR_OPENSANDBOX_SANDBOX_IMAGE_PREFIX", ""),
+        "--task-repository",
+        default=os.environ.get("YICLOUD_HARBOR_TASK_REPOSITORY", ""),
+        help="optional controlled task repository override",
     )
+    parser.add_argument(
+        "--benchmark-name",
+        default=os.environ.get("HARBOR_OPENSANDBOX_BENCHMARK", ""),
+        help="source benchmark name recorded in the Bundle",
+    )
+    # Compatibility-only migration input. It is deliberately not used as a
+    # target repository: split project/repository forms are rejected unless
+    # the project can be unambiguously derived.
+    parser.add_argument("--repository", default=os.environ.get("HARBOR_OPENSANDBOX_IMAGE_REPOSITORY", ""), help=argparse.SUPPRESS)
+    parser.add_argument("--sandbox-image-prefix", default="", help=argparse.SUPPRESS)
     parser.add_argument(
         "--docker-config",
         type=Path,
@@ -846,23 +1589,101 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--build-args-json",
         default=os.environ.get("HARBOR_OPENSANDBOX_BUILD_ARGS_JSON", "{}"),
     )
+    parser.add_argument(
+        "--registry-tls-verify",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("YICLOUD_HARBOR_TLS_VERIFY", "0") in {"1", "true", "TRUE"},
+        help="verify the configured Registry TLS certificate",
+    )
+    parser.add_argument(
+        "--bundle-manifest-output",
+        type=Path,
+        help="atomically write the prepared Bundle Manifest to this path",
+    )
+    parser.add_argument(
+        "--output",
+        choices=("image-ref", "bundle-manifest", "json"),
+        default="image-ref",
+        help="stdout contract; image-ref preserves the v1 CLI behavior",
+    )
+    parser.add_argument(
+        "--build-timeout-sec",
+        type=float,
+        help="override task.toml build_timeout_sec for this image preparation",
+    )
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--use-proxy", action="store_true")
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="disable BuildKit layer cache for this build without changing image identity",
+    )
+    parser.add_argument(
+        "--retry-no-cache-on-apt-404",
+        action="store_true",
+        help="retry once without cache when a cached apt index fetches a missing package",
+    )
+    parser.add_argument(
+        "--build-network",
+        choices=("default", "host"),
+        default=os.environ.get("HARBOR_OPENSANDBOX_BUILD_NETWORK", "host"),
+        help="network mode for Dockerfile RUN instructions",
+    )
+    parser.add_argument(
+        "--use-proxy",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("HARBOR_OPENSANDBOX_BUILD_USE_PROXY", "1")
+        in {"1", "true", "TRUE"},
+        help="pass the current shell HTTP(S) proxy to Dockerfile builds (default: enabled)",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     args.registry = args.registry.strip().removeprefix("https://").rstrip("/")
-    args.repository = args.repository.strip().strip("/")
-    if not args.repository:
-        parser.error("--repository or HARBOR_OPENSANDBOX_IMAGE_REPOSITORY is required")
-    if not args.sandbox_image_prefix:
-        args.sandbox_image_prefix = args.repository
-    args.sandbox_image_prefix = args.sandbox_image_prefix.strip().rstrip(":")
+    args.project = args.project.strip().strip("/")
+    args.task_repository = args.task_repository.strip().strip("/")
+    args.benchmark_name = args.benchmark_name.strip()
+    legacy_repository = args.repository.strip().strip("/")
+    if legacy_repository and not args.project:
+        parser.error(
+            "legacy --repository does not describe the supported Harbor layout; "
+            "set --project and let the task repository be derived"
+        )
+    if not args.project:
+        parser.error("--project or YICLOUD_HARBOR_PROJECT is required")
+    if "/" in args.project:
+        parser.error("--project must be a single Harbor Project name")
+    if args.task_repository and "/" in args.task_repository:
+        parser.error("--task-repository must be a single repository name")
     return args
 
 
 def main() -> int:
     args = parse_args()
-    print(prepare(args))
+    prepared = prepare_bundle(args)
+    if args.output == "image-ref":
+        print(prepared.main_image_ref)
+    elif args.output == "bundle-manifest":
+        if prepared.manifest_path is None:
+            raise ValueError(
+                "--output bundle-manifest requires --bundle-manifest-output "
+                "in dry-run mode"
+            )
+        print(prepared.manifest_path)
+    else:
+        print(
+            json.dumps(
+                {
+                    "bundle_manifest_path": (
+                        str(prepared.manifest_path)
+                        if prepared.manifest_path is not None
+                        else None
+                    ),
+                    "main_image_ref": prepared.main_image_ref,
+                    "bundle_identity": prepared.manifest["bundle_identity"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
     return 0
 
 

@@ -13,6 +13,8 @@ defaults="$(
     -u OUTPUT_PATH \
     -u OPIK_PROJECT_NAME \
     -u HARBOR_ZELLIJ_SESSION_NAME \
+    -u HARBOR_OPENSANDBOX_BUILD_USE_PROXY \
+    -u HARBOR_OPENSANDBOX_BUILD_NETWORK \
     HOME="$TEST_ROOT/home" \
     AGENT="opencode" \
     DATASET_NAME="terminalbench21" \
@@ -27,13 +29,17 @@ defaults="$(
         "$OUTPUT_ROOT" \
         "$OUTPUT_PATH" \
         "$OPIK_PROJECT_NAME" \
-        "$HARBOR_ZELLIJ_SESSION_NAME"
+        "$HARBOR_ZELLIJ_SESSION_NAME" \
+        "$HARBOR_OPENSANDBOX_BUILD_USE_PROXY" \
+        "$HARBOR_OPENSANDBOX_BUILD_NETWORK"
     ' bash "$HARBOR_DIR/env.sh"
 )"
 default_output_root="$(printf '%s\n' "$defaults" | sed -n '1p')"
 default_output_path="$(printf '%s\n' "$defaults" | sed -n '2p')"
 default_project="$(printf '%s\n' "$defaults" | sed -n '3p')"
 default_session="$(printf '%s\n' "$defaults" | sed -n '4p')"
+default_build_use_proxy="$(printf '%s\n' "$defaults" | sed -n '5p')"
+default_build_network="$(printf '%s\n' "$defaults" | sed -n '6p')"
 
 [[ "$default_output_root" == "$REPO_ROOT/runs" ]]
 [[ "$default_output_path" == "$REPO_ROOT/runs/"* ]]
@@ -43,6 +49,8 @@ default_session="$(printf '%s\n' "$defaults" | sed -n '4p')"
   h-120000-*-opencode-terminal-glm-5* ]]
 [[ "${#default_session}" -le 40 ]]
 [[ "$default_session" != *"/"* ]]
+[[ "$default_build_use_proxy" == "1" ]]
+[[ "$default_build_network" == "host" ]]
 
 overrides="$(
   env \

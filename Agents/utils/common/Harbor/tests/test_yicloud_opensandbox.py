@@ -85,6 +85,100 @@ class FakeSandbox:
 
 
 class YiCloudOpenSandboxTest(unittest.TestCase):
+    def test_v2_bundle_loads_digest_refs_and_rejects_unsupported_capabilities(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "bundle.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "main": "main",
+                        "services": {
+                            "main": {
+                                "image": {
+                                    "digest_ref": "registry/seta/0@sha256:" + "a" * 64
+                                }
+                            },
+                            "worker": {
+                                "image": {
+                                    "digest_ref": "registry/seta/0@sha256:" + "b" * 64
+                                }
+                            },
+                        },
+                        "requirements": {"multi_service": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            instance._bundle_manifest_path = str(manifest)
+            instance._bundle = None
+            instance._services = {}
+            instance._main_service = "main"
+            instance._load_bundle()
+
+        self.assertEqual(instance._main_service, "main")
+        self.assertEqual(set(instance._services), {"main", "worker"})
+
+        instance._bundle["requirements"] = {"fixed_ip": True}
+        with self.assertRaisesRegex(RuntimeError, "capability gate rejected"):
+            instance._capability_gate()
+
+    def test_service_port_parsing_uses_compose_container_ports(self) -> None:
+        self.assertEqual(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment._service_ports(
+                {"ports": ["127.0.0.1:8080:80/tcp", "5432", {"target": 22}]}
+            ),
+            [80, 5432, 22],
+        )
+
+    def test_service_start_command_preserves_compose_argv(self) -> None:
+        command = yicloud_opensandbox.YiCloudOpenSandboxEnvironment._service_start_command
+        self.assertEqual(command({"command": ["sh", "-c", "sleep infinity"]}), ["sh", "-c", "sleep infinity"])
+        self.assertEqual(command({"entrypoint": ["/entry"], "command": ["--serve"]}), ["/entry", "--serve"])
+        self.assertIsNone(command({}))
+
+    def test_runtime_contract_is_preferred_over_legacy_compose_fields(self) -> None:
+        start = yicloud_opensandbox.YiCloudOpenSandboxEnvironment._service_start_command
+        ports = yicloud_opensandbox.YiCloudOpenSandboxEnvironment._service_ports
+        spec = {
+            "command": ["incorrect", "legacy"],
+            "runtime": {
+                "start_argv": ["/usr/sbin/sshd", "-D"],
+                "internal_ports": [
+                    {"port": 22, "protocol": "tcp", "source": "image-config.exposed-ports"}
+                ],
+            },
+        }
+        self.assertEqual(start(spec), ["/usr/sbin/sshd", "-D"])
+        self.assertEqual(ports(spec), [22])
+
+    def test_yicloud_image_ref_strips_only_registry_host(self) -> None:
+        digest = "sha256:" + "a" * 64
+        self.assertEqual(
+            yicloud_opensandbox._yicloud_image_ref(
+                f"harbor.example/seta/973@{digest}"
+            ),
+            f"seta/973@{digest}",
+        )
+        self.assertEqual(
+            yicloud_opensandbox._yicloud_image_ref(f"seta/973@{digest}"),
+            f"seta/973@{digest}",
+        )
+
+    def test_full_oci_ref_is_sent_via_yicloud_uri(self) -> None:
+        fake_sandbox = SimpleNamespace(
+            models=SimpleNamespace(CreateSandboxReqImageInput=Request)
+        )
+        image = yicloud_opensandbox.YiCloudOpenSandboxEnvironment._create_image_input(
+            fake_sandbox,
+            "harbor-sandbox.example/seta/973@sha256:" + "a" * 64,
+        )
+        self.assertTrue(image.Uri.startswith("harbor-sandbox.example/"))
+        self.assertFalse(hasattr(image, "Ref"))
+
     def test_s3_download_url_is_passed_as_environment_not_command_text(self) -> None:
         instance = object.__new__(
             yicloud_opensandbox.YiCloudOpenSandboxEnvironment

@@ -26,8 +26,10 @@ Agents/utils/common/Harbor/
 ├── harbor_worker_utils.py
 ├── model-fusion/
 │   └── router_cli_utils.py     # Shared Router build/config/launcher helpers
-├── OPENSANDBOX_IMAGE_MANAGER.md # OpenSandbox task image build/cache/publish flow
-├── prebuild_opensandbox_dataset.sh # Batch prebuild/publish local dataset images
+├── compose_bundle.py            # Dockerfile/Compose to provider-neutral BundleSpec
+├── opensandbox_image_manager.py # Per-service image build/cache/publish and Bundle output
+├── OPENSANDBOX_IMAGE_MANAGER.md # OpenSandbox Bundle and image management contract
+├── prebuild_opensandbox_dataset.sh # Batch prebuild/publish dataset Bundles
 └── scripts/
     ├── monitor.py              # Monitor CLI entrypoint and path resolution
     ├── controller.py           # Submit benchmark decisions and user-controlled Fixer actions
@@ -173,6 +175,12 @@ Typical dataset paths:
 | `HARBOR_TIMEOUT_MULTIPLIER` | General Harbor timeout multiplier |
 | `HARBOR_AGENT_TIMEOUT_MULTIPLIER` | Agent execution timeout override |
 | `HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER` | Agent setup timeout multiplier |
+| `HARBOR_OPENSANDBOX_IMAGE_REF` | Legacy explicit single-image override; automatic preparation is skipped when set without a Bundle Manifest |
+| `HARBOR_OPENSANDBOX_BUNDLE_MANIFEST` | Optional versioned service Bundle Manifest; automatic preparation writes one under the worker runtime directory |
+| `HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT` | H-local Registry records, image locks, build logs, and immutable Bundle cache root |
+| `YICLOUD_HARBOR_HOST` | New Harbor registry host used by `skopeo` |
+| `YICLOUD_HARBOR_PROJECT` | Externally provisioned Harbor Project for the selected benchmark; task repositories are derived per task |
+| `YICLOUD_HARBOR_TLS_VERIFY` | Whether `skopeo` verifies the configured Harbor TLS certificate; current internal ingress requires `0` |
 | `YICLOUD_SANDBOX_CPU` | OpenSandbox request CPU flavor, default `2` to match the current prewarm pool |
 | `YICLOUD_SANDBOX_MEMORY` | OpenSandbox request memory flavor, default `8Gi` to match the current prewarm pool |
 | `YICLOUD_SANDBOX_LIFECYCLE_MINUTES` | Maximum OpenSandbox lifetime, default `120`; normal trials still delete on completion unless retention is enabled |

@@ -43,6 +43,8 @@ TERMINAL_FAILURE_STATES = {
     "killed",
     "expired",
 }
+HOSTS_BLOCK_BEGIN = "# HARBOR COMPOSE BEGIN"
+HOSTS_BLOCK_END = "# HARBOR COMPOSE END"
 # The YiCloud gateway currently rejects multipart bodies around 1 MiB and
 # above. Base64 expands each chunk by 4/3, so 512 KiB leaves enough room for
 # multipart metadata while avoiding thousands of tiny requests.
@@ -104,6 +106,18 @@ class YiCloudSandboxReadyTimeoutError(RuntimeError):
     """The YiCloud control plane did not schedule a Sandbox before our deadline."""
 
 
+class ServiceRuntime:
+    def __init__(self, name: str, spec: dict[str, Any]) -> None:
+        self.name = name
+        self.spec = spec
+        self.sandbox_id = ""
+        self.sandbox_name = ""
+        self.command_url = ""
+        self.access_token = ""
+        self.internal_address = ""
+        self.state = "CREATING"
+
+
 def _required_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -146,6 +160,22 @@ def _state_of(data: Any) -> str:
 def _status_reason_of(data: Any) -> str:
     status = getattr(data, "Status", None)
     return str(getattr(status, "Reason", "") or "").strip()
+
+
+def _yicloud_image_ref(ref: str) -> str:
+    """Translate a full OCI reference to YiCloud's ``Image.Ref`` format.
+
+    The Bundle retains the complete OCI digest reference used for Registry
+    publication and verification.  YiCloud's CreateSandbox SDK explicitly
+    requires ``Image.Ref`` without a registry host, so this provider boundary
+    keeps the immutable repository-and-digest portion only.
+    """
+    value = str(ref or "").strip()
+    repository, marker, digest = value.partition("@")
+    first, separator, remainder = repository.partition("/")
+    if separator and ("." in first or ":" in first or first == "localhost"):
+        return f"{remainder}{marker}{digest}" if marker else remainder
+    return value
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -255,6 +285,18 @@ def _command_url_of(data: Any) -> str:
     raise RuntimeError("running YiCloud Sandbox returned no execd proxy endpoint")
 
 
+def _internal_address_of(data: Any) -> str:
+    endpoints = getattr(data, "Endpoints", None)
+    for endpoint in (getattr(endpoints, "Endpoints", None) or {}).values():
+        value = str(getattr(endpoint, "InternalUrl", "") or "")
+        if not value:
+            continue
+        parsed = urlsplit(value if "://" in value else f"tcp://{value}")
+        if parsed.hostname:
+            return parsed.hostname
+    raise RuntimeError("running YiCloud Sandbox returned no internal endpoint address")
+
+
 def _parse_sse(text: str) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for line in text.splitlines():
@@ -280,6 +322,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         self,
         *args,
         image_ref: str | None = None,
+        bundle_manifest_path: str | None = None,
         project_name: str | None = None,
         lifecycle_minutes: int | str | None = None,
         ready_timeout_sec: int | None = None,
@@ -376,6 +419,13 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         self._sandbox_name = ""
         self._command_url = ""
         self._access_token = ""
+        self._bundle_manifest_path = (
+            bundle_manifest_path
+            or os.environ.get("HARBOR_OPENSANDBOX_BUNDLE_MANIFEST", "")
+        ).strip()
+        self._bundle: dict[str, Any] | None = None
+        self._services: dict[str, ServiceRuntime] = {}
+        self._main_service = "main"
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -411,12 +461,87 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             )
 
     @property
-    def _image_ref(self) -> str:
+    def _image_source_ref(self) -> str:
+        if self._bundle is not None:
+            main = self._services.get(self._main_service)
+            if main is not None:
+                image = main.spec.get("image") or {}
+                return str(image.get("digest_ref") or image.get("sandbox_ref") or "").strip()
         return self._image_ref_override or str(
             self.task_env_config.docker_image or ""
         ).strip()
 
+    @property
+    def _image_ref(self) -> str:
+        """YiCloud's normalized image-ref value used for binding validation."""
+        return _yicloud_image_ref(self._image_source_ref)
+
+    def _load_bundle(self) -> None:
+        if self._bundle is not None:
+            return
+        if not self._bundle_manifest_path:
+            return
+        path = Path(self._bundle_manifest_path)
+        try:
+            bundle = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"cannot read OpenSandbox Bundle Manifest {path}: {exc}") from exc
+        if not isinstance(bundle, dict):
+            raise TypeError("OpenSandbox Bundle Manifest must be a JSON object")
+        schema = bundle.get("schema_version")
+        main = bundle.get("main") if schema == 2 else bundle.get("main_service")
+        services = bundle.get("services")
+        if schema not in {1, 2} or not isinstance(main, str) or not isinstance(services, dict) or main not in services:
+            raise RuntimeError("OpenSandbox Bundle Manifest has an invalid schema or main service")
+        resolved: dict[str, ServiceRuntime] = {}
+        for name, spec in services.items():
+            if not isinstance(name, str) or not isinstance(spec, dict):
+                raise TypeError("OpenSandbox Bundle Manifest has an invalid service entry")
+            image = spec.get("image") or {}
+            ref = image.get("digest_ref") if schema == 2 else image.get("sandbox_ref")
+            if not isinstance(ref, str) or not ref:
+                raise RuntimeError(f"Bundle service {name!r} has no immutable image reference")
+            resolved[name] = ServiceRuntime(name=name, spec=spec)
+        self._bundle = bundle
+        self._services = resolved
+        self._main_service = main
+
+    def _capability_gate(self) -> None:
+        if self._bundle is None:
+            return
+        requirements = self._bundle.get("requirements") or {}
+        unsupported = []
+        mapping = {
+            "shared_volumes": "shared_volumes",
+            "fixed_ip": "fixed_ip",
+            "multiple_networks": "multiple_networks",
+            "net_admin": "net_admin",
+            "sys_admin": "sys_admin",
+            "privileged": "privileged",
+        }
+        for field, label in mapping.items():
+            if requirements.get(field):
+                unsupported.append(label)
+        unsupported.extend(requirements.get("unsupported_features") or [])
+        if requirements.get("multi_service"):
+            for name, runtime in self._services.items():
+                if name == self._main_service:
+                    continue
+                contract = runtime.spec.get("runtime")
+                ports = contract.get("internal_ports") if isinstance(contract, dict) else None
+                if not isinstance(ports, list) or not ports:
+                    unsupported.append(f"service {name} lacks runtime.internal_ports")
+        if unsupported:
+            raise RuntimeError(
+                "OpenSandbox capability gate rejected Bundle before create: "
+                + ", ".join(sorted(str(item) for item in unsupported))
+            )
+
     def _validate_definition(self) -> None:
+        self._load_bundle()
+        if self._bundle is not None:
+            self._capability_gate()
+            return
         compose_paths = (
             self.environment_dir / "docker-compose.yaml",
             self.environment_dir / "docker-compose.yml",
@@ -577,15 +702,405 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             )
             self._detach_sandbox()
 
+    @staticmethod
+    def _service_ports(spec: dict[str, Any]) -> list[int]:
+        runtime = spec.get("runtime")
+        if isinstance(runtime, dict) and "internal_ports" in runtime:
+            ports: list[int] = []
+            for item in runtime.get("internal_ports") or []:
+                if not isinstance(item, dict):
+                    raise TypeError("Bundle runtime.internal_ports entries must be objects")
+                value = item.get("port")
+                protocol = str(item.get("protocol", "tcp")).lower()
+                if isinstance(value, int) and protocol == "tcp" and 1 <= value <= 65535:
+                    ports.append(value)
+                else:
+                    raise RuntimeError("Bundle runtime.internal_ports has an invalid TCP port")
+            return list(dict.fromkeys(ports))
+
+        # Schema v1 compatibility only. Newly materialized schema v2 Bundles
+        # must carry runtime.internal_ports from Compose expose/ports or OCI
+        # image config and never rediscover them from Dockerfile text here.
+        ports: list[int] = []
+        for item in spec.get("ports") or []:
+            value: Any = item.get("target") if isinstance(item, dict) else item
+            if isinstance(value, int):
+                ports.append(value)
+                continue
+            if isinstance(value, str):
+                # Compose short syntax: host:container/proto and container/proto.
+                candidate = value.split("/", 1)[0].rsplit(":", 1)[-1]
+                if candidate.isdigit():
+                    ports.append(int(candidate))
+        return list(dict.fromkeys(port for port in ports if 1 <= port <= 65535))
+
+    async def _wait_service_running(self, runtime: ServiceRuntime, created: Any) -> Any:
+        sandbox = self._sandbox_service
+        assert sandbox is not None
+        deadline = time.monotonic() + self._ready_timeout_sec
+        current = created
+        while time.monotonic() < deadline:
+            current = await asyncio.to_thread(
+                sandbox.get_sandbox,
+                None,
+                sandbox.models.GetSandboxReq(ProjectName=self._project_name, SandboxId=runtime.sandbox_id),
+            )
+            state = _state_of(current) or "unknown"
+            if state == "running":
+                return current
+            if state in TERMINAL_FAILURE_STATES:
+                raise RuntimeError(
+                    f"OpenSandbox service {runtime.name!r} entered terminal state={state}; "
+                    f"reason={_status_reason_of(current) or '<none>'}"
+                )
+            await asyncio.sleep(3)
+        raise YiCloudSandboxReadyTimeoutError(
+            f"OpenSandbox service {runtime.name!r} scheduling timed out after "
+            f"{self._ready_timeout_sec}s"
+        )
+
+    def _service_image_source_ref(self, runtime: ServiceRuntime) -> str:
+        image = runtime.spec.get("image") or {}
+        return str(image.get("digest_ref") or image.get("sandbox_ref") or "").strip()
+
+    def _service_image_ref(self, runtime: ServiceRuntime) -> str:
+        return _yicloud_image_ref(self._service_image_source_ref(runtime))
+
+    @staticmethod
+    def _create_image_input(sandbox: Any, source_ref: str) -> Any:
+        """Use URI for a fully-qualified OCI reference to pin its registry."""
+        normalized = _yicloud_image_ref(source_ref)
+        if normalized != source_ref:
+            return sandbox.models.CreateSandboxReqImageInput(Uri=source_ref)
+        return sandbox.models.CreateSandboxReqImageInput(Ref=source_ref)
+
+    @staticmethod
+    def _service_start_command(spec: dict[str, Any]) -> list[str] | None:
+        """Map Compose entrypoint/command directly to Create.Entrypoint.
+
+        This is not a hold/bootstrap wrapper or a process supervisor: when
+        Compose supplied a start command, the platform starts that exact
+        command. The common list forms preserve their argv boundaries.
+        """
+        runtime = spec.get("runtime")
+        if isinstance(runtime, dict):
+            argv = runtime.get("start_argv")
+            if not isinstance(argv, list) or not argv or not all(
+                isinstance(item, str) for item in argv
+            ):
+                raise RuntimeError(
+                    "Bundle runtime.start_argv must be a non-empty string list"
+                )
+            return list(argv)
+
+        entrypoint = spec.get("entrypoint")
+        command = spec.get("command")
+        if entrypoint is None and command is None:
+            return None
+        if entrypoint is None:
+            if isinstance(command, list) and all(isinstance(item, str) for item in command):
+                return list(command)
+            if isinstance(command, str):
+                return ["sh", "-c", command]
+            raise RuntimeError("Compose command must be a string or string list")
+        if isinstance(entrypoint, str):
+            base = ["sh", "-c", entrypoint]
+            if command is not None:
+                raise RuntimeError(
+                    "string Compose entrypoint with command has no lossless "
+                    "OpenSandbox argv mapping"
+                )
+            return base
+        if not isinstance(entrypoint, list) or not all(isinstance(item, str) for item in entrypoint):
+            raise RuntimeError("Compose entrypoint must be a string or string list")
+        if command is None:
+            return list(entrypoint)
+        if isinstance(command, list) and all(isinstance(item, str) for item in command):
+            return [*entrypoint, *command]
+        if isinstance(command, str):
+            return [*entrypoint, command]
+        raise RuntimeError("Compose command must be a string or string list")
+
+    def _make_service_sandbox_name(self, service: str) -> str:
+        base = f"{self._make_sandbox_name()}-{service}".lower()
+        return re.sub(r"[^a-z0-9-]+", "-", base).strip("-")[:63].rstrip("-")
+
+    async def _wait_for_sandbox_ids_absent(self, sandbox_ids: set[str]) -> bool:
+        """Return only after the control-plane list no longer contains IDs."""
+        sandbox = self._sandbox_service
+        if sandbox is None or not sandbox_ids:
+            return True
+        deadline = time.monotonic() + self._cleanup_wait_sec
+        while time.monotonic() < deadline:
+            remaining: set[str] = set()
+            offset = 0
+            while True:
+                listed = await asyncio.to_thread(
+                    sandbox.list_sandboxes,
+                    None,
+                    sandbox.models.ListSandboxesReq(
+                        ProjectName=self._project_name,
+                        EnvironmentId=self._environment_id,
+                        Limit=100,
+                        Offset=offset,
+                    ),
+                )
+                items = list(getattr(listed, "Items", None) or [])
+                remaining.update(
+                    str(getattr(item, "Id", "") or "")
+                    for item in items
+                    if str(getattr(item, "Id", "") or "") in sandbox_ids
+                )
+                if len(items) < 100:
+                    break
+                offset += len(items)
+            if not remaining:
+                return True
+            await asyncio.sleep(3)
+        return False
+
+    async def _batch_delete_sandboxes(self, sandbox_ids: set[str]) -> bool:
+        """Request physical removal, then require list invisibility as success."""
+        sandbox = self._sandbox_service
+        if sandbox is None or not sandbox_ids:
+            return True
+        response = await asyncio.to_thread(
+            sandbox.batch_delete_sandboxes,
+            None,
+            sandbox.models.BatchDeleteSandboxesReq(
+                ProjectName=self._project_name,
+                Ids=sorted(sandbox_ids),
+            ),
+        )
+        failed = {
+            str(getattr(item, "Id", "") or "")
+            for item in (getattr(response, "Failed", None) or [])
+        }
+        if failed:
+            self.logger.warning(
+                "YiCloud Sandbox batch deletion rejected IDs: %s", sorted(failed)
+            )
+            return False
+        return await self._wait_for_sandbox_ids_absent(sandbox_ids)
+
+    async def _delete_service_group(self) -> None:
+        runtimes = [runtime for runtime in self._services.values() if runtime.sandbox_id]
+        try:
+            deleted = await self._batch_delete_sandboxes(
+                {runtime.sandbox_id for runtime in runtimes}
+            )
+            for runtime in runtimes:
+                runtime.state = "DELETED" if deleted else "DELETE_UNCONFIRMED"
+            if not deleted:
+                self.logger.warning(
+                    "YiCloud composite Sandbox deletion was not confirmed within %ss: %s",
+                    self._cleanup_wait_sec,
+                    [runtime.sandbox_id for runtime in runtimes],
+                )
+        finally:
+            self._detach_sandbox()
+
+    async def _run_service_command(
+        self, runtime: ServiceRuntime, command: str, *, cwd: str = "/", timeout_sec: int = 60
+    ) -> ExecResult:
+        if not runtime.command_url or not runtime.access_token:
+            raise RuntimeError(f"OpenSandbox service {runtime.name!r} is not running")
+        wrapped = (
+            "set +e\n(\n" + command + "\n)\nharbor_rc=$?\n"
+            f"printf '\\n{EXIT_MARKER}%s\\n' \"$harbor_rc\"\nexit \"$harbor_rc\"\n"
+        )
+        body = json.dumps({"command": wrapped, "background": False, "timeout": timeout_sec * 1000, "cwd": cwd}, separators=(",", ":"))
+        now = time.localtime()
+        headers = {
+            "X-OGW-PUBLIC-KEY": self._base_client.crede.public_key,
+            "X-OGW-TICK": str(int(time.mktime(now) * 1000)),
+            "X-OGW-SIGN": self._base_client.crede.sign(now, urlsplit(runtime.command_url).query, body),
+            "X-Sandbox-Access-Token": runtime.access_token,
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        def run() -> ExecResult:
+            session = requests.Session()
+            session.trust_env = False
+            response = session.post(runtime.command_url, headers=headers, data=body, timeout=timeout_sec + 60)
+            response.raise_for_status()
+            events = _parse_sse(response.text)
+            stdout = "".join(str(event.get("text", "")) for event in events if event.get("type") == "stdout")
+            stderr = "".join(str(event.get("text", "")) for event in events if event.get("type") == "stderr")
+            matches = re.findall(rf"{re.escape(EXIT_MARKER)}(\d+)", stdout)
+            return ExecResult(
+                stdout=re.sub(rf"\n?{re.escape(EXIT_MARKER)}\d+\n?", "", stdout),
+                stderr=stderr,
+                return_code=int(matches[-1]) if matches else 1,
+            )
+        return await asyncio.to_thread(run)
+
+    async def _wire_service_aliases(self) -> None:
+        entries: list[str] = []
+        for target in self._services.values():
+            aliases = [target.name, *(target.spec.get("aliases") or [])]
+            aliases = list(dict.fromkeys(str(item) for item in aliases if str(item)))
+            if not target.internal_address:
+                continue
+            entries.append(f"{target.internal_address} {' '.join(aliases)}")
+        block = "\\n".join(entries)
+        encoded = base64.b64encode(block.encode("utf-8")).decode("ascii")
+        command = (
+            "tmp=$(mktemp); "
+            f"printf %s {shlex.quote(encoded)} | base64 -d >$tmp; "
+            f"sed '/^{HOSTS_BLOCK_BEGIN}$/,/^{HOSTS_BLOCK_END}$/d' /etc/hosts >$tmp.hosts; "
+            f"{{ cat $tmp.hosts; printf '\\n{HOSTS_BLOCK_BEGIN}\\n'; cat $tmp; printf '{HOSTS_BLOCK_END}\\n'; }} >/etc/hosts; "
+            "rm -f $tmp $tmp.hosts"
+        )
+        for runtime in self._services.values():
+            result = await self._run_service_command(runtime, command, timeout_sec=60)
+            if result.return_code != 0:
+                raise RuntimeError(f"failed to inject service aliases into {runtime.name!r}: {result.stderr or result.stdout}")
+
+    async def _wait_bundle_ready(self) -> None:
+        for runtime in self._services.values():
+            contract = runtime.spec.get("runtime") or {}
+            readiness = contract.get("readiness") if isinstance(contract, dict) else None
+            if not isinstance(readiness, dict) or readiness.get("type") != "healthcheck":
+                continue
+            healthcheck = readiness.get("healthcheck")
+            if not isinstance(healthcheck, dict):
+                raise TypeError(f"OpenSandbox healthcheck readiness is invalid for {runtime.name!r}")
+            test = healthcheck.get("test") if isinstance(healthcheck, dict) else None
+            if isinstance(test, list):
+                command = " ".join(shlex.quote(str(item)) for item in test[1:]) if test and test[0] == "CMD" else " ".join(str(item) for item in test[1:])
+            elif isinstance(test, str):
+                command = test
+            else:
+                continue
+            result = await self._run_service_command(runtime, command, timeout_sec=60)
+            if result.return_code != 0:
+                raise RuntimeError(f"OpenSandbox healthcheck failed for {runtime.name!r}: {result.stderr or result.stdout}")
+        # The runtime contract distinguishes address-discovery ports from
+        # readiness.  Only an explicit TCP readiness declaration is probed;
+        # merely exposing a port does not promise that the service is ready.
+        main = self._services[self._main_service]
+        deadline = time.monotonic() + self._ready_timeout_sec
+        for runtime in self._services.values():
+            contract = runtime.spec.get("runtime") or {}
+            readiness = contract.get("readiness") if isinstance(contract, dict) else None
+            if not isinstance(readiness, dict) or readiness.get("type") != "tcp":
+                continue
+            port = readiness.get("port")
+            if not isinstance(port, int) or port not in self._service_ports(runtime.spec):
+                raise RuntimeError(f"OpenSandbox TCP readiness is invalid for {runtime.name!r}")
+            probe = (
+                "if command -v nc >/dev/null 2>&1; then nc -z -w 2 \"$@\"; "
+                "elif command -v bash >/dev/null 2>&1; then timeout 3 bash -c "
+                "'cat < /dev/null > /dev/tcp/$1/$2' _ \"$@\"; "
+                "elif command -v python3 >/dev/null 2>&1; then python3 -c "
+                "'import socket,sys;s=socket.create_connection((sys.argv[1],int(sys.argv[2])),2);s.close()' \"$@\"; "
+                "else exit 69; fi"
+            )
+            while True:
+                result = await self._run_service_command(
+                    main,
+                    f"sh -c {shlex.quote(probe)} _ {shlex.quote(runtime.name)} {port}",
+                    timeout_sec=15,
+                )
+                if result.return_code == 0:
+                    break
+                if result.return_code == 69:
+                    raise RuntimeError(
+                        "OpenSandbox cannot probe required service port: "
+                        "main has none of nc, bash, or python3"
+                    )
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"OpenSandbox required port was not ready: "
+                        f"service={runtime.name} port={port}; "
+                        f"stderr={result.stderr or result.stdout}"
+                    )
+                await asyncio.sleep(2)
+
+    async def _start_composite(self) -> None:
+        sandbox = self._sandbox_service
+        assert sandbox is not None
+        created: dict[str, Any] = {}
+        for runtime in self._services.values():
+            runtime.sandbox_name = self._make_service_sandbox_name(runtime.name)
+            image_ref = self._service_image_source_ref(runtime)
+            request: dict[str, Any] = {
+                "ProjectName": self._project_name,
+                "EnvironmentId": self._environment_id,
+                "Name": runtime.sandbox_name,
+                "Image": self._create_image_input(sandbox, image_ref),
+                "Env": {
+                    **self._persistent_env,
+                    **{
+                        str(key): str(value)
+                        for key, value in (runtime.spec.get("environment") or {}).items()
+                        if value is not None
+                    },
+                },
+                "Resources": sandbox.models.CreateSandboxReqResources(Cpu=self._request_cpu, Memory=self._request_memory),
+                "LifecycleMinutes": self._lifecycle_minutes,
+                "RequestTimeoutSeconds": self._request_timeout_sec,
+            }
+            start_command = self._service_start_command(runtime.spec)
+            if start_command is not None:
+                request["Entrypoint"] = start_command
+            ports = self._service_ports(runtime.spec)
+            if ports:
+                request["Ports"] = [sandbox.models.CreateSandboxReqPort(ContainerPort=port, Name=f"svc-{port}", Purpose=f"Harbor {runtime.name}") for port in ports]
+            created[runtime.name] = await asyncio.to_thread(sandbox.create_sandbox, None, sandbox.models.CreateSandboxReq(**request))
+            runtime.sandbox_id = str(getattr(created[runtime.name], "Id", "") or "")
+            if not runtime.sandbox_id:
+                raise RuntimeError(f"OpenSandbox create returned no sandbox ID for service {runtime.name!r}")
+        running = await asyncio.gather(*(self._wait_service_running(runtime, created[runtime.name]) for runtime in self._services.values()))
+        for runtime, current in zip(self._services.values(), running, strict=True):
+            _validate_sandbox_binding(current, self._environment_id, self._service_image_ref(runtime))
+            runtime.access_token = _access_token_of(created[runtime.name]) or _access_token_of(current)
+            runtime.command_url = _command_url_of(current)
+            if self._service_ports(runtime.spec):
+                runtime.internal_address = _internal_address_of(current)
+            runtime.state = "WIRING"
+            if not runtime.access_token:
+                raise RuntimeError(f"OpenSandbox service {runtime.name!r} returned no access token")
+        await self._wire_service_aliases()
+        await self._wait_bundle_ready()
+        main = self._services[self._main_service]
+        self._sandbox_id, self._sandbox_name = main.sandbox_id, main.sandbox_name
+        self._access_token, self._command_url = main.access_token, main.command_url
+        for runtime in self._services.values():
+            runtime.state = "READY"
+
     async def start(self, force_build: bool) -> None:
         if force_build:
             self.logger.warning(
                 "YiCloud OpenSandbox ignores force_build and uses prebuilt images"
             )
+        self._validate_definition()
         self._initialize_service()
         sandbox = self._sandbox_service
         assert sandbox is not None
         await asyncio.to_thread(self._resolve_environment_id)
+        if self._bundle is not None:
+            try:
+                await self._start_composite()
+                setup = await self.exec(
+                    "mkdir -p /logs/agent /logs/verifier /logs/artifacts /artifacts && "
+                    "chmod 777 /logs/agent /logs/verifier /logs/artifacts /artifacts",
+                    cwd="/",
+                    timeout_sec=60,
+                    user="root",
+                )
+                if setup.return_code != 0:
+                    raise RuntimeError(
+                        "failed to initialize Harbor log directories: "
+                        f"{setup.stderr or setup.stdout}"
+                    )
+                await self._upload_environment_dir_after_start()
+                await self._materialize_read_only_mounts()
+            except BaseException:
+                await self._delete_service_group()
+                raise
+            return
         self._sandbox_name = self._make_sandbox_name()
 
         created = await asyncio.to_thread(
@@ -595,7 +1110,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
                 ProjectName=self._project_name,
                 EnvironmentId=self._environment_id,
                 Name=self._sandbox_name,
-                Image=sandbox.models.CreateSandboxReqImageInput(Ref=self._image_ref),
+                Image=self._create_image_input(sandbox, self._image_source_ref),
                 Entrypoint=["sh", "-c", "while :; do sleep 60; done"],
                 Env=dict(self._persistent_env),
                 Resources=sandbox.models.CreateSandboxReqResources(
@@ -669,38 +1184,11 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             self.logger.info(
                 "YiCloud Sandbox cleanup requested sandbox_id=%s", sandbox_id
             )
-            await asyncio.to_thread(
-                sandbox.delete_sandbox,
-                None,
-                sandbox.models.DeleteSandboxReq(
-                    ProjectName=self._project_name,
-                    SandboxId=sandbox_id,
-                ),
-            )
-            deadline = time.monotonic() + self._cleanup_wait_sec
-            while time.monotonic() < deadline:
-                listed = await asyncio.to_thread(
-                    sandbox.list_sandboxes,
-                    None,
-                    sandbox.models.ListSandboxesReq(
-                        ProjectName=self._project_name,
-                        EnvironmentId=self._environment_id,
-                        Keyword=self._sandbox_name,
-                        Limit=100,
-                        Offset=0,
-                    ),
+            deleted = await self._batch_delete_sandboxes({sandbox_id})
+            if deleted:
+                self.logger.info(
+                    "YiCloud Sandbox cleanup confirmed sandbox_id=%s", sandbox_id
                 )
-                remaining_ids = {
-                    str(getattr(item, "Id", "") or "")
-                    for item in (getattr(listed, "Items", None) or [])
-                }
-                if sandbox_id not in remaining_ids:
-                    self.logger.info(
-                        "YiCloud Sandbox cleanup confirmed sandbox_id=%s",
-                        sandbox_id,
-                    )
-                    break
-                await asyncio.sleep(3)
             else:
                 self.logger.warning(
                     "YiCloud Sandbox deletion not confirmed within %ss: %s",
@@ -711,6 +1199,12 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             self._detach_sandbox()
 
     async def stop(self, delete: bool) -> None:
+        if self._bundle is not None:
+            if delete:
+                await self._delete_service_group()
+            else:
+                self._detach_sandbox()
+            return
         if self._retain_after_trial and self._sandbox_id:
             self.logger.warning(
                 "YiCloud Sandbox retained after trial sandbox_id=%s "
@@ -1033,6 +1527,30 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             if result.stderr:
                 await callback(result.stderr, "stderr")
         return result
+
+    async def service_exec(
+        self,
+        service: str | None,
+        command: str,
+        cwd: str | None = None,
+        timeout_sec: int | None = None,
+    ) -> ExecResult:
+        """Execute on a named sidecar; None and main retain Harbor routing."""
+        name = service or self._main_service
+        if not self._services or name == self._main_service:
+            return await self.exec(command, cwd=cwd, timeout_sec=timeout_sec)
+        runtime = self._services.get(name)
+        if runtime is None:
+            raise ValueError(f"unknown OpenSandbox service: {name!r}")
+        return await self._run_service_command(
+            runtime, command, cwd=cwd or "/", timeout_sec=timeout_sec or 3600
+        )
+
+    async def stop_service(self, service: str) -> None:
+        runtime = self._services.get(service)
+        if runtime is None:
+            raise ValueError(f"unknown OpenSandbox service: {service!r}")
+        await self._delete_service(runtime)
 
     def _uses_s3_upload(self) -> bool:
         return getattr(self, "_upload_backend", "http") == "s3"

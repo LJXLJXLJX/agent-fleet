@@ -41,6 +41,7 @@ run_dry() {
   local agent="${7:-oracle}"
   local dry_run="${8:-1}"
   local extension_source="${9:-$tmp/no-pi-extensions}"
+  local bundle_manifest="${10:-}"
   local runtime_dir="$tmp/runtime/$agent"
   local queue_dir="$tmp/queue/$agent"
   local harbor_python="$MANAGER_PYTHON"
@@ -75,7 +76,9 @@ run_dry() {
     TRACE_TO_OPIK=false \
     HARBOR_ENVIRONMENT_TYPE="$environment_type" \
     HARBOR_OPENSANDBOX_IMAGE_REF="$image_ref" \
-    HARBOR_OPENSANDBOX_IMAGE_REPOSITORY=test-project/test-repository \
+    HARBOR_OPENSANDBOX_BUNDLE_MANIFEST="$bundle_manifest" \
+    YICLOUD_HARBOR_HOST=registry.gate.yicloud.com.cn \
+    YICLOUD_HARBOR_PROJECT=test-project \
     HARBOR_OPENSANDBOX_IMAGE_MANAGER="$manager" \
     HARBOR_OPIK_BIN="$tmp/bin/fake-harbor" \
     HARBOR_CLI_BIN="$tmp/bin/fake-harbor" \
@@ -93,12 +96,25 @@ run_dry() {
 
 automatic="$(run_dry '' "$HARBOR_DIR/opensandbox_image_manager.py" '{}')"
 grep -F -- '--env yicloud_opensandbox:YiCloudOpenSandboxEnvironment' <<< "$automatic" >/dev/null
-grep -E -- '--ek image_ref=test-project/test-repository:harbor-0-[0-9a-f]{20}' \
+grep -E -- '--ek image_ref=registry\.gate\.yicloud\.com\.cn/test-project/0@sha256:[0-9a-f]{64}' \
   <<< "$automatic" >/dev/null
 grep -F -- '--ek lifecycle_minutes=120' <<< "$automatic" >/dev/null
 grep -F -- '--mounts-json' <<< "$automatic" >/dev/null
 grep -F -- 'HARBOR_VERIFIER_UV_BIN_DIR=/opt/tb-uv-backup/bin' \
   <<< "$automatic" >/dev/null
+grep -F -- '[INFO] OpenSandbox Bundle Manifest ready:' <<< "$automatic" >/dev/null
+automatic_bundle="$tmp/runtime/oracle/opensandbox-bundle.json"
+[[ -f "$automatic_bundle" ]]
+"$MANAGER_PYTHON" -c '
+import json, pathlib, sys
+bundle = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert bundle["schema_version"] == 2
+assert bundle["main"] == "main"
+assert bundle["registry"]["repository"] == "test-project/0"
+assert bundle["services"]["main"]["image"]["digest_ref"].startswith(
+    "registry.gate.yicloud.com.cn/test-project/0@sha256:"
+)
+' "$automatic_bundle"
 if grep -F -- '--extra-docker-compose' <<< "$automatic" >/dev/null; then
   echo 'OpenSandbox command unexpectedly contains a Docker compose overlay' >&2
   exit 1
@@ -114,7 +130,7 @@ for force_build in 1 true; do
     '' "$HARBOR_DIR/opensandbox_image_manager.py" '{}' auto opensandbox \
     "$force_build")"
   grep -E -- \
-    '--ek image_ref=test-project/test-repository:harbor-0-[0-9a-f]{20}-r[0-9]{14}-[0-9]+' \
+    '--ek image_ref=registry\.gate\.yicloud\.com\.cn/test-project/0@sha256:[0-9a-f]{64}' \
     <<< "$forced" >/dev/null
 done
 
@@ -128,7 +144,7 @@ if grep -F -- '--ek image_ref=' <<< "$docker_run" >/dev/null; then
 fi
 
 automatic_seta="$(run_dry '' "$HARBOR_DIR/opensandbox_image_manager.py" '{}' seta)"
-grep -E -- '--ek image_ref=test-project/test-repository:harbor-0-[0-9a-f]{20}' \
+grep -E -- '--ek image_ref=registry\.gate\.yicloud\.com\.cn/test-project/0@sha256:[0-9a-f]{64}' \
   <<< "$automatic_seta" >/dev/null
 grep -F -- "--path $tmp/dataset" <<< "$automatic_seta" >/dev/null
 if grep -F -- '--dataset seta-env' <<< "$automatic_seta" >/dev/null; then
@@ -142,6 +158,28 @@ if grep -F -- '[INFO] preparing OpenSandbox image' <<< "$manual" >/dev/null; the
   echo 'manual image override unexpectedly invoked the image manager' >&2
   exit 1
 fi
+
+manual_bundle="$tmp/manual-bundle.json"
+cat >"$manual_bundle" <<'JSON'
+{
+  "schema_version": 1,
+  "main_service": "main",
+  "services": {
+    "main": {
+      "image": {
+        "sandbox_ref": "test-project/from-bundle:immutable"
+      }
+    }
+  }
+}
+JSON
+manual_bundle_run="$(run_dry \
+  '' "$tmp/does-not-exist.py" '{}' auto opensandbox 0 oracle 1 \
+  "$tmp/no-pi-extensions" "$manual_bundle")"
+grep -F -- '--ek image_ref=test-project/from-bundle:immutable' \
+  <<< "$manual_bundle_run" >/dev/null
+grep -F -- '[INFO] using OpenSandbox Bundle Manifest:' \
+  <<< "$manual_bundle_run" >/dev/null
 
 claude_opensandbox="$(run_dry \
   'test-project/manual:immutable' "$tmp/does-not-exist.py" '{}' auto \

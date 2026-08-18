@@ -14,10 +14,16 @@ make_runner() {
 #!/usr/bin/env bash
 if [[ "\${3:-}" == "harbor" ]]; then
   printf '%s\n' '$harbor_version'
+elif [[ "\${3:-}" == "e2b" ]]; then
+  printf '%s\n' '2.32.1'
+elif [[ "\${3:-}" == "opik" ]]; then
+  printf '%s\n' '$opik_version'
 elif [[ "\${3:-}" == "yicloud-sdk-python" ]]; then
   printf '%s\n' '0.3.1'
 elif [[ "\${3:-}" == "pip" ]]; then
   printf '%s\n' '25.2'
+elif [[ "\${3:-}" == "PyYAML" ]]; then
+  printf '%s\n' '6.0.3'
 elif [[ "\${3:-}" == "s3cmd" ]]; then
   printf '%s\n' '2.4.0'
 elif [[ "\${3:-}" == "e2b" ]]; then
@@ -27,7 +33,7 @@ elif [[ "\${3:-}" == "dockerfile-parse" ]]; then
 elif [[ "\$#" == 2 ]]; then
   printf '%s\n' '3.12.13'
 else
-  printf '%s\n' '$opik_version'
+  exit 1
 fi
 SH
   cat > "$runner_dir/bin/opik" <<'SH'

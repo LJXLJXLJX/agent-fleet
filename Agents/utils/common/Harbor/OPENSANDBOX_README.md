@@ -8,16 +8,18 @@ agent and verifier, collects the result, and deletes the instance.
 
 - Run `./scripts/setup.sh` once from the repository root.
 - Install Docker with Buildx and log in to the target image registry.
-- Prepare a local Harbor dataset whose tasks contain an
-  `environment/Dockerfile`.
+- Prepare a local Harbor dataset whose tasks contain a Dockerfile or the
+  supported Compose subset.
 - Obtain YiCloud API credentials, a project name, and an OpenSandbox
   environment ID.
 - Make the model gateway reachable from OpenSandbox.
 - For the S3 upload backend, provide an `s3cmd` configuration and a writable
   bucket.
 
-OpenSandbox currently supports single-container tasks only. Docker Compose
-tasks fail before an instance is created.
+Compose tasks use a constrained service group: all services are created in the
+same dedicated environment, receive a managed `/etc/hosts` alias block, and
+must pass the capability gate. Shared volumes, fixed IPs, multiple networks,
+and privileged/capability requests are rejected before any Sandbox is created.
 
 ## Configure
 
@@ -41,9 +43,13 @@ YICLOUD_SECRET_KEY=your-yicloud-secret-key
 YICLOUD_PROJECT_NAME=your-project
 YICLOUD_SANDBOX_ENVIRONMENT_ID=env-xxxxxxxx-xxx
 
-HARBOR_OPENSANDBOX_REGISTRY=registry.example.com
-HARBOR_OPENSANDBOX_IMAGE_REPOSITORY=project/benchmark-task-images
-HARBOR_OPENSANDBOX_SANDBOX_IMAGE_PREFIX=project/benchmark-task-images
+YICLOUD_HARBOR_HOST=harbor.example.internal
+YICLOUD_HARBOR_PROJECT=seta
+YICLOUD_HARBOR_USERNAME=your-harbor-username
+YICLOUD_HARBOR_PASSWORD=your-harbor-password
+# Set to 1 after the host trusts Harbor's certificate. Current YiCloud ingress
+# is verified with 0.
+YICLOUD_HARBOR_TLS_VERIFY=0
 
 YICLOUD_SANDBOX_UPLOAD_BACKEND=s3
 YICLOUD_SANDBOX_S3_CONFIG=/absolute/path/to/s3cfg
@@ -82,13 +88,19 @@ set -a
 source config.local.env
 set +a
 
+# Required for Dockerfile RUN downloads from upstream release hosts.  Pin the
+# development machine's local proxy instead of allowing a shell helper to
+# fall back to a forwarded proxy; BuildKit defaults to host networking.
+export HARBOR_OPENSANDBOX_BUILD_PROXY_URL=http://127.0.0.1:7890
+
 HARBOR_OPENSANDBOX_PREBUILD_CONCURRENCY=4 \
 bash Agents/utils/common/Harbor/prebuild_opensandbox_dataset.sh \
   /absolute/path/to/Harbor-Dataset seta
 ```
 
-Already published content-addressed images are reused. Unsupported Compose
-tasks are listed as skipped in the prebuild report.
+Already published content-addressed images are reused in the task-specific
+repository. Unsupported environment definitions are listed as skipped in the
+prebuild report; unsupported runtime capabilities fail before creation.
 
 ## Troubleshooting
 
