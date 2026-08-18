@@ -186,7 +186,12 @@ def manifest_url_ready(url: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Harbor environment helpers")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("llm-kwargs", "model-info", "opencode-config"):
+    for command in (
+        "llm-kwargs",
+        "model-info",
+        "opencode-config",
+        "has-model-request-headers",
+    ):
         subparsers.add_parser(command)
     generate_parser = subparsers.add_parser("generate-task-file")
     generate_parser.add_argument("dataset", type=Path)
@@ -220,6 +225,9 @@ def main() -> None:
         return
     if args.command == "manifest-url-ready":
         manifest_url_ready(args.url)
+        return
+    if args.command == "has-model-request-headers":
+        print("1" if model_request_headers() else "0")
         return
 
     builders: dict[str, Callable[[], dict[str, object]]] = {

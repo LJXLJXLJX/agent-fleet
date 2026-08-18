@@ -388,11 +388,19 @@ OPENCODE_VERSION="${OPENCODE_VERSION:-latest}"
 OPENCODE_TGZ_BASENAME="${OPENCODE_TGZ_BASENAME:-opencode-ai-${OPENCODE_VERSION}.tgz}"
 OPENCODE_LINUX_X64_TGZ_BASENAME="${OPENCODE_LINUX_X64_TGZ_BASENAME:-opencode-linux-x64-${OPENCODE_VERSION}.tgz}"
 OPENCODE_CONFIG_CONTENT="${OPENCODE_CONFIG_CONTENT:-}"
+OPENCODE_HAS_REQUEST_HEADERS="0"
+if [[ "$AGENT" == "opencode" ]]; then
+  OPENCODE_HAS_REQUEST_HEADERS="$(
+    TB_LLM_KWARGS="$TB_LLM_KWARGS" \
+      python3 "$SCRIPT_DIR/env.py" has-model-request-headers
+  )"
+fi
 if [[ "$AGENT" == "opencode" \
   && ( ( -z "$OPENCODE_CONFIG_CONTENT" && "${TB_MODEL%%/*}" == "custom" ) \
     || -n "$HARBOR_TEMPERATURE" \
     || -n "$HARBOR_TOP_P" \
-    || -n "$HARBOR_MAX_TOKENS" ) ]]; then
+    || -n "$HARBOR_MAX_TOKENS" \
+    || "$OPENCODE_HAS_REQUEST_HEADERS" == "1" ) ]]; then
   # OpenCode's built-in minimax provider ignores our gateway BASE_URL and calls
   # api.minimax.io directly. Use an OpenAI-compatible custom provider by default.
   OPENCODE_CONFIG_CONTENT="$(
