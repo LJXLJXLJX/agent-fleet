@@ -823,6 +823,52 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             return [*entrypoint, command]
         raise RuntimeError("Compose command must be a string or string list")
 
+    @staticmethod
+    def _hosts_update_command(entries: list[str]) -> str:
+        block = "\n".join(entries)
+        encoded = base64.b64encode(block.encode("utf-8")).decode("ascii")
+        return (
+            "tmp=$(mktemp); "
+            f"printf %s {shlex.quote(encoded)} | base64 -d >$tmp; "
+            f"sed '/^{HOSTS_BLOCK_BEGIN}$/,/^{HOSTS_BLOCK_END}$/d' /etc/hosts >$tmp.hosts; "
+            f"{{ cat $tmp.hosts; printf '{HOSTS_BLOCK_BEGIN}\\n'; cat $tmp; printf '\\n{HOSTS_BLOCK_END}\\n'; }} >/etc/hosts; "
+            "rm -f $tmp $tmp.hosts"
+        )
+
+    def _service_entrypoint(self, runtime: ServiceRuntime) -> list[str] | None:
+        start_command = self._service_start_command(runtime.spec)
+        dependencies = runtime.spec.get("depends_on") or {}
+        if start_command is None or not dependencies:
+            return start_command
+
+        entries: list[str] = []
+        for dependency_name in dependencies:
+            dependency = self._services[dependency_name]
+            if not dependency.internal_address:
+                raise RuntimeError(
+                    "OpenSandbox dependency has no internal address before "
+                    f"starting {runtime.name!r}: {dependency_name!r}"
+                )
+            aliases = [
+                dependency.name,
+                *(dependency.spec.get("aliases") or []),
+            ]
+            aliases = list(
+                dict.fromkeys(str(item) for item in aliases if str(item))
+            )
+            entries.append(
+                f"{dependency.internal_address} {' '.join(aliases)}"
+            )
+
+        hosts_command = self._hosts_update_command(entries)
+        return [
+            "sh",
+            "-c",
+            f'set -e\n{hosts_command}\nexec "$@"',
+            "harbor-compose-entrypoint",
+            *start_command,
+        ]
+
     def _make_service_sandbox_name(self, service: str) -> str:
         base = f"{self._make_sandbox_name()}-{service}".lower()
         return re.sub(r"[^a-z0-9-]+", "-", base).strip("-")[:63].rstrip("-")
@@ -1000,15 +1046,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             if not target.internal_address:
                 continue
             entries.append(f"{target.internal_address} {' '.join(aliases)}")
-        block = "\n".join(entries)
-        encoded = base64.b64encode(block.encode("utf-8")).decode("ascii")
-        command = (
-            "tmp=$(mktemp); "
-            f"printf %s {shlex.quote(encoded)} | base64 -d >$tmp; "
-            f"sed '/^{HOSTS_BLOCK_BEGIN}$/,/^{HOSTS_BLOCK_END}$/d' /etc/hosts >$tmp.hosts; "
-            f"{{ cat $tmp.hosts; printf '{HOSTS_BLOCK_BEGIN}\\n'; cat $tmp; printf '\\n{HOSTS_BLOCK_END}\\n'; }} >/etc/hosts; "
-            "rm -f $tmp $tmp.hosts"
-        )
+        command = self._hosts_update_command(entries)
         targets = runtimes if runtimes is not None else list(self._services.values())
         for runtime in targets:
             result = await self._run_service_command(runtime, command, timeout_sec=60)
@@ -1203,7 +1241,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
                 "LifecycleMinutes": self._lifecycle_minutes,
                 "RequestTimeoutSeconds": self._request_timeout_sec,
             }
-            start_command = self._service_start_command(runtime.spec)
+            start_command = self._service_entrypoint(runtime)
             if start_command is not None:
                 request["Entrypoint"] = start_command
             ports = self._service_ports(runtime.spec)

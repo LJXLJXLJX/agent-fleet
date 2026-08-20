@@ -179,6 +179,61 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "non-empty string list"):
             start({"runtime": {"start_argv": []}})
 
+    def test_dependency_aliases_are_wired_before_entrypoint(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        worker = yicloud_opensandbox.ServiceRuntime(
+            "worker",
+            {
+                "aliases": ["database"],
+                "depends_on": {},
+                "runtime": {"start_argv": ["worker"]},
+            },
+        )
+        worker.internal_address = "10.0.0.2"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hosts_path = Path(tmp) / "hosts"
+            hosts_path.write_text("127.0.0.1 localhost\n", encoding="utf-8")
+            expected_entry = "10.0.0.2 worker database"
+            main = yicloud_opensandbox.ServiceRuntime(
+                "main",
+                {
+                    "depends_on": {
+                        "worker": {
+                            "condition": "service_started",
+                            "required": True,
+                        }
+                    },
+                    "runtime": {
+                        "start_argv": [
+                            "sh",
+                            "-c",
+                            "grep -Fqx "
+                            + shlex.quote(expected_entry)
+                            + " "
+                            + shlex.quote(str(hosts_path)),
+                        ]
+                    },
+                },
+            )
+            instance._services = {"main": main, "worker": worker}
+
+            entrypoint = instance._service_entrypoint(main)
+            assert entrypoint is not None
+            entrypoint[2] = entrypoint[2].replace(
+                "/etc/hosts", shlex.quote(str(hosts_path))
+            )
+            subprocess.run(entrypoint, check=True, capture_output=True, text=True)
+
+            self.assertIn(
+                f"{expected_entry}\n",
+                hosts_path.read_text(encoding="utf-8"),
+            )
+
+        self.assertEqual(instance._service_entrypoint(worker), ["worker"])
+
     def test_service_hosts_block_uses_real_newlines(self) -> None:
         instance = object.__new__(
             yicloud_opensandbox.YiCloudOpenSandboxEnvironment
@@ -287,6 +342,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             yicloud_opensandbox.YiCloudOpenSandboxEnvironment
         )
         events = []
+        entrypoints = {}
         worker = yicloud_opensandbox.ServiceRuntime(
             "worker",
             {
@@ -325,6 +381,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         def create_sandbox(_context, request):
             service = request.Name.rsplit("-", 1)[-1]
             events.append(f"create:{service}")
+            entrypoints[service] = request.Entrypoint
             return SimpleNamespace(
                 Id=f"sbx-{service}", AccessToken=f"token-{service}"
             )
@@ -394,6 +451,12 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         self.assertEqual(instance._sandbox_id, "sbx-main")
         self.assertEqual(main.state, "READY")
         self.assertEqual(worker.state, "READY")
+        self.assertEqual(entrypoints["worker"], ["worker"])
+        self.assertEqual(entrypoints["main"][-1], "main")
+        encoded = entrypoints["main"][2].split("printf %s ", 1)[1].split(
+            " | base64", 1
+        )[0]
+        self.assertEqual(base64.b64decode(encoded).decode("utf-8"), "10.0.0.2 worker")
 
     def test_composite_rejects_unsupported_dependency_before_create(self) -> None:
         instance = object.__new__(
