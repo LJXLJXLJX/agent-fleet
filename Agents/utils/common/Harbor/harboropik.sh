@@ -347,6 +347,7 @@ ensure_environment_backend() {
 }
 
 prepare_opensandbox_image_ref() {
+  local automatic_bundle_manifest="$1"
   if [[ "$HARBOR_ENVIRONMENT_TYPE" != "opensandbox" ]]; then
     return 0
   fi
@@ -413,7 +414,7 @@ print(ref)
     --apt-mirror "$HARBOR_OPENSANDBOX_APT_MIRROR"
     --build-args-json "$HARBOR_OPENSANDBOX_BUILD_ARGS_JSON"
     --build-network "$HARBOR_OPENSANDBOX_BUILD_NETWORK"
-    --bundle-manifest-output "$RUNTIME_DIR/opensandbox-bundle.json"
+    --bundle-manifest-output "$automatic_bundle_manifest"
   )
   if [[ "$YICLOUD_HARBOR_TLS_VERIFY" == "1" ]]; then
     manager_cmd+=( --registry-tls-verify )
@@ -439,7 +440,7 @@ print(ref)
     echo "[ERROR] OpenSandbox image manager returned an empty image reference" >&2
     exit 1
   fi
-  HARBOR_OPENSANDBOX_BUNDLE_MANIFEST="$RUNTIME_DIR/opensandbox-bundle.json"
+  HARBOR_OPENSANDBOX_BUNDLE_MANIFEST="$automatic_bundle_manifest"
   if [[ ! -f "$HARBOR_OPENSANDBOX_BUNDLE_MANIFEST" ]]; then
     echo "[ERROR] OpenSandbox image manager did not write Bundle Manifest: $HARBOR_OPENSANDBOX_BUNDLE_MANIFEST" >&2
     exit 1
@@ -810,7 +811,7 @@ run_oracle_task() {
   if [[ "$HARBOR_DRY_RUN" != "1" ]]; then
     harbor_validate_runner_cli
   fi
-  prepare_opensandbox_image_ref
+  prepare_opensandbox_image_ref "$out_dir/opensandbox-bundle.json"
 
   local cmd=(
     "$HARBOR_CLI_BIN" run
@@ -1095,7 +1096,7 @@ run_harbor() {
   else
     cmd+=( --path "$DATASET_PATH" )
   fi
-  prepare_opensandbox_image_ref
+  prepare_opensandbox_image_ref "$out_dir/opensandbox-bundle.json"
   append_environment_backend_args
   if [[ -n "${HARBOR_VERIFIER_UV_HOME:-}" ]]; then
     cmd+=( --ve "HOME=$HARBOR_VERIFIER_UV_HOME" )
@@ -1484,7 +1485,7 @@ run_opencode_task() {
     else
       cmd+=( --path "$DATASET_PATH" )
     fi
-    prepare_opensandbox_image_ref
+    prepare_opensandbox_image_ref "$out_dir/opensandbox-bundle.json"
     append_environment_backend_args
 
     if [[ -n "${HARBOR_AGENT_TIMEOUT_MULTIPLIER:-}" ]]; then

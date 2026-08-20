@@ -176,7 +176,7 @@ Typical dataset paths:
 | `HARBOR_AGENT_TIMEOUT_MULTIPLIER` | Agent execution timeout override |
 | `HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER` | Agent setup timeout multiplier |
 | `HARBOR_OPENSANDBOX_IMAGE_REF` | Legacy explicit single-image override; automatic preparation is skipped when set without a Bundle Manifest |
-| `HARBOR_OPENSANDBOX_BUNDLE_MANIFEST` | Optional versioned service Bundle Manifest; automatic preparation writes one under the worker runtime directory |
+| `HARBOR_OPENSANDBOX_BUNDLE_MANIFEST` | Optional versioned service Bundle Manifest; automatic preparation writes one under the current task attempt's job directory |
 | `HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT` | H-local Registry records, image locks, build logs, and immutable Bundle cache root |
 | `YICLOUD_HARBOR_HOST` | New Harbor registry host used by `skopeo` |
 | `YICLOUD_HARBOR_PROJECT` | Externally provisioned Harbor Project for the selected benchmark; task repositories are derived per task |

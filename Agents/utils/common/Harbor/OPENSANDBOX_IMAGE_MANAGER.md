@@ -142,7 +142,7 @@ The normal integration calls:
 
 ```text
 opensandbox_image_manager.py ... \
-  --bundle-manifest-output <runtime>/opensandbox-bundle.json
+  --bundle-manifest-output <task-job>/<attempt>/opensandbox-bundle.json
 ```
 
 Stdout defaults to the `main` image ref for existing callers. `--output
