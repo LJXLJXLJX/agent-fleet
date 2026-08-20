@@ -523,6 +523,8 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             if requirements.get(field):
                 unsupported.append(label)
         unsupported.extend(requirements.get("unsupported_features") or [])
+        # TODO: Consider a routing environment that falls back to Docker when
+        # OpenSandbox cannot satisfy a task's required capabilities.
         if requirements.get("multi_service"):
             for name, runtime in self._services.items():
                 if name == self._main_service:
@@ -883,12 +885,65 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             return False
         return await self._wait_for_sandbox_ids_absent(sandbox_ids)
 
+    async def _delete_single_sandbox(self, sandbox_id: str) -> bool:
+        """Delete one Sandbox through the provider's dedicated single-ID API."""
+        sandbox = self._sandbox_service
+        if sandbox is None or not sandbox_id:
+            return True
+        await asyncio.to_thread(
+            sandbox.delete_sandbox,
+            None,
+            sandbox.models.DeleteSandboxReq(
+                ProjectName=self._project_name,
+                SandboxId=sandbox_id,
+            ),
+        )
+        return await self._wait_for_sandbox_ids_absent({sandbox_id})
+
+    async def _delete_service(self, runtime: ServiceRuntime) -> None:
+        """Delete one composite service and invalidate its runtime connection."""
+        sandbox_id = runtime.sandbox_id
+        try:
+            if not sandbox_id:
+                runtime.state = "DELETED"
+                return
+            self.logger.info(
+                "YiCloud composite service cleanup requested service=%s sandbox_id=%s",
+                runtime.name,
+                sandbox_id,
+            )
+            deleted = await self._delete_single_sandbox(sandbox_id)
+            runtime.state = "DELETED" if deleted else "DELETE_UNCONFIRMED"
+            if deleted:
+                runtime.sandbox_id = ""
+                self.logger.info(
+                    "YiCloud composite service cleanup confirmed service=%s sandbox_id=%s",
+                    runtime.name,
+                    sandbox_id,
+                )
+            else:
+                self.logger.warning(
+                    "YiCloud composite service deletion was not confirmed within %ss: "
+                    "service=%s sandbox_id=%s",
+                    self._cleanup_wait_sec,
+                    runtime.name,
+                    sandbox_id,
+                )
+        finally:
+            runtime.command_url = ""
+            runtime.access_token = ""
+            runtime.internal_address = ""
+            if runtime.name == self._main_service:
+                self._detach_sandbox()
+
     async def _delete_service_group(self) -> None:
         runtimes = [runtime for runtime in self._services.values() if runtime.sandbox_id]
         try:
-            deleted = await self._batch_delete_sandboxes(
-                {runtime.sandbox_id for runtime in runtimes}
-            )
+            sandbox_ids = {runtime.sandbox_id for runtime in runtimes}
+            if len(sandbox_ids) == 1:
+                deleted = await self._delete_single_sandbox(next(iter(sandbox_ids)))
+            else:
+                deleted = await self._batch_delete_sandboxes(sandbox_ids)
             for runtime in runtimes:
                 runtime.state = "DELETED" if deleted else "DELETE_UNCONFIRMED"
             if not deleted:
@@ -935,7 +990,9 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             )
         return await asyncio.to_thread(run)
 
-    async def _wire_service_aliases(self) -> None:
+    async def _wire_service_aliases(
+        self, runtimes: list[ServiceRuntime] | None = None
+    ) -> None:
         entries: list[str] = []
         for target in self._services.values():
             aliases = [target.name, *(target.spec.get("aliases") or [])]
@@ -943,39 +1000,131 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             if not target.internal_address:
                 continue
             entries.append(f"{target.internal_address} {' '.join(aliases)}")
-        block = "\\n".join(entries)
+        block = "\n".join(entries)
         encoded = base64.b64encode(block.encode("utf-8")).decode("ascii")
         command = (
             "tmp=$(mktemp); "
             f"printf %s {shlex.quote(encoded)} | base64 -d >$tmp; "
             f"sed '/^{HOSTS_BLOCK_BEGIN}$/,/^{HOSTS_BLOCK_END}$/d' /etc/hosts >$tmp.hosts; "
-            f"{{ cat $tmp.hosts; printf '\\n{HOSTS_BLOCK_BEGIN}\\n'; cat $tmp; printf '{HOSTS_BLOCK_END}\\n'; }} >/etc/hosts; "
+            f"{{ cat $tmp.hosts; printf '{HOSTS_BLOCK_BEGIN}\\n'; cat $tmp; printf '\\n{HOSTS_BLOCK_END}\\n'; }} >/etc/hosts; "
             "rm -f $tmp $tmp.hosts"
         )
-        for runtime in self._services.values():
+        targets = runtimes if runtimes is not None else list(self._services.values())
+        for runtime in targets:
             result = await self._run_service_command(runtime, command, timeout_sec=60)
             if result.return_code != 0:
                 raise RuntimeError(f"failed to inject service aliases into {runtime.name!r}: {result.stderr or result.stdout}")
 
-    async def _wait_bundle_ready(self) -> None:
+    @staticmethod
+    def _service_healthcheck_command(runtime: ServiceRuntime) -> str | None:
+        contract = runtime.spec.get("runtime") or {}
+        readiness = contract.get("readiness") if isinstance(contract, dict) else None
+        if not isinstance(readiness, dict) or readiness.get("type") != "healthcheck":
+            return None
+        healthcheck = readiness.get("healthcheck")
+        if not isinstance(healthcheck, dict):
+            raise TypeError(f"OpenSandbox healthcheck readiness is invalid for {runtime.name!r}")
+        test = healthcheck.get("test")
+        if isinstance(test, list):
+            if test and test[0] == "CMD":
+                return " ".join(shlex.quote(str(item)) for item in test[1:])
+            return " ".join(str(item) for item in test[1:])
+        if isinstance(test, str):
+            return test
+        return None
+
+    def _service_start_order(self) -> list[ServiceRuntime]:
+        ordered: list[ServiceRuntime] = []
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(name: str) -> None:
+            if name in visited:
+                return
+            if name in visiting:
+                raise RuntimeError(
+                    f"OpenSandbox service dependencies contain a cycle at {name!r}"
+                )
+            runtime = self._services.get(name)
+            if runtime is None:
+                raise RuntimeError(f"OpenSandbox service dependency is missing: {name!r}")
+            dependencies = runtime.spec.get("depends_on") or {}
+            if not isinstance(dependencies, dict):
+                raise TypeError(f"OpenSandbox depends_on is invalid for {name!r}")
+            visiting.add(name)
+            for dependency_name, config in dependencies.items():
+                if not isinstance(config, dict):
+                    raise TypeError(
+                        "OpenSandbox dependency config is invalid: "
+                        f"{name!r} -> {dependency_name!r}"
+                    )
+                condition = str(config.get("condition") or "service_started")
+                if condition not in {"service_started", "service_healthy"}:
+                    raise RuntimeError(
+                        f"OpenSandbox dependency condition is unsupported: "
+                        f"{name!r} -> {dependency_name!r} uses {condition!r}"
+                    )
+                if not config.get("required", True):
+                    raise RuntimeError(
+                        f"OpenSandbox optional service dependency is unsupported: "
+                        f"{name!r} -> {dependency_name!r}"
+                    )
+                dependency = self._services.get(str(dependency_name))
+                if dependency is None:
+                    raise RuntimeError(
+                        f"OpenSandbox service dependency is missing: "
+                        f"{name!r} -> {dependency_name!r}"
+                    )
+                if (
+                    condition == "service_healthy"
+                    and self._service_healthcheck_command(dependency) is None
+                ):
+                    raise RuntimeError(
+                        f"OpenSandbox service_healthy dependency has no healthcheck: "
+                        f"{name!r} -> {dependency_name!r}"
+                    )
+                visit(str(dependency_name))
+            visiting.remove(name)
+            visited.add(name)
+            ordered.append(runtime)
+
+        for service_name in self._services:
+            visit(service_name)
+        return ordered
+
+    async def _wait_service_healthcheck(
+        self, runtime: ServiceRuntime, deadline: float
+    ) -> None:
+        command = self._service_healthcheck_command(runtime)
+        if command is None:
+            return
+        last_error = ""
+        while time.monotonic() < deadline:
+            result = await self._run_service_command(
+                runtime,
+                command,
+                timeout_sec=60,
+            )
+            if result.return_code == 0:
+                return
+            last_error = result.stderr or result.stdout
+            now = time.monotonic()
+            if now < deadline:
+                await asyncio.sleep(min(2, deadline - now))
+        raise RuntimeError(
+            f"OpenSandbox healthcheck failed for {runtime.name!r} "
+            f"within {self._ready_timeout_sec}s: {last_error}"
+        )
+
+    async def _wait_bundle_ready(
+        self, already_healthy: set[str] | None = None
+    ) -> None:
+        healthy = already_healthy or set()
+        healthcheck_deadline = time.monotonic() + self._ready_timeout_sec
         for runtime in self._services.values():
-            contract = runtime.spec.get("runtime") or {}
-            readiness = contract.get("readiness") if isinstance(contract, dict) else None
-            if not isinstance(readiness, dict) or readiness.get("type") != "healthcheck":
+            if runtime.name in healthy:
                 continue
-            healthcheck = readiness.get("healthcheck")
-            if not isinstance(healthcheck, dict):
-                raise TypeError(f"OpenSandbox healthcheck readiness is invalid for {runtime.name!r}")
-            test = healthcheck.get("test") if isinstance(healthcheck, dict) else None
-            if isinstance(test, list):
-                command = " ".join(shlex.quote(str(item)) for item in test[1:]) if test and test[0] == "CMD" else " ".join(str(item) for item in test[1:])
-            elif isinstance(test, str):
-                command = test
-            else:
-                continue
-            result = await self._run_service_command(runtime, command, timeout_sec=60)
-            if result.return_code != 0:
-                raise RuntimeError(f"OpenSandbox healthcheck failed for {runtime.name!r}: {result.stderr or result.stdout}")
+            await self._wait_service_healthcheck(runtime, healthcheck_deadline)
         # The runtime contract distinguishes address-discovery ports from
         # readiness.  Only an explicit TCP readiness declaration is probed;
         # merely exposing a port does not promise that the service is ready.
@@ -1021,8 +1170,20 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
     async def _start_composite(self) -> None:
         sandbox = self._sandbox_service
         assert sandbox is not None
-        created: dict[str, Any] = {}
-        for runtime in self._services.values():
+        start_order = self._service_start_order()
+        healthy: set[str] = set()
+        for runtime in start_order:
+            dependencies = runtime.spec.get("depends_on") or {}
+            for dependency_name, config in dependencies.items():
+                if (
+                    config.get("condition") == "service_healthy"
+                    and dependency_name not in healthy
+                ):
+                    await self._wait_service_healthcheck(
+                        self._services[dependency_name],
+                        time.monotonic() + self._ready_timeout_sec,
+                    )
+                    healthy.add(dependency_name)
             runtime.sandbox_name = self._make_service_sandbox_name(runtime.name)
             image_ref = self._service_image_source_ref(runtime)
             request: dict[str, Any] = {
@@ -1048,22 +1209,22 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             ports = self._service_ports(runtime.spec)
             if ports:
                 request["Ports"] = [sandbox.models.CreateSandboxReqPort(ContainerPort=port, Name=f"svc-{port}", Purpose=f"Harbor {runtime.name}") for port in ports]
-            created[runtime.name] = await asyncio.to_thread(sandbox.create_sandbox, None, sandbox.models.CreateSandboxReq(**request))
-            runtime.sandbox_id = str(getattr(created[runtime.name], "Id", "") or "")
+            created = await asyncio.to_thread(sandbox.create_sandbox, None, sandbox.models.CreateSandboxReq(**request))
+            runtime.sandbox_id = str(getattr(created, "Id", "") or "")
             if not runtime.sandbox_id:
                 raise RuntimeError(f"OpenSandbox create returned no sandbox ID for service {runtime.name!r}")
-        running = await asyncio.gather(*(self._wait_service_running(runtime, created[runtime.name]) for runtime in self._services.values()))
-        for runtime, current in zip(self._services.values(), running, strict=True):
+            current = await self._wait_service_running(runtime, created)
             _validate_sandbox_binding(current, self._environment_id, self._service_image_ref(runtime))
-            runtime.access_token = _access_token_of(created[runtime.name]) or _access_token_of(current)
+            runtime.access_token = _access_token_of(created) or _access_token_of(current)
             runtime.command_url = _command_url_of(current)
             if self._service_ports(runtime.spec):
                 runtime.internal_address = _internal_address_of(current)
             runtime.state = "WIRING"
             if not runtime.access_token:
                 raise RuntimeError(f"OpenSandbox service {runtime.name!r} returned no access token")
+            await self._wire_service_aliases([runtime])
         await self._wire_service_aliases()
-        await self._wait_bundle_ready()
+        await self._wait_bundle_ready(healthy)
         main = self._services[self._main_service]
         self._sandbox_id, self._sandbox_name = main.sandbox_id, main.sandbox_name
         self._access_token, self._command_url = main.access_token, main.command_url
@@ -1184,7 +1345,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             self.logger.info(
                 "YiCloud Sandbox cleanup requested sandbox_id=%s", sandbox_id
             )
-            deleted = await self._batch_delete_sandboxes({sandbox_id})
+            deleted = await self._delete_single_sandbox(sandbox_id)
             if deleted:
                 self.logger.info(
                     "YiCloud Sandbox cleanup confirmed sandbox_id=%s", sandbox_id

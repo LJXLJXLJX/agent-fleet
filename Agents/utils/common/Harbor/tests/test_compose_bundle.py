@@ -127,6 +127,47 @@ volumes:
         self.assertTrue(requirements["privileged"])
         self.assertIn("services.worker.privileged", requirements["unsupported_features"])
 
+    def test_bind_mounts_are_reported_as_unsupported(self) -> None:
+        compose = """
+services:
+  main:
+    build: .
+    volumes:
+      - ./cache:/cache
+      - type: bind
+        source: /host/data
+        target: /data
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            requirements = resolve_bundle_spec(
+                self.make_task(Path(tmp), compose)
+            ).requirements
+
+        self.assertIn(
+            "services.main.volumes.bind",
+            requirements["unsupported_features"],
+        )
+
+    def test_legacy_log_bind_mounts_remain_adapter_managed(self) -> None:
+        compose = """
+services:
+  main:
+    build: .
+    volumes:
+      - ${HOST_VERIFIER_LOGS_PATH}:${ENV_VERIFIER_LOGS_PATH}
+      - ${HOST_AGENT_LOGS_PATH}:${ENV_AGENT_LOGS_PATH}
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            requirements = resolve_bundle_spec(
+                self.make_task(Path(tmp), compose)
+            ).requirements
+
+        self.assertFalse(requirements["shared_volumes"])
+        self.assertNotIn(
+            "services.main.volumes.bind",
+            requirements["unsupported_features"],
+        )
+
     def test_rejects_build_context_escape(self) -> None:
         compose = """
 services:

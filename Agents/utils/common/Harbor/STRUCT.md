@@ -184,7 +184,7 @@ Typical dataset paths:
 | `YICLOUD_SANDBOX_CPU` | OpenSandbox request CPU flavor, default `2` to match the current prewarm pool |
 | `YICLOUD_SANDBOX_MEMORY` | OpenSandbox request memory flavor, default `8Gi` to match the current prewarm pool |
 | `YICLOUD_SANDBOX_LIFECYCLE_MINUTES` | Maximum OpenSandbox lifetime, default `120`; normal trials still delete on completion unless retention is enabled |
-| `YICLOUD_SANDBOX_READY_TIMEOUT_SEC` | YiCloud scheduling deadline before a dedicated ready-timeout error, default `300` |
+| `YICLOUD_SANDBOX_READY_TIMEOUT_SEC` | Overall timeout for YiCloud Sandbox scheduling and composite-service health/TCP readiness polling, default `300` |
 | `YICLOUD_SANDBOX_STATUS_LOG_INTERVAL_SEC` | Interval for Pending/state progress diagnostics, default `30` |
 | `YICLOUD_SANDBOX_RETAIN_ON_START_FAILURE` | Debug-only switch that skips automatic deletion after environment start failure, default `0` |
 | `YICLOUD_SANDBOX_RETAIN_AFTER_TRIAL` | Debug-only switch that retains a completed trial Sandbox until platform expiry, default `0` |

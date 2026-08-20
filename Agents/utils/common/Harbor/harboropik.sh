@@ -415,7 +415,6 @@ print(ref)
     --build-network "$HARBOR_OPENSANDBOX_BUILD_NETWORK"
     --bundle-manifest-output "$RUNTIME_DIR/opensandbox-bundle.json"
   )
-  if [[ "${HARBOR_FORCE_BUILD:-0}" == "1" || "${HARBOR_FORCE_BUILD:-0}" == "true" ]]; then
   if [[ "$YICLOUD_HARBOR_TLS_VERIFY" == "1" ]]; then
     manager_cmd+=( --registry-tls-verify )
   fi

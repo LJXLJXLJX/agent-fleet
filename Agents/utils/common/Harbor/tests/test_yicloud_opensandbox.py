@@ -2,6 +2,7 @@ import asyncio
 import base64
 import importlib.util
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -60,6 +61,27 @@ spec.loader.exec_module(yicloud_opensandbox)
 class Request:
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
+
+
+def make_healthcheck_environment(ready_timeout_sec: int):
+    instance = object.__new__(
+        yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+    )
+    runtime = yicloud_opensandbox.ServiceRuntime(
+        "worker",
+        {
+            "runtime": {
+                "readiness": {
+                    "type": "healthcheck",
+                    "healthcheck": {"test": "check-ready"},
+                }
+            }
+        },
+    )
+    instance._services = {runtime.name: runtime}
+    instance._main_service = runtime.name
+    instance._ready_timeout_sec = ready_timeout_sec
+    return instance
 
 
 class FakeSandbox:
@@ -154,6 +176,356 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         }
         self.assertEqual(start(spec), ["/usr/sbin/sshd", "-D"])
         self.assertEqual(ports(spec), [22])
+        with self.assertRaisesRegex(RuntimeError, "non-empty string list"):
+            start({"runtime": {"start_argv": []}})
+
+    def test_service_hosts_block_uses_real_newlines(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        main = yicloud_opensandbox.ServiceRuntime(
+            "main", {"aliases": ["api", "main"]}
+        )
+        worker = yicloud_opensandbox.ServiceRuntime(
+            "worker", {"aliases": ["database"]}
+        )
+        main.internal_address = "10.0.0.1"
+        worker.internal_address = "10.0.0.2"
+        instance._services = {"main": main, "worker": worker}
+        instance._run_service_command = AsyncMock(
+            return_value=SimpleNamespace(return_code=0, stdout="", stderr="")
+        )
+
+        asyncio.run(instance._wire_service_aliases())
+
+        command = instance._run_service_command.await_args_list[0].args[1]
+        encoded = command.split("printf %s ", 1)[1].split(" | base64", 1)[0]
+        block = base64.b64decode(encoded).decode("utf-8")
+        self.assertEqual(
+            block,
+            "10.0.0.1 main api\n10.0.0.2 worker database",
+        )
+        self.assertNotIn("\\n", block)
+        self.assertIn(
+            f"printf '\\n{yicloud_opensandbox.HOSTS_BLOCK_END}\\n'",
+            command,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            hosts_path = Path(tmp) / "hosts"
+            hosts_path.write_text("127.0.0.1 localhost\n", encoding="utf-8")
+            test_command = command.replace(
+                "/etc/hosts", shlex.quote(str(hosts_path))
+            )
+            rendered_hosts = []
+            for _ in range(2):
+                subprocess.run(
+                    ["sh", "-c", test_command],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                rendered_hosts.append(hosts_path.read_text(encoding="utf-8"))
+            self.assertEqual(rendered_hosts[0], rendered_hosts[1])
+            self.assertEqual(
+                rendered_hosts[-1],
+                "127.0.0.1 localhost\n"
+                f"{yicloud_opensandbox.HOSTS_BLOCK_BEGIN}\n"
+                "10.0.0.1 main api\n"
+                "10.0.0.2 worker database\n"
+                f"{yicloud_opensandbox.HOSTS_BLOCK_END}\n",
+            )
+
+    def test_bundle_healthcheck_retries_until_success(self) -> None:
+        instance = make_healthcheck_environment(300)
+        instance._run_service_command = AsyncMock(
+            side_effect=[
+                SimpleNamespace(return_code=1, stdout="", stderr="starting"),
+                SimpleNamespace(return_code=0, stdout="ready", stderr=""),
+            ]
+        )
+        sleep = AsyncMock()
+
+        with patch.object(yicloud_opensandbox.asyncio, "sleep", sleep):
+            asyncio.run(instance._wait_bundle_ready())
+
+        self.assertEqual(instance._run_service_command.await_count, 2)
+        sleep.assert_awaited_once_with(2)
+
+    def test_bundle_healthcheck_respects_global_ready_deadline(self) -> None:
+        instance = make_healthcheck_environment(3)
+        instance._run_service_command = AsyncMock(
+            return_value=SimpleNamespace(return_code=1, stdout="", stderr="")
+        )
+        clock = SimpleNamespace(value=0.0)
+
+        async def advance(seconds: float) -> None:
+            clock.value += seconds
+
+        fake_time = SimpleNamespace(monotonic=lambda: clock.value)
+        with (
+            patch.object(yicloud_opensandbox, "time", fake_time),
+            patch.object(
+                yicloud_opensandbox.asyncio,
+                "sleep",
+                side_effect=advance,
+            ) as sleep,
+            self.assertRaisesRegex(RuntimeError, "failed.*within 3s"),
+        ):
+            asyncio.run(instance._wait_bundle_ready())
+
+        self.assertEqual(
+            instance._run_service_command.await_count,
+            2,
+        )
+        self.assertEqual(
+            [item.args[0] for item in sleep.await_args_list],
+            [2, 1.0],
+        )
+
+    def test_composite_starts_dependency_before_dependent_health_gate(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        events = []
+        worker = yicloud_opensandbox.ServiceRuntime(
+            "worker",
+            {
+                "image": {"digest_ref": "seta/973@sha256:" + "b" * 64},
+                "depends_on": {},
+                "runtime": {
+                    "start_argv": ["worker"],
+                    "internal_ports": [
+                        {"port": 8080, "protocol": "tcp"}
+                    ],
+                    "readiness": {
+                        "type": "healthcheck",
+                        "healthcheck": {"test": "check-worker"},
+                    },
+                },
+            },
+        )
+        main = yicloud_opensandbox.ServiceRuntime(
+            "main",
+            {
+                "image": {"digest_ref": "seta/973@sha256:" + "a" * 64},
+                "depends_on": {
+                    "worker": {
+                        "condition": "service_healthy",
+                        "required": True,
+                    }
+                },
+                "runtime": {
+                    "start_argv": ["main"],
+                    "internal_ports": [],
+                    "readiness": None,
+                },
+            },
+        )
+
+        def create_sandbox(_context, request):
+            service = request.Name.rsplit("-", 1)[-1]
+            events.append(f"create:{service}")
+            return SimpleNamespace(
+                Id=f"sbx-{service}", AccessToken=f"token-{service}"
+            )
+
+        async def wait_running(runtime, _created):
+            events.append(f"running:{runtime.name}")
+            port = 8080 if runtime.name == "worker" else 44772
+            return SimpleNamespace(
+                EnvironmentId="env-test",
+                Image=SimpleNamespace(
+                    Ref=instance._service_image_ref(runtime)
+                ),
+                Endpoints=SimpleNamespace(
+                    Endpoints={
+                        "exec": SimpleNamespace(
+                            ProxyUrl=(
+                                f"https://sandbox.example/{runtime.name}/ping"
+                            ),
+                            InternalUrl=f"tcp://10.0.0.2:{port}",
+                        )
+                    }
+                ),
+            )
+
+        async def run_service_command(runtime, command, **_kwargs):
+            events.append(f"health:{runtime.name}:{command}")
+            return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+        instance._services = {"main": main, "worker": worker}
+        instance._main_service = "main"
+        instance._sandbox_service = SimpleNamespace(
+            create_sandbox=create_sandbox,
+            models=SimpleNamespace(
+                CreateSandboxReq=Request,
+                CreateSandboxReqImageInput=Request,
+                CreateSandboxReqResources=Request,
+                CreateSandboxReqPort=Request,
+            ),
+        )
+        instance._project_name = "test-project"
+        instance._environment_id = "env-test"
+        instance._persistent_env = {}
+        instance._request_cpu = "2"
+        instance._request_memory = "8Gi"
+        instance._lifecycle_minutes = 120
+        instance._request_timeout_sec = 180
+        instance._ready_timeout_sec = 300
+        instance.session_id = "test-session"
+        instance._wait_service_running = wait_running
+        instance._wire_service_aliases = AsyncMock()
+        instance._run_service_command = AsyncMock(
+            side_effect=run_service_command
+        )
+
+        asyncio.run(instance._start_composite())
+
+        self.assertEqual(
+            events,
+            [
+                "create:worker",
+                "running:worker",
+                "health:worker:check-worker",
+                "create:main",
+                "running:main",
+            ],
+        )
+        self.assertEqual(instance._sandbox_id, "sbx-main")
+        self.assertEqual(main.state, "READY")
+        self.assertEqual(worker.state, "READY")
+
+    def test_composite_rejects_unsupported_dependency_before_create(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._services = {
+            "main": yicloud_opensandbox.ServiceRuntime(
+                "main",
+                {
+                    "depends_on": {
+                        "worker": {
+                            "condition": "service_completed_successfully",
+                            "required": True,
+                        }
+                    }
+                },
+            ),
+            "worker": yicloud_opensandbox.ServiceRuntime(
+                "worker", {"depends_on": {}}
+            ),
+        }
+        create_sandbox = Mock()
+        instance._sandbox_service = SimpleNamespace(
+            create_sandbox=create_sandbox
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "dependency condition is unsupported"
+        ):
+            asyncio.run(instance._start_composite())
+
+        create_sandbox.assert_not_called()
+
+    def test_stop_service_deletes_sidecar_and_invalidates_connection(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        runtime = yicloud_opensandbox.ServiceRuntime("worker", {})
+        runtime.sandbox_id = "sbx-worker"
+        runtime.command_url = "https://sandbox.example/command"
+        runtime.access_token = "sandbox-token"
+        runtime.internal_address = "10.0.0.2"
+        runtime.state = "READY"
+        instance._services = {"worker": runtime}
+        instance._main_service = "main"
+        instance._cleanup_wait_sec = 30
+        instance.logger = Mock()
+        instance._delete_single_sandbox = AsyncMock(return_value=True)
+
+        asyncio.run(instance.stop_service("worker"))
+
+        instance._delete_single_sandbox.assert_awaited_once_with("sbx-worker")
+        self.assertEqual(runtime.state, "DELETED")
+        self.assertEqual(runtime.sandbox_id, "")
+        self.assertEqual(runtime.command_url, "")
+        self.assertEqual(runtime.access_token, "")
+        self.assertEqual(runtime.internal_address, "")
+
+    def test_stop_service_preserves_id_when_deletion_is_unconfirmed(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        runtime = yicloud_opensandbox.ServiceRuntime("worker", {})
+        runtime.sandbox_id = "sbx-worker"
+        runtime.command_url = "https://sandbox.example/command"
+        runtime.access_token = "sandbox-token"
+        runtime.internal_address = "10.0.0.2"
+        runtime.state = "READY"
+        instance._services = {"worker": runtime}
+        instance._main_service = "main"
+        instance._cleanup_wait_sec = 30
+        instance.logger = Mock()
+        instance._delete_single_sandbox = AsyncMock(return_value=False)
+
+        asyncio.run(instance.stop_service("worker"))
+
+        self.assertEqual(runtime.state, "DELETE_UNCONFIRMED")
+        self.assertEqual(runtime.sandbox_id, "sbx-worker")
+        self.assertEqual(runtime.command_url, "")
+        self.assertEqual(runtime.access_token, "")
+        self.assertEqual(runtime.internal_address, "")
+        instance.logger.warning.assert_called_once()
+
+    def test_single_sandbox_delete_uses_dedicated_provider_api(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        delete_sandbox = Mock()
+        instance._sandbox_service = SimpleNamespace(
+            delete_sandbox=delete_sandbox,
+            models=SimpleNamespace(DeleteSandboxReq=Request),
+        )
+        instance._project_name = "test-project"
+        instance._wait_for_sandbox_ids_absent = AsyncMock(return_value=True)
+
+        deleted = asyncio.run(instance._delete_single_sandbox("sbx-worker"))
+
+        self.assertTrue(deleted)
+        delete_sandbox.assert_called_once()
+        request = delete_sandbox.call_args.args[1]
+        self.assertEqual(request.ProjectName, "test-project")
+        self.assertEqual(request.SandboxId, "sbx-worker")
+        instance._wait_for_sandbox_ids_absent.assert_awaited_once_with(
+            {"sbx-worker"}
+        )
+
+    def test_service_group_uses_batch_only_for_multiple_ids(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        main = yicloud_opensandbox.ServiceRuntime("main", {})
+        worker = yicloud_opensandbox.ServiceRuntime("worker", {})
+        main.sandbox_id = "sbx-main"
+        worker.sandbox_id = "sbx-worker"
+        instance._services = {"main": main, "worker": worker}
+        instance._delete_single_sandbox = AsyncMock(return_value=True)
+        instance._batch_delete_sandboxes = AsyncMock(return_value=True)
+        instance._detach_sandbox = Mock()
+
+        asyncio.run(instance._delete_service_group())
+
+        instance._batch_delete_sandboxes.assert_awaited_once_with(
+            {"sbx-main", "sbx-worker"}
+        )
+        instance._delete_single_sandbox.assert_not_awaited()
+
+        worker.sandbox_id = ""
+        instance._batch_delete_sandboxes.reset_mock()
+        asyncio.run(instance._delete_service_group())
+
+        instance._delete_single_sandbox.assert_awaited_once_with("sbx-main")
+        instance._batch_delete_sandboxes.assert_not_awaited()
 
     def test_yicloud_image_ref_strips_only_registry_host(self) -> None:
         digest = "sha256:" + "a" * 64

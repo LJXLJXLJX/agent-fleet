@@ -540,6 +540,23 @@ def _volume_source(raw: Any) -> str | None:
     return None
 
 
+_LEGACY_LOG_BIND_MOUNTS = {
+    f"${{HOST_{name}_PATH}}:${{ENV_{name}_PATH}}"
+    for name in ("AGENT_LOGS", "ARTIFACTS", "VERIFIER_LOGS")
+}
+
+
+def _unsupported_bind_mount(raw: Any) -> bool:
+    if isinstance(raw, str):
+        source, separator, _target = raw.partition(":")
+        return bool(
+            separator
+            and source.startswith(("/", ".", "~", "${"))
+            and raw not in _LEGACY_LOG_BIND_MOUNTS
+        )
+    return isinstance(raw, dict) and raw.get("type", "volume") == "bind"
+
+
 def _requirements(
     services: dict[str, ServiceSpec], compose: dict[str, Any]
 ) -> dict[str, Any]:
@@ -578,6 +595,8 @@ def _requirements(
             unsupported.append(field)
     for service in services.values():
         unsupported.extend(service.unsupported_fields)
+        if any(_unsupported_bind_mount(volume) for volume in service.volumes):
+            unsupported.append(f"services.{service.name}.volumes.bind")
         if service.privileged:
             unsupported.append(f"services.{service.name}.privileged")
 

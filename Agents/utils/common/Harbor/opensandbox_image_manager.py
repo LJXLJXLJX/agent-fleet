@@ -121,6 +121,7 @@ OPENSANDBOX_ADAPTER_METADATA: dict[str, dict[str, dict[str, dict[str, object]]]]
         }
     }
 }
+LEGACY_DOCKERFILE_KEEPALIVE = ["sh", "-c", "while :; do sleep 60; done"]
 
 
 def log(message: str) -> None:
@@ -926,11 +927,14 @@ def normalize_oci_image_config(raw: object) -> dict[str, object]:
     healthcheck = config.get("Healthcheck")
     if healthcheck is not None and not isinstance(healthcheck, dict):
         raise RuntimeError("OCI image config Healthcheck must be an object or null")
+    normalized_healthcheck = dict(healthcheck) if healthcheck is not None else None
+    if normalized_healthcheck is not None and "Test" in normalized_healthcheck:
+        normalized_healthcheck["test"] = normalized_healthcheck.pop("Test")
     return {
         "entrypoint": _string_argv(config.get("Entrypoint"), label="Entrypoint"),
         "cmd": _string_argv(config.get("Cmd"), label="Cmd"),
         "exposed_ports": _oci_port_entries(config.get("ExposedPorts")),
-        "healthcheck": dict(healthcheck) if healthcheck is not None else None,
+        "healthcheck": normalized_healthcheck,
     }
 
 
@@ -980,6 +984,7 @@ def _compose_runtime(
     benchmark: str,
     task_identity: str,
     image_config_resolved: bool = True,
+    legacy_dockerfile_keepalive: bool = False,
 ) -> dict[str, object]:
     """Materialize OCI defaults and Compose overrides for one provider run."""
     image_entrypoint = image_config.get("entrypoint")
@@ -1013,6 +1018,9 @@ def _compose_runtime(
     start_argv = [*effective_entrypoint, *effective_command]
     sources = [source for source in (entrypoint_source, command_source) if source]
     start_source = "+".join(sources) if sources else None
+    if not start_argv and legacy_dockerfile_keepalive:
+        start_argv = list(LEGACY_DOCKERFILE_KEEPALIVE)
+        start_source = "adapter.legacy-keepalive"
 
     ports: list[dict[str, object]] = []
     seen_ports: set[tuple[int, str]] = set()
@@ -1325,6 +1333,7 @@ def _service_manifest(
     *,
     benchmark: str,
     task_identity: str,
+    definition_kind: str,
 ) -> dict[str, object]:
     build: dict[str, object] | None = None
     if service.build is not None:
@@ -1370,6 +1379,7 @@ def _service_manifest(
             benchmark=benchmark,
             task_identity=task_identity,
             image_config_resolved=bool(artifact.get("config_resolved", True)),
+            legacy_dockerfile_keepalive=definition_kind == "dockerfile",
         ),
     }
 
@@ -1454,6 +1464,7 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
             bundle.environment_dir,
             benchmark=args.benchmark_name or args.project,
             task_identity=bundle.task_identity,
+            definition_kind=bundle.definition_kind,
         )
         for name in sorted(bundle.services)
     }

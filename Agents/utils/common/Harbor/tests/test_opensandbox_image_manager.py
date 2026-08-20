@@ -24,6 +24,7 @@ from opensandbox_image_manager import (  # noqa: E402
     SkopeoPublisher,
     SourcePolicy,
     _compose_runtime,
+    _service_manifest,
     apt_404_requires_cache_refresh,
     environment_content_hash,
     normalize_oci_image_config,
@@ -144,7 +145,7 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
             (environment / "payload.txt").write_text("changed", encoding="utf-8")
             self.assertNotEqual(first, environment_content_hash(environment))
 
-    def test_oci_config_is_the_only_source_for_default_process_and_ports(self) -> None:
+    def test_oci_config_normalizes_process_ports_and_healthcheck(self) -> None:
         config = normalize_oci_image_config(
             {
                 "config": {
@@ -161,7 +162,7 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
             config["exposed_ports"],
             [{"port": 22, "protocol": "tcp"}, {"port": 8080, "protocol": "tcp"}],
         )
-        self.assertEqual(config["healthcheck"], {"Test": ["CMD", "true"]})
+        self.assertEqual(config["healthcheck"], {"test": ["CMD", "true"]})
 
     def test_task_973_runtime_uses_compose_command_and_oci_worker_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -210,6 +211,51 @@ services:
             [{"port": 22, "protocol": "tcp", "source": "image-config.exposed-ports"}],
         )
         self.assertEqual(worker["readiness"]["source"], "adapter-metadata:seta/973/worker")
+
+    def test_commandless_implicit_dockerfile_gets_legacy_keepalive_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task = self.make_task(Path(tmp), "commandless")
+            from compose_bundle import resolve_bundle_spec
+
+            bundle = resolve_bundle_spec(task)
+            service = bundle.services["main"]
+            artifact = {
+                "config": {
+                    "entrypoint": None,
+                    "cmd": None,
+                    "exposed_ports": [],
+                    "healthcheck": None,
+                },
+                "config_resolved": True,
+                "build_arg_names": [],
+            }
+            implicit = _service_manifest(
+                service,
+                artifact,
+                bundle.environment_dir,
+                benchmark="seta",
+                task_identity="commandless",
+                definition_kind="dockerfile",
+            )
+            explicit_compose = _service_manifest(
+                service,
+                artifact,
+                bundle.environment_dir,
+                benchmark="seta",
+                task_identity="commandless",
+                definition_kind="compose",
+            )
+
+        self.assertEqual(
+            implicit["runtime"]["start_argv"],
+            ["sh", "-c", "while :; do sleep 60; done"],
+        )
+        self.assertEqual(
+            implicit["runtime"]["start_argv_source"],
+            "adapter.legacy-keepalive",
+        )
+        self.assertEqual(explicit_compose["runtime"]["start_argv"], [])
+        self.assertIsNone(explicit_compose["runtime"]["start_argv_source"])
 
     def test_compose_dry_run_writes_versioned_bundle_and_keeps_main_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
