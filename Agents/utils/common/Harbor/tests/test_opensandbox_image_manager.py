@@ -212,6 +212,38 @@ services:
         )
         self.assertEqual(worker["readiness"]["source"], "adapter-metadata:seta/973/worker")
 
+    def test_compose_scalar_command_is_appended_as_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task = self.make_task(Path(tmp), "scalar-command")
+            (task / "environment" / "docker-compose.yaml").write_text(
+                "services:\n  main:\n    build: .\n    command: --message 'hello world'\n",
+                encoding="utf-8",
+            )
+            from compose_bundle import resolve_bundle_spec
+
+            service = resolve_bundle_spec(task).services["main"]
+
+        runtime = _compose_runtime(
+            service,
+            {
+                "entrypoint": ["python", "server.py"],
+                "cmd": ["--message", "default"],
+                "exposed_ports": [],
+                "healthcheck": None,
+            },
+            benchmark="seta",
+            task_identity="scalar-command",
+        )
+
+        self.assertEqual(
+            runtime["start_argv"],
+            ["python", "server.py", "--message", "hello world"],
+        )
+        self.assertEqual(
+            runtime["start_argv_source"],
+            "image-config.entrypoint+compose.command",
+        )
+
     def test_commandless_implicit_dockerfile_gets_legacy_keepalive_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             task = self.make_task(Path(tmp), "commandless")

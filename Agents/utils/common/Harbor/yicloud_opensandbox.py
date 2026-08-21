@@ -45,6 +45,7 @@ TERMINAL_FAILURE_STATES = {
 }
 HOSTS_BLOCK_BEGIN = "# HARBOR COMPOSE BEGIN"
 HOSTS_BLOCK_END = "# HARBOR COMPOSE END"
+COMPOSE_START_MARKER_PREFIX = "/tmp/.harbor-compose-start-"
 # The YiCloud gateway currently rejects multipart bodies around 1 MiB and
 # above. Base64 expands each chunk by 4/3, so 512 KiB leaves enough room for
 # multipart metadata while avoiding thousands of tiny requests.
@@ -837,34 +838,21 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
 
     def _service_entrypoint(self, runtime: ServiceRuntime) -> list[str] | None:
         start_command = self._service_start_command(runtime.spec)
-        dependencies = runtime.spec.get("depends_on") or {}
-        if start_command is None or not dependencies:
+        if len(self._services) <= 1:
             return start_command
-
-        entries: list[str] = []
-        for dependency_name in dependencies:
-            dependency = self._services[dependency_name]
-            if not dependency.internal_address:
-                raise RuntimeError(
-                    "OpenSandbox dependency has no internal address before "
-                    f"starting {runtime.name!r}: {dependency_name!r}"
-                )
-            aliases = [
-                dependency.name,
-                *(dependency.spec.get("aliases") or []),
-            ]
-            aliases = list(
-                dict.fromkeys(str(item) for item in aliases if str(item))
+        if start_command is None:
+            raise RuntimeError(
+                "OpenSandbox multi-service startup requires an explicit start command"
             )
-            entries.append(
-                f"{dependency.internal_address} {' '.join(aliases)}"
-            )
-
-        hosts_command = self._hosts_update_command(entries)
+        # Compose service discovery is independent of depends_on. Hold every
+        # process until the controller has addresses for all peer aliases.
+        marker = shlex.quote(
+            f"{COMPOSE_START_MARKER_PREFIX}{runtime.sandbox_name}"
+        )
         return [
             "sh",
             "-c",
-            f'set -e\n{hosts_command}\nexec "$@"',
+            f'set -e\nwhile [ ! -e {marker} ]; do sleep 1; done\nexec "$@"',
             "harbor-compose-entrypoint",
             *start_command,
         ]
@@ -1053,6 +1041,19 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             if result.return_code != 0:
                 raise RuntimeError(f"failed to inject service aliases into {runtime.name!r}: {result.stderr or result.stdout}")
 
+    async def _release_service_entrypoint(self, runtime: ServiceRuntime) -> None:
+        marker = shlex.quote(
+            f"{COMPOSE_START_MARKER_PREFIX}{runtime.sandbox_name}"
+        )
+        result = await self._run_service_command(
+            runtime, f"touch {marker}", timeout_sec=60
+        )
+        if result.return_code != 0:
+            raise RuntimeError(
+                f"failed to start OpenSandbox service {runtime.name!r}: "
+                f"{result.stderr or result.stdout}"
+            )
+
     @staticmethod
     def _service_healthcheck_command(runtime: ServiceRuntime) -> str | None:
         contract = runtime.spec.get("runtime") or {}
@@ -1211,17 +1212,6 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         start_order = self._service_start_order()
         healthy: set[str] = set()
         for runtime in start_order:
-            dependencies = runtime.spec.get("depends_on") or {}
-            for dependency_name, config in dependencies.items():
-                if (
-                    config.get("condition") == "service_healthy"
-                    and dependency_name not in healthy
-                ):
-                    await self._wait_service_healthcheck(
-                        self._services[dependency_name],
-                        time.monotonic() + self._ready_timeout_sec,
-                    )
-                    healthy.add(dependency_name)
             runtime.sandbox_name = self._make_service_sandbox_name(runtime.name)
             image_ref = self._service_image_source_ref(runtime)
             request: dict[str, Any] = {
@@ -1255,13 +1245,25 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             _validate_sandbox_binding(current, self._environment_id, self._service_image_ref(runtime))
             runtime.access_token = _access_token_of(created) or _access_token_of(current)
             runtime.command_url = _command_url_of(current)
-            if self._service_ports(runtime.spec):
-                runtime.internal_address = _internal_address_of(current)
+            runtime.internal_address = _internal_address_of(current)
             runtime.state = "WIRING"
             if not runtime.access_token:
                 raise RuntimeError(f"OpenSandbox service {runtime.name!r} returned no access token")
-            await self._wire_service_aliases([runtime])
         await self._wire_service_aliases()
+        for runtime in start_order:
+            dependencies = runtime.spec.get("depends_on") or {}
+            for dependency_name, config in dependencies.items():
+                if (
+                    config.get("condition") == "service_healthy"
+                    and dependency_name not in healthy
+                ):
+                    await self._wait_service_healthcheck(
+                        self._services[dependency_name],
+                        time.monotonic() + self._ready_timeout_sec,
+                    )
+                    healthy.add(dependency_name)
+            await self._release_service_entrypoint(runtime)
+            runtime.state = "STARTING"
         await self._wait_bundle_ready(healthy)
         main = self._services[self._main_service]
         self._sandbox_id, self._sandbox_name = main.sandbox_id, main.sandbox_name

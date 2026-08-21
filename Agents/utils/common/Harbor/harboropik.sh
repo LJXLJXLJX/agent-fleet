@@ -77,8 +77,7 @@ write_harbor_registry_summary() {
     "$job_dir" "$OUTPUT_PATH/summary.txt" "$exit_code" "$dataset"
 }
 
-if harbor_is_native_registry_main; then
-  mkdir -p "$(dirname "$HARBOR_JOB_DIR_FILE")"
+if harbor_publishes_job_dir; then
   : > "$HARBOR_JOB_DIR_FILE"
   rm -f "$HARBOR_BENCHMARK_EXIT_FILE"
   # BASHPID needs bash >= 4; at this top-level scope $$ is the same pid.

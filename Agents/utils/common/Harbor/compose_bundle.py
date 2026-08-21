@@ -37,6 +37,15 @@ except ModuleNotFoundError as exc:  # pragma: no cover - runner dependency guard
 BUNDLE_SCHEMA_VERSION = 2
 BUNDLE_FORMAT_VERSION = "harbor-environment-bundle-v2"
 COMPOSE_FILENAMES = ("docker-compose.yaml", "docker-compose.yml")
+COMPOSE_TOP_LEVEL_KEYS = {
+    "services",
+    "networks",
+    "volumes",
+    "configs",
+    "secrets",
+    "name",
+    "version",
+}
 BUILD_KEYS = {"context", "dockerfile", "args", "target"}
 SERVICE_KEYS = {
     "build",
@@ -644,6 +653,19 @@ def _load_compose(path: Path) -> dict[str, Any]:
     loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(loaded, dict):
         raise TypeError(f"Compose definition must be a map: {path}")
+    unsupported = sorted(
+        str(key)
+        for key in loaded
+        if not isinstance(key, str)
+        or (
+            key not in COMPOSE_TOP_LEVEL_KEYS
+            and not key.startswith("x-")
+        )
+    )
+    if unsupported:
+        raise ValueError(
+            "unsupported top-level Compose fields: " + ", ".join(unsupported)
+        )
     return loaded
 
 

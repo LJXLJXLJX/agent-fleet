@@ -53,6 +53,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -970,10 +971,10 @@ def _compose_argv(value: object, *, label: str) -> list[str]:
     if isinstance(value, list) and all(isinstance(item, str) for item in value):
         return list(value)
     if isinstance(value, str):
-        # The platform only accepts argv.  This matches the existing v1
-        # adapter behavior for Compose scalar commands without adding a
-        # supervisor or an unrelated keepalive process.
-        return ["sh", "-c", value]
+        try:
+            return shlex.split(value)
+        except ValueError as exc:
+            raise RuntimeError(f"invalid Compose {label}: {exc}") from exc
     raise RuntimeError(f"Compose {label} must be a string or string list")
 
 

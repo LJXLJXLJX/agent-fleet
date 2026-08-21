@@ -179,7 +179,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "non-empty string list"):
             start({"runtime": {"start_argv": []}})
 
-    def test_dependency_aliases_are_wired_before_entrypoint(self) -> None:
+    def test_all_composite_entrypoints_wait_for_alias_wiring(self) -> None:
         instance = object.__new__(
             yicloud_opensandbox.YiCloudOpenSandboxEnvironment
         )
@@ -191,48 +191,46 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
                 "runtime": {"start_argv": ["worker"]},
             },
         )
-        worker.internal_address = "10.0.0.2"
+        main = yicloud_opensandbox.ServiceRuntime(
+            "main",
+            {
+                "depends_on": {},
+                "runtime": {"start_argv": ["main"]},
+            },
+        )
+        main.sandbox_name = "test-main"
+        worker.sandbox_name = "test-worker"
+        instance._services = {"main": main, "worker": worker}
 
-        with tempfile.TemporaryDirectory() as tmp:
-            hosts_path = Path(tmp) / "hosts"
-            hosts_path.write_text("127.0.0.1 localhost\n", encoding="utf-8")
-            expected_entry = "10.0.0.2 worker database"
-            main = yicloud_opensandbox.ServiceRuntime(
-                "main",
-                {
-                    "depends_on": {
-                        "worker": {
-                            "condition": "service_started",
-                            "required": True,
-                        }
-                    },
-                    "runtime": {
-                        "start_argv": [
-                            "sh",
-                            "-c",
-                            "grep -Fqx "
-                            + shlex.quote(expected_entry)
-                            + " "
-                            + shlex.quote(str(hosts_path)),
-                        ]
-                    },
-                },
-            )
-            instance._services = {"main": main, "worker": worker}
-
-            entrypoint = instance._service_entrypoint(main)
+        for runtime in (main, worker):
+            entrypoint = instance._service_entrypoint(runtime)
             assert entrypoint is not None
-            entrypoint[2] = entrypoint[2].replace(
-                "/etc/hosts", shlex.quote(str(hosts_path))
-            )
-            subprocess.run(entrypoint, check=True, capture_output=True, text=True)
-
+            self.assertEqual(entrypoint[:2], ["sh", "-c"])
             self.assertIn(
-                f"{expected_entry}\n",
-                hosts_path.read_text(encoding="utf-8"),
+                yicloud_opensandbox.COMPOSE_START_MARKER_PREFIX
+                + runtime.sandbox_name,
+                entrypoint[2],
             )
+            self.assertIn('exec "$@"', entrypoint[2])
+            self.assertEqual(entrypoint[-1], runtime.name)
 
-        self.assertEqual(instance._service_entrypoint(worker), ["worker"])
+    def test_release_service_entrypoint_touches_its_marker(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        runtime = yicloud_opensandbox.ServiceRuntime("worker", {})
+        runtime.sandbox_name = "test-worker"
+        instance._run_service_command = AsyncMock(
+            return_value=SimpleNamespace(return_code=0, stdout="", stderr="")
+        )
+
+        asyncio.run(instance._release_service_entrypoint(runtime))
+
+        instance._run_service_command.assert_awaited_once_with(
+            runtime,
+            "touch /tmp/.harbor-compose-start-test-worker",
+            timeout_sec=60,
+        )
 
     def test_service_hosts_block_uses_real_newlines(self) -> None:
         instance = object.__new__(
@@ -431,7 +429,15 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         instance._ready_timeout_sec = 300
         instance.session_id = "test-session"
         instance._wait_service_running = wait_running
-        instance._wire_service_aliases = AsyncMock()
+
+        async def wire_aliases(*_args, **_kwargs):
+            events.append("wire:all")
+
+        async def release(runtime):
+            events.append(f"release:{runtime.name}")
+
+        instance._wire_service_aliases = AsyncMock(side_effect=wire_aliases)
+        instance._release_service_entrypoint = AsyncMock(side_effect=release)
         instance._run_service_command = AsyncMock(
             side_effect=run_service_command
         )
@@ -443,20 +449,23 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             [
                 "create:worker",
                 "running:worker",
-                "health:worker:check-worker",
                 "create:main",
                 "running:main",
+                "wire:all",
+                "release:worker",
+                "health:worker:check-worker",
+                "release:main",
             ],
         )
         self.assertEqual(instance._sandbox_id, "sbx-main")
         self.assertEqual(main.state, "READY")
         self.assertEqual(worker.state, "READY")
-        self.assertEqual(entrypoints["worker"], ["worker"])
+        self.assertEqual(entrypoints["worker"][-1], "worker")
         self.assertEqual(entrypoints["main"][-1], "main")
-        encoded = entrypoints["main"][2].split("printf %s ", 1)[1].split(
-            " | base64", 1
-        )[0]
-        self.assertEqual(base64.b64decode(encoded).decode("utf-8"), "10.0.0.2 worker")
+        self.assertIn(".harbor-compose-start-", entrypoints["worker"][2])
+        self.assertIn(".harbor-compose-start-", entrypoints["main"][2])
+        self.assertEqual(worker.internal_address, "10.0.0.2")
+        self.assertEqual(main.internal_address, "10.0.0.2")
 
     def test_composite_rejects_unsupported_dependency_before_create(self) -> None:
         instance = object.__new__(

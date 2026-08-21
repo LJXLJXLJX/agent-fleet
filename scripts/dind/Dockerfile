@@ -60,6 +60,7 @@ RUN set -eux; \
       pigz \
       procps \
       python3 \
+      skopeo \
       tar \
       tini \
       tmux \

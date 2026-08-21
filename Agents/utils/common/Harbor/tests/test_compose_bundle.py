@@ -227,6 +227,36 @@ services:
             with self.assertRaisesRegex(ValueError, "unsupported build fields"):
                 resolve_bundle_spec(task)
 
+    def test_rejects_unsupported_top_level_compose_fields(self) -> None:
+        compose = """
+include:
+  - worker.yaml
+services:
+  main:
+    build: .
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            task = self.make_task(Path(tmp), compose)
+            with self.assertRaisesRegex(
+                ValueError, "unsupported top-level Compose fields: include"
+            ):
+                resolve_bundle_spec(task)
+
+    def test_allows_top_level_metadata_and_extensions(self) -> None:
+        compose = """
+name: example
+version: "3.9"
+x-main: &main
+  build: .
+services:
+  main:
+    <<: *main
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = resolve_bundle_spec(self.make_task(Path(tmp), compose))
+
+        self.assertEqual(list(spec.services), ["main"])
+
     def test_surfaces_unhandled_runtime_fields_as_requirements(self) -> None:
         compose = """
 services:
