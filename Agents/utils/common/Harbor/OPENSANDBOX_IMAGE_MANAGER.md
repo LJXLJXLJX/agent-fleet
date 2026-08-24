@@ -180,6 +180,25 @@ build machines must use an internal Gateway domain or Service reachable from
 their BuildKit execution environment. Missing configuration and loopback with
 a non-host build network fail before the image build starts.
 
+This fallback is intentionally limited to
+`prebuild_opensandbox_dataset.sh`; it does not change other Harbor benchmark
+framework runs, package managers, or repository-wide defaults. Before a real
+OpenSandbox image prebuild batch, the script probes the Gateway `/healthz`.
+If it is unavailable, it preserves the previous source-rewrite behavior by
+selecting the first reachable trusted domestic root, in this default order:
+
+```bash
+HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACKS=https://mirrors.tuna.tsinghua.edu.cn,https://mirrors.aliyun.com
+HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC=5
+```
+
+Each task probes the Gateway again before build. If the Gateway becomes
+unavailable during a failed build, that task is retried once with the selected
+domestic root. A normal image-build failure while the Gateway remains healthy
+is not masked by this fallback. The fallback root is passed through the same
+`--apt-mirror` option, so Ubuntu, Debian, Debian Security, and Docker CE retain
+their existing path rewrite and `SourcePolicy.identity` changes.
+
 Package names do not select third-party sources. A future third-party rewrite
 must scan the current task Dockerfile and referenced scripts, then exactly
 match an `upstream_url` from `apt-gateway-plan.json`. In particular,

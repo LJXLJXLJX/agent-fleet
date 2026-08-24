@@ -14,6 +14,8 @@ HARBOR_OPENSANDBOX_IMAGE_PLATFORM="${HARBOR_OPENSANDBOX_IMAGE_PLATFORM:-linux/am
 HARBOR_OPENSANDBOX_PREBUILD_BUILD_TIMEOUT_SEC="${HARBOR_OPENSANDBOX_PREBUILD_BUILD_TIMEOUT_SEC:-7200}"
 HARBOR_OPENSANDBOX_DOCKERHUB_MIRROR_PREFIX="${HARBOR_OPENSANDBOX_DOCKERHUB_MIRROR_PREFIX:-m.daocloud.io/docker.io}"
 HARBOR_OPENSANDBOX_APT_MIRROR="${HARBOR_OPENSANDBOX_APT_MIRROR:-}"
+HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACKS="${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACKS:-https://mirrors.tuna.tsinghua.edu.cn,https://mirrors.aliyun.com}"
+HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC="${HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC:-5}"
 HARBOR_OPENSANDBOX_BUILD_ARGS_JSON="${HARBOR_OPENSANDBOX_BUILD_ARGS_JSON:-}"
 if [[ -z "${HARBOR_OPENSANDBOX_BUILD_ARGS_JSON}" ]]; then
   HARBOR_OPENSANDBOX_BUILD_ARGS_JSON='{}'
@@ -49,6 +51,47 @@ print_warning() {
   else
     printf '%s\n' "$*" >&2
   fi
+}
+
+apt_mirror_probe_url() {
+  local mirror="${1%/}"
+  case "${mirror}" in
+    */v1/cache) printf '%s/healthz\n' "${mirror%/v1/cache}" ;;
+    *) printf '%s/ubuntu/dists/jammy/InRelease\n' "${mirror}" ;;
+  esac
+}
+
+probe_apt_mirror() {
+  local mirror="$1"
+  curl --noproxy '*' --fail --silent --show-error \
+    --output /dev/null \
+    --max-time "${HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC}" \
+    "$(apt_mirror_probe_url "${mirror}")"
+}
+
+first_healthy_domestic_apt_mirror() {
+  local raw candidate
+  local -a configured=()
+  IFS=',' read -r -a configured <<< "${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACKS}"
+  for raw in "${configured[@]}"; do
+    candidate="${raw#"${raw%%[![:space:]]*}"}"
+    candidate="${candidate%"${candidate##*[![:space:]]}"}"
+    candidate="${candidate%/}"
+    [[ -n "${candidate}" ]] || continue
+    case "${candidate}" in
+      https://*) ;;
+      *)
+        print_warning "[WARN] ignoring non-HTTPS APT fallback mirror: ${candidate}"
+        continue
+        ;;
+    esac
+    if probe_apt_mirror "${candidate}"; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+    print_warning "[WARN] APT fallback mirror probe failed: ${candidate}"
+  done
+  return 1
 }
 
 [[ -n "${YICLOUD_HARBOR_PROJECT}" ]] || {
@@ -89,6 +132,12 @@ case "${HARBOR_OPENSANDBOX_PREBUILD_BUILD_TIMEOUT_SEC}" in
     exit 1
     ;;
 esac
+case "${HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC}" in
+  ''|*[!0-9]*|0)
+    print_error "[ERROR] HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC must be a positive integer"
+    exit 1
+    ;;
+esac
 case "${HARBOR_OPENSANDBOX_BUILD_USE_PROXY}" in
   0|1) ;;
   *) print_error "[ERROR] HARBOR_OPENSANDBOX_BUILD_USE_PROXY must be 0 or 1"; exit 1 ;;
@@ -126,6 +175,12 @@ command -v "${HARBOR_OPENSANDBOX_MANAGER_PYTHON}" >/dev/null 2>&1 || {
   print_error "[ERROR] Python not found: ${HARBOR_OPENSANDBOX_MANAGER_PYTHON}"
   exit 1
 }
+if [[ "${HARBOR_OPENSANDBOX_DRY_RUN}" != 1 ]]; then
+  command -v curl >/dev/null 2>&1 || {
+    print_error "[ERROR] curl is required to probe the APT Gateway and trusted fallbacks"
+    exit 1
+  }
+fi
 if [[ "${HARBOR_OPENSANDBOX_DRY_RUN}" != 1 ]] \
   && ! docker buildx version >/dev/null 2>&1; then
   print_error "[ERROR] docker buildx is required to prebuild benchmark task images."
@@ -151,6 +206,41 @@ if [[ "${HARBOR_OPENSANDBOX_DRY_RUN}" != 1 \
         ;;
     esac
   done
+fi
+
+HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY="${HARBOR_OPENSANDBOX_APT_MIRROR%/}"
+HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY_IS_GATEWAY=0
+HARBOR_OPENSANDBOX_APT_MIRROR_GATEWAY_HEALTH_URL=""
+case "${HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY}" in
+  */v1/cache)
+    HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY_IS_GATEWAY=1
+    HARBOR_OPENSANDBOX_APT_MIRROR_GATEWAY_HEALTH_URL="$(
+      apt_mirror_probe_url "${HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY}"
+    )"
+    ;;
+esac
+HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACK=""
+if [[ "${HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY_IS_GATEWAY}" == 1 \
+  && "${HARBOR_OPENSANDBOX_DRY_RUN}" != 1 ]]; then
+  HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACK="$(
+    first_healthy_domestic_apt_mirror || true
+  )"
+fi
+if [[ "${HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY_IS_GATEWAY}" == 1 \
+  && "${HARBOR_OPENSANDBOX_DRY_RUN}" != 1 ]]; then
+  if probe_apt_mirror "${HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY}"; then
+    printf '[prebuild] APT Gateway healthy; using %s\n' \
+      "${HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY}"
+  elif [[ -n "${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACK}" ]]; then
+    print_warning \
+      "[WARN] APT Gateway unavailable; falling back to trusted domestic mirror ${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACK}"
+    HARBOR_OPENSANDBOX_APT_MIRROR="${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACK}"
+  else
+    print_error "[ERROR] APT Gateway and all configured trusted domestic fallbacks are unavailable"
+    exit 1
+  fi
+else
+  HARBOR_OPENSANDBOX_APT_MIRROR="${HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY}"
 fi
 
 run_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -201,6 +291,11 @@ export HARBOR_OPENSANDBOX_IMAGE_PLATFORM
 export HARBOR_OPENSANDBOX_PREBUILD_BUILD_TIMEOUT_SEC
 export HARBOR_OPENSANDBOX_DOCKERHUB_MIRROR_PREFIX
 export HARBOR_OPENSANDBOX_APT_MIRROR
+export HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY
+export HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY_IS_GATEWAY
+export HARBOR_OPENSANDBOX_APT_MIRROR_GATEWAY_HEALTH_URL
+export HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACK
+export HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC
 export HARBOR_OPENSANDBOX_BUILD_ARGS_JSON
 export HARBOR_OPENSANDBOX_BUILD_USE_PROXY
 export HARBOR_OPENSANDBOX_BUILD_NETWORK
@@ -213,33 +308,64 @@ export run_dir
 set +e
 xargs -0 -r -P "${HARBOR_OPENSANDBOX_PREBUILD_CONCURRENCY}" -n 1 \
   bash -c '
+    set -uo pipefail
     task_dir="$1"
     task_name="$(basename "${task_dir}")"
-    command=(
-      "${HARBOR_OPENSANDBOX_MANAGER_PYTHON}"
-      "${HARBOR_OPENSANDBOX_IMAGE_MANAGER}"
-      --task-dir "${task_dir}"
-      --registry "${YICLOUD_HARBOR_HOST}"
-      --project "${YICLOUD_HARBOR_PROJECT}"
-      --benchmark-name "${BENCHMARK_NAME}"
-      --docker-config "${HARBOR_OPENSANDBOX_DOCKER_CONFIG}"
-      --cache-root "${HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT}"
-      --platform "${HARBOR_OPENSANDBOX_IMAGE_PLATFORM}"
-      --build-timeout-sec "${HARBOR_OPENSANDBOX_PREBUILD_BUILD_TIMEOUT_SEC}"
-      --tag-prefix "${BENCHMARK_NAME}"
-      --dockerhub-mirror-prefix "${HARBOR_OPENSANDBOX_DOCKERHUB_MIRROR_PREFIX}"
-      --apt-mirror "${HARBOR_OPENSANDBOX_APT_MIRROR}"
-      --build-args-json "${HARBOR_OPENSANDBOX_BUILD_ARGS_JSON}"
-      --build-network "${HARBOR_OPENSANDBOX_BUILD_NETWORK}"
-      --bundle-manifest-output "${run_dir}/bundles/${task_name}.json"
-      --retry-no-cache-on-apt-404
-    )
-    [[ "${YICLOUD_HARBOR_TLS_VERIFY}" == 1 ]] && command+=(--registry-tls-verify)
-    [[ "${HARBOR_OPENSANDBOX_BUILD_USE_PROXY}" == 1 ]] && command+=(--use-proxy)
-    [[ "${HARBOR_OPENSANDBOX_DRY_RUN}" == 1 ]] && command+=(--dry-run)
-    if image_ref="$("${command[@]}")"; then
+    gateway_healthy() {
+      [[ "${HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY_IS_GATEWAY}" == 1 ]] || return 0
+      curl --noproxy "*" --fail --silent --show-error --output /dev/null \
+        --max-time "${HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC}" \
+        "${HARBOR_OPENSANDBOX_APT_MIRROR_GATEWAY_HEALTH_URL}"
+    }
+    run_image_manager() {
+      local apt_mirror="$1"
+      local -a command=(
+        "${HARBOR_OPENSANDBOX_MANAGER_PYTHON}"
+        "${HARBOR_OPENSANDBOX_IMAGE_MANAGER}"
+        --task-dir "${task_dir}"
+        --registry "${YICLOUD_HARBOR_HOST}"
+        --project "${YICLOUD_HARBOR_PROJECT}"
+        --benchmark-name "${BENCHMARK_NAME}"
+        --docker-config "${HARBOR_OPENSANDBOX_DOCKER_CONFIG}"
+        --cache-root "${HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT}"
+        --platform "${HARBOR_OPENSANDBOX_IMAGE_PLATFORM}"
+        --build-timeout-sec "${HARBOR_OPENSANDBOX_PREBUILD_BUILD_TIMEOUT_SEC}"
+        --tag-prefix "${BENCHMARK_NAME}"
+        --dockerhub-mirror-prefix "${HARBOR_OPENSANDBOX_DOCKERHUB_MIRROR_PREFIX}"
+        --apt-mirror "${apt_mirror}"
+        --build-args-json "${HARBOR_OPENSANDBOX_BUILD_ARGS_JSON}"
+        --build-network "${HARBOR_OPENSANDBOX_BUILD_NETWORK}"
+        --bundle-manifest-output "${run_dir}/bundles/${task_name}.json"
+        --retry-no-cache-on-apt-404
+      )
+      [[ "${YICLOUD_HARBOR_TLS_VERIFY}" == 1 ]] && command+=(--registry-tls-verify)
+      [[ "${HARBOR_OPENSANDBOX_BUILD_USE_PROXY}" == 1 ]] && command+=(--use-proxy)
+      [[ "${HARBOR_OPENSANDBOX_DRY_RUN}" == 1 ]] && command+=(--dry-run)
+      "${command[@]}"
+    }
+    task_apt_mirror="${HARBOR_OPENSANDBOX_APT_MIRROR}"
+    if [[ "${task_apt_mirror}" == "${HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY}" \
+      && -n "${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACK}" ]] \
+      && ! gateway_healthy; then
+      printf "[prebuild][warning] task=%s APT Gateway became unavailable; using %s\n" \
+        "${task_name}" "${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACK}" >&2
+      task_apt_mirror="${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACK}"
+    fi
+    if image_ref="$(run_image_manager "${task_apt_mirror}")"; then
       printf "[prebuild][ready] task=%s image_ref=%s bundle=%s\n" \
         "${task_name}" "${image_ref}" "${run_dir}/bundles/${task_name}.json"
+    elif [[ "${task_apt_mirror}" == "${HARBOR_OPENSANDBOX_APT_MIRROR_PRIMARY}" \
+      && -n "${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACK}" ]] \
+      && ! gateway_healthy; then
+      printf "[prebuild][warning] task=%s retrying once with trusted domestic APT mirror %s\n" \
+        "${task_name}" "${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACK}" >&2
+      if image_ref="$(run_image_manager "${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACK}")"; then
+        printf "[prebuild][ready] task=%s image_ref=%s bundle=%s fallback=domestic\n" \
+          "${task_name}" "${image_ref}" "${run_dir}/bundles/${task_name}.json"
+      else
+        printf "[prebuild][failed] task=%s after domestic fallback\n" "${task_name}" >&2
+        exit 1
+      fi
     else
       printf "[prebuild][failed] task=%s\n" "${task_name}" >&2
       exit 1

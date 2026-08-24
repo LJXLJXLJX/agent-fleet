@@ -56,6 +56,10 @@ YICLOUD_HARBOR_TLS_VERIFY=0
 # Internal artifact-cache-gateway root. Use loopback only for a same-host
 # Gateway with host-network image builds.
 HARBOR_OPENSANDBOX_APT_MIRROR=http://<INTERNAL_GATEWAY>/v1/cache
+# Used only by OpenSandbox dataset image prebuild when the Gateway health probe
+# fails. Ordered, comma-separated HTTPS roots; no package path suffix here.
+HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACKS=https://mirrors.tuna.tsinghua.edu.cn,https://mirrors.aliyun.com
+HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC=5
 
 YICLOUD_SANDBOX_UPLOAD_BACKEND=s3
 YICLOUD_SANDBOX_S3_CONFIG=/absolute/path/to/s3cfg
