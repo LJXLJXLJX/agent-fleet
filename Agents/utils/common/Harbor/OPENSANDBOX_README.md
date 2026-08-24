@@ -1,6 +1,7 @@
 # YiCloud OpenSandbox Quick Start
 
-This guide runs a local Harbor task in a YiCloud OpenSandbox instance. The
+This guide runs a local Harbor benchmark framework task in a YiCloud
+OpenSandbox instance. The
 runner builds or reuses the task image, uploads the agent runtime, executes the
 agent and verifier, collects the result, and deletes the instance.
 
@@ -8,7 +9,8 @@ agent and verifier, collects the result, and deletes the instance.
 
 - Run `./scripts/setup.sh` once from the repository root.
 - Install Docker with Buildx and log in to the target image registry.
-- Prepare a local Harbor dataset whose tasks contain a Dockerfile or the
+- Prepare a local Harbor benchmark framework dataset whose tasks contain a
+  Dockerfile or the
   supported Compose subset.
 - Obtain YiCloud API credentials, a project name, and an OpenSandbox
   environment ID.
@@ -47,9 +49,13 @@ YICLOUD_HARBOR_HOST=harbor.example.internal
 YICLOUD_HARBOR_PROJECT=seta
 YICLOUD_HARBOR_USERNAME=your-harbor-username
 YICLOUD_HARBOR_PASSWORD=your-harbor-password
-# Set to 1 after the host trusts Harbor's certificate. Current YiCloud ingress
+# Set to 1 after the host trusts the Harbor 镜像仓库 certificate. Current YiCloud ingress
 # is verified with 0.
 YICLOUD_HARBOR_TLS_VERIFY=0
+
+# Internal artifact-cache-gateway root. Use loopback only for a same-host
+# Gateway with host-network image builds.
+HARBOR_OPENSANDBOX_APT_MIRROR=http://<INTERNAL_GATEWAY>/v1/cache
 
 YICLOUD_SANDBOX_UPLOAD_BACKEND=s3
 YICLOUD_SANDBOX_S3_CONFIG=/absolute/path/to/s3cfg
@@ -114,5 +120,5 @@ prebuild report; unsupported runtime capabilities fail before creation.
   gateway is unreachable or rejected the request.
 
 See [task image management](OPENSANDBOX_IMAGE_MANAGER.md) for image naming,
-caching, and registry internals. See [Harbor structure](STRUCT.md) for the full
+caching, and registry internals. See [Harbor benchmark framework structure](STRUCT.md) for the full
 configuration reference.

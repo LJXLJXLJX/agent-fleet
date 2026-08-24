@@ -13,7 +13,7 @@ HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT="${HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT:-/dat
 HARBOR_OPENSANDBOX_IMAGE_PLATFORM="${HARBOR_OPENSANDBOX_IMAGE_PLATFORM:-linux/amd64}"
 HARBOR_OPENSANDBOX_PREBUILD_BUILD_TIMEOUT_SEC="${HARBOR_OPENSANDBOX_PREBUILD_BUILD_TIMEOUT_SEC:-7200}"
 HARBOR_OPENSANDBOX_DOCKERHUB_MIRROR_PREFIX="${HARBOR_OPENSANDBOX_DOCKERHUB_MIRROR_PREFIX:-m.daocloud.io/docker.io}"
-HARBOR_OPENSANDBOX_APT_MIRROR="${HARBOR_OPENSANDBOX_APT_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn}"
+HARBOR_OPENSANDBOX_APT_MIRROR="${HARBOR_OPENSANDBOX_APT_MIRROR:-}"
 HARBOR_OPENSANDBOX_BUILD_ARGS_JSON="${HARBOR_OPENSANDBOX_BUILD_ARGS_JSON:-}"
 if [[ -z "${HARBOR_OPENSANDBOX_BUILD_ARGS_JSON}" ]]; then
   HARBOR_OPENSANDBOX_BUILD_ARGS_JSON='{}'
@@ -53,6 +53,10 @@ print_warning() {
 
 [[ -n "${YICLOUD_HARBOR_PROJECT}" ]] || {
   print_error "[ERROR] set externally provisioned YICLOUD_HARBOR_PROJECT in config.local.env"
+  exit 1
+}
+[[ -n "${HARBOR_OPENSANDBOX_APT_MIRROR}" ]] || {
+  print_error "[ERROR] set HARBOR_OPENSANDBOX_APT_MIRROR to the internal artifact-cache-gateway root"
   exit 1
 }
 
@@ -96,6 +100,17 @@ esac
 case "${HARBOR_OPENSANDBOX_DRY_RUN}" in
   0|1) ;;
   *) print_error "[ERROR] HARBOR_OPENSANDBOX_DRY_RUN must be 0 or 1"; exit 1 ;;
+esac
+case "${HARBOR_OPENSANDBOX_APT_MIRROR}" in
+  http://127.0.0.1:*|http://127.0.0.1|https://127.0.0.1:*|https://127.0.0.1|\
+  http://localhost:*|http://localhost|https://localhost:*|https://localhost|\
+  http://\[::1\]:*|http://\[::1\]|https://\[::1\]:*|https://\[::1\])
+    if [[ "${HARBOR_OPENSANDBOX_BUILD_NETWORK}" != host ]]; then
+      print_error "[ERROR] loopback APT Gateway requires HARBOR_OPENSANDBOX_BUILD_NETWORK=host"
+      print_error "[ERROR] Otherwise use an internal Gateway address reachable by the build environment."
+      exit 1
+    fi
+    ;;
 esac
 
 DATASET_ROOT="$(cd "${DATASET_ROOT}" && pwd)"

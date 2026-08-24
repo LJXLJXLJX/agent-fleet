@@ -299,6 +299,30 @@ def rewrite_docker_ce_sources(source: str, apt_mirror: str) -> str:
     )
 
 
+def validate_apt_mirror(apt_mirror: str, build_network: str) -> str:
+    """Validate that the configured APT Gateway is reachable by BuildKit."""
+    normalized = apt_mirror.strip().rstrip("/")
+    if not normalized:
+        raise ValueError(
+            "--apt-mirror or HARBOR_OPENSANDBOX_APT_MIRROR must name the "
+            "internal artifact-cache-gateway root"
+        )
+    parsed = urlparse(normalized)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("--apt-mirror must be an absolute query-free HTTP(S) URL")
+    if parsed.hostname in {"127.0.0.1", "localhost", "::1"} and build_network != "host":
+        raise ValueError(
+            "loopback APT Gateway is unreachable from BuildKit without "
+            "--build-network=host; use a build-reachable internal Gateway instead"
+        )
+    return normalized
+
+
 def render_build_dockerfile(source: str, policy: SourcePolicy) -> str:
     output: list[str] = []
     aliases: set[str] = set()
@@ -1418,6 +1442,8 @@ def _bundle_identity(
 def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
     task_dir = resolve_task_dir(args.task_dir, args.dataset_root, args.include)
     bundle = resolve_bundle_spec(task_dir)
+    build_network = getattr(args, "build_network", "default")
+    args.apt_mirror = validate_apt_mirror(args.apt_mirror, build_network)
     policy = SourcePolicy(args.dockerhub_mirror_prefix, args.apt_mirror)
     explicit_build_args = parse_build_args(args.build_args_json)
     cache_root = args.cache_root.resolve()
@@ -1429,7 +1455,6 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
     publisher: SkopeoPublisher | None = None
     registry: RegistryClient | None = None
     proxy_args: dict[str, str] = {}
-    build_network = getattr(args, "build_network", "default")
     if not args.dry_run:
         username, password = registry_credentials(args.docker_config, args.registry)
         publisher = SkopeoPublisher(
@@ -1593,8 +1618,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--apt-mirror",
-        default=os.environ.get(
-            "HARBOR_OPENSANDBOX_APT_MIRROR", "http://mirrors.tuna.tsinghua.edu.cn"
+        default=os.environ.get("HARBOR_OPENSANDBOX_APT_MIRROR", ""),
+        help=(
+            "internal artifact-cache-gateway root, for example "
+            "http://<INTERNAL_GATEWAY>/v1/cache"
         ),
     )
     parser.add_argument(

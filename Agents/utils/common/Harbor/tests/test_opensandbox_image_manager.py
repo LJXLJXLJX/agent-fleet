@@ -36,6 +36,7 @@ from opensandbox_image_manager import (  # noqa: E402
     render_build_dockerfile,
     run_build,
     schema2_manifest,
+    validate_apt_mirror,
 )
 
 
@@ -106,6 +107,19 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
 
         self.assertEqual(proxy_args["HTTPS_PROXY"], "http://127.0.0.1:7890")
         self.assertEqual(proxy_args["https_proxy"], "http://127.0.0.1:7890")
+
+    def test_loopback_apt_gateway_requires_host_build_network(self) -> None:
+        gateway = "http://127.0.0.1:8080/v1/cache/"
+        with self.assertRaisesRegex(ValueError, "build-network=host"):
+            validate_apt_mirror(gateway, "default")
+        self.assertEqual(
+            validate_apt_mirror(gateway, "host"),
+            "http://127.0.0.1:8080/v1/cache",
+        )
+
+    def test_apt_gateway_must_be_explicit(self) -> None:
+        with self.assertRaisesRegex(ValueError, "HARBOR_OPENSANDBOX_APT_MIRROR"):
+            validate_apt_mirror("", "host")
 
     def test_configured_proxy_takes_precedence_over_shell_proxy(self) -> None:
         with patch.dict(
@@ -373,6 +387,47 @@ networks:
         )
         self.assertNotIn("download.docker.com", rendered)
         self.assertEqual(rendered.count("RUN set -eu;"), 1)
+
+    def test_render_routes_ubuntu_and_docker_ce_through_gateway(self) -> None:
+        gateway = "http://127.0.0.1:8080/v1/cache"
+        rendered = render_build_dockerfile(
+            (
+                "FROM ubuntu:22.04\n"
+                "RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg\n"
+                "RUN echo 'deb https://download.docker.com/linux/ubuntu jammy stable' "
+                "> /etc/apt/sources.list.d/docker.list\n"
+            ),
+            SourcePolicy("m.daocloud.io/docker.io", gateway),
+        )
+
+        self.assertIn(f"{gateway}/ubuntu/", rendered)
+        self.assertIn(f"{gateway}/docker-ce/linux/ubuntu/gpg", rendered)
+        self.assertIn(f"{gateway}/docker-ce/linux/ubuntu jammy stable", rendered)
+        self.assertNotIn("download.docker.com", rendered)
+
+    def test_render_routes_debian_and_security_through_gateway(self) -> None:
+        gateway = "http://gateway.internal/v1/cache"
+        rendered = render_build_dockerfile(
+            (
+                "FROM debian:bookworm\n"
+                "RUN curl -fsSL https://download.docker.com/linux/debian/gpg\n"
+            ),
+            SourcePolicy("m.daocloud.io/docker.io", gateway),
+        )
+
+        self.assertIn(f"{gateway}/debian/", rendered)
+        self.assertIn(f"{gateway}/debian-security/", rendered)
+        self.assertIn(f"{gateway}/docker-ce/linux/debian/gpg", rendered)
+        self.assertNotIn("download.docker.com", rendered)
+
+    def test_source_policy_identity_changes_with_gateway_root(self) -> None:
+        first = SourcePolicy(
+            "m.daocloud.io/docker.io", "http://gateway-a/v1/cache"
+        )
+        second = SourcePolicy(
+            "m.daocloud.io/docker.io", "http://gateway-b/v1/cache"
+        )
+        self.assertNotEqual(first.identity, second.identity)
 
     def test_render_preserves_debian_security_repository_path(self) -> None:
         rendered = render_build_dockerfile(

@@ -2,7 +2,8 @@
 
 ## Summary
 
-The image layer represents every local Harbor task as a versioned Bundle:
+The image layer represents every local Harbor benchmark framework task as a
+versioned Bundle:
 
 - `compose_bundle.py` normalizes a single Dockerfile into an implicit `main`
   service, or parses a Compose definition into named services and topology;
@@ -19,7 +20,7 @@ service dependencies. Those operations belong to the Environment runtime.
 
 ```mermaid
 graph TD
-    A["Harbor task<br/>Dockerfile or Compose"] --> B["resolve BundleSpec"]
+    A["Harbor benchmark task<br/>Dockerfile or Compose"] --> B["resolve BundleSpec"]
     B --> C["named services + main + topology requirements"]
     C --> D{"service source"}
     D -- build --> E["hash context, Dockerfile, target,<br/>args, platform and source policy"]
@@ -81,7 +82,7 @@ For an `image:` service, the source manifest body digest replaces the build
 input hash. The image is republished through the managed Registry flow so that
 OpenSandbox receives the materialized image's digest ref.
 
-New Harbor addressing is explicit:
+Harbor 镜像仓库 addressing is explicit:
 
 ```text
 Project = benchmark
@@ -94,7 +95,7 @@ The `input_hash` is a full SHA-256 calculated before build and the Registry
 `artifact_digest` is collected by an independent `skopeo inspect` after copy.
 The cache authority is the target task repository, not a local record. Equal
 service image inputs in one Bundle create a service-tag alias for the same
-artifact. The manager does not implement Harbor Project management, raw blob
+artifact. The manager does not implement Registry Project management, raw blob
 upload, an old-Registry fallback, or a cross-repository layer index.
 
 The current context hash is conservative: generated cache files are ignored,
@@ -158,13 +159,42 @@ HARBOR_OPENSANDBOX_IMAGE_REF=<main digest_ref>
 An explicitly supplied Bundle takes precedence and can supply the main ref. An
 explicit image ref without a Bundle retains the old single-image behavior.
 
+## Unified APT Gateway
+
+Task image builds require one explicitly configured APT Gateway root:
+
+```bash
+HARBOR_OPENSANDBOX_APT_MIRROR=http://<INTERNAL_GATEWAY>/v1/cache
+```
+
+The image manager appends the allowlisted source name to that root. Ubuntu,
+Debian, Debian Security, and Docker CE therefore resolve through
+`/v1/cache/ubuntu/`, `/v1/cache/debian/`, `/v1/cache/debian-security/`, and
+`/v1/cache/docker-ce/`. The root is part of `SourcePolicy.identity`, so changing
+the Gateway invalidates the previous task-image build identity.
+
+A loopback Gateway such as `http://127.0.0.1:8080/v1/cache` is accepted only
+with `HARBOR_OPENSANDBOX_BUILD_NETWORK=host`. It is suitable for a Gateway on
+the same development machine, but it is not a shared YiCloud endpoint. Other
+build machines must use an internal Gateway domain or Service reachable from
+their BuildKit execution environment. Missing configuration and loopback with
+a non-host build network fail before the image build starts.
+
+Package names do not select third-party sources. A future third-party rewrite
+must scan the current task Dockerfile and referenced scripts, then exactly
+match an `upstream_url` from `apt-gateway-plan.json`. In particular,
+`packages_in_same_tasks` and the report's limited `examples` are context only;
+NodeSource `setup_18.x` requires a semantic rewrite because the script writes
+its own repository URL.
+
 ## Current boundary
 
 - Image preparation and Bundle handoff are implemented for local tasks.
 - `YiCloudOpenSandboxEnvironment` consumes schema v2 (and reads schema v1 for
   migration): it gates unsupported capabilities before creation, creates the
   service group, wires a managed `/etc/hosts` block, checks healthchecks, and
-  routes Harbor's default file and exec operations to `main`.
+  routes the Harbor benchmark framework's default file and exec operations to
+  `main`.
 - `service_exec(name, ...)` and `stop_service(name)` target an explicit
   sidecar. Group startup failure and `stop(delete=True)` clean up all recorded
   Sandbox IDs.
@@ -172,7 +202,7 @@ explicit image ref without a Bundle retains the old single-image behavior.
   Compose implementation. Compose merge, profiles, configs, secrets, and other
   unlisted semantics must be added or rejected explicitly before relying on
   them.
-- Configured domestic Docker and APT mirrors are preferred. Proxy build args
-  are forwarded only when explicitly enabled.
+- The configured Docker mirror and unified APT Gateway are part of the source
+  policy. Proxy build args are forwarded only when explicitly enabled.
 - `--force` bypasses the target-tag cache lookup; it does not change the
   deterministic tag or the image content identity.
