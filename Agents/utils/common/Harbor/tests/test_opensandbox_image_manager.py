@@ -22,7 +22,6 @@ from opensandbox_image_manager import (  # noqa: E402
     OCI_LAYER_GZIP,
     RegistryTarget,
     SkopeoPublisher,
-    SourcePolicy,
     _compose_runtime,
     _service_manifest,
     apt_404_requires_cache_refresh,
@@ -93,6 +92,19 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
 
         self.assertTrue(args.use_proxy)
         self.assertEqual(args.build_network, "host")
+        self.assertEqual(
+            args.apt_mirror, "http://mirrors.tuna.tsinghua.edu.cn"
+        )
+        self.assertEqual(
+            args.pip_index_url, "https://pypi.tuna.tsinghua.edu.cn/simple"
+        )
+        self.assertEqual(args.npm_registry, "https://registry.npmmirror.com")
+        self.assertEqual(args.goproxy, "https://goproxy.cn,direct")
+        self.assertEqual(args.gosumdb, "sum.golang.google.cn")
+        self.assertEqual(
+            args.cargo_registry_url,
+            "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/",
+        )
 
     def test_loopback_proxy_requires_host_build_network(self) -> None:
         with patch.dict(
@@ -358,10 +370,12 @@ networks:
                 "RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg\n"
                 "FROM builder\n"
             ),
-            SourcePolicy(
-                "m.daocloud.io/docker.io",
-                "https://mirrors.tuna.tsinghua.edu.cn",
-            ),
+            dockerhub_mirror_prefix="m.daocloud.io/docker.io",
+            apt_mirror="https://mirrors.tuna.tsinghua.edu.cn",
+            package_build_args={
+                "NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com",
+                "PIP_INDEX_URL": "https://pypi.tuna.tsinghua.edu.cn/simple",
+            },
         )
         self.assertIn("FROM m.daocloud.io/docker.io/library/ubuntu:24.04 AS builder", rendered)
         self.assertIn("mirrors.tuna.tsinghua.edu.cn/ubuntu/", rendered)
@@ -373,14 +387,14 @@ networks:
         )
         self.assertNotIn("download.docker.com", rendered)
         self.assertEqual(rendered.count("RUN set -eu;"), 1)
+        self.assertIn("ARG NPM_CONFIG_REGISTRY", rendered)
+        self.assertIn("ARG PIP_INDEX_URL", rendered)
 
     def test_render_preserves_debian_security_repository_path(self) -> None:
         rendered = render_build_dockerfile(
             "FROM python:3.13-slim-bookworm\n",
-            SourcePolicy(
-                "m.daocloud.io/docker.io",
-                "http://mirrors.tuna.tsinghua.edu.cn",
-            ),
+            dockerhub_mirror_prefix="m.daocloud.io/docker.io",
+            apt_mirror="http://mirrors.tuna.tsinghua.edu.cn",
         )
 
         self.assertIn(
@@ -408,10 +422,8 @@ networks:
                 "from flask import Flask\n"
                 "APP\n"
             ),
-            SourcePolicy(
-                "m.daocloud.io/docker.io",
-                "https://mirrors.tuna.tsinghua.edu.cn",
-            ),
+            dockerhub_mirror_prefix="m.daocloud.io/docker.io",
+            apt_mirror="https://mirrors.tuna.tsinghua.edu.cn",
         )
 
         self.assertIn(

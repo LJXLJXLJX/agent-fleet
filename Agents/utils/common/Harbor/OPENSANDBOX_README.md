@@ -1,6 +1,7 @@
 # YiCloud OpenSandbox Quick Start
 
-This guide runs a local Harbor task in a YiCloud OpenSandbox instance. The
+This guide runs a local Harbor benchmark framework task in a YiCloud
+OpenSandbox instance. The
 runner builds or reuses the task image, uploads the agent runtime, executes the
 agent and verifier, collects the result, and deletes the instance.
 
@@ -8,7 +9,8 @@ agent and verifier, collects the result, and deletes the instance.
 
 - Run `./scripts/setup.sh` once from the repository root.
 - Install Docker with Buildx and log in to the target image registry.
-- Prepare a local Harbor dataset whose tasks contain a Dockerfile or the
+- Prepare a local Harbor benchmark framework dataset whose tasks contain a
+  Dockerfile or the
   supported Compose subset.
 - Obtain YiCloud API credentials, a project name, and an OpenSandbox
   environment ID.
@@ -47,7 +49,7 @@ YICLOUD_HARBOR_HOST=harbor.example.internal
 YICLOUD_HARBOR_PROJECT=seta
 YICLOUD_HARBOR_USERNAME=your-harbor-username
 YICLOUD_HARBOR_PASSWORD=your-harbor-password
-# Set to 1 after the host trusts Harbor's certificate. Current YiCloud ingress
+# Set to 1 after the host trusts the OCI Registry certificate. Current YiCloud ingress
 # is verified with 0.
 YICLOUD_HARBOR_TLS_VERIFY=0
 
@@ -98,6 +100,14 @@ bash Agents/utils/common/Harbor/prebuild_opensandbox_dataset.sh \
   /absolute/path/to/Harbor-Dataset seta
 ```
 
+Prebuild performs a bounded BuildKit cache prune before starting and every 30
+minutes while it runs. Defaults are `max-used-space=500GB`,
+`min-free-space=300GB`, and `reserved-space=100GB`; all four values are
+configurable through `HARBOR_OPENSANDBOX_PREBUILD_GC_*`. Set
+`HARBOR_OPENSANDBOX_PREBUILD_GC_INTERVAL_SEC=0` to disable GC. It prunes only
+unused BuildKit cache and does not delete images, containers, volumes, or
+artifacts already published to the OCI Registry.
+
 Already published content-addressed images are reused in the task-specific
 repository. Unsupported environment definitions are listed as skipped in the
 prebuild report; unsupported runtime capabilities fail before creation.
@@ -114,5 +124,5 @@ prebuild report; unsupported runtime capabilities fail before creation.
   gateway is unreachable or rejected the request.
 
 See [task image management](OPENSANDBOX_IMAGE_MANAGER.md) for image naming,
-caching, and registry internals. See [Harbor structure](STRUCT.md) for the full
+caching, and registry internals. See [Harbor benchmark framework structure](STRUCT.md) for the full
 configuration reference.

@@ -9,8 +9,8 @@ Flow:
     Normalize Dockerfile or Compose into named services
                   |
                   v
-    Hash each service build/image input, source policy,
-    target platform, and explicit build args
+    Hash the original static environment files with the Harbor benchmark framework's
+    native environment-content algorithm
                   |
                   v
     Resolve each service to a Registry image
@@ -38,7 +38,7 @@ Flow:
                   v
     Return the main image ref for legacy callers
 
-Each benchmark is a Harbor Project and each task has its own repository.
+Each benchmark is a Registry Project and each task has its own repository.
 Deterministic service tags are cache lookup keys; Registry manifest digests are
 the immutable runtime addresses.
 Single-Dockerfile tasks are represented as one implicit ``main`` service.
@@ -54,6 +54,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -69,7 +70,6 @@ if __package__:
     from .compose_bundle import (
         BUNDLE_FORMAT_VERSION,
         BUNDLE_SCHEMA_VERSION,
-        BuildSpec,
         BundleSpec,
         ServiceSpec,
         resolve_bundle_spec,
@@ -78,7 +78,6 @@ else:
     from compose_bundle import (
         BUNDLE_FORMAT_VERSION,
         BUNDLE_SCHEMA_VERSION,
-        BuildSpec,
         BundleSpec,
         ServiceSpec,
         resolve_bundle_spec,
@@ -89,13 +88,31 @@ try:
 except ModuleNotFoundError:  # Python 3.10 is still used by some H-side tools.
     tomllib = None  # type: ignore[assignment]
 
+try:
+    from harbor.environments.definition import environment_content_hash
+except ImportError as exc:
+    raise RuntimeError(
+        "OpenSandbox image preparation requires the Harbor benchmark "
+        "framework API harbor.environments.definition.environment_content_hash; "
+        "install a supported Harbor runner version"
+    ) from exc
+
 
 DOCKER_MANIFEST = "application/vnd.docker.distribution.manifest.v2+json"
 DOCKER_CONFIG = "application/vnd.docker.container.image.v1+json"
 DOCKER_LAYER_GZIP = "application/vnd.docker.image.rootfs.diff.tar.gzip"
 OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
 OCI_LAYER_GZIP = "application/vnd.oci.image.layer.v1.tar+gzip"
-CONTENT_HASH_IGNORE_NAMES = {"__pycache__", ".DS_Store", ".git"}
+DEFAULT_APT_MIRROR = "http://mirrors.tuna.tsinghua.edu.cn"
+DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+DEFAULT_NPM_REGISTRY = "https://registry.npmmirror.com"
+DEFAULT_GOPROXY = "https://goproxy.cn,direct"
+DEFAULT_GOSUMDB = "sum.golang.google.cn"
+DEFAULT_CARGO_REGISTRY_URL = (
+    "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
+)
+DEFAULT_RUSTUP_DIST_SERVER = "https://mirrors.tuna.tsinghua.edu.cn/rustup"
+DEFAULT_RUSTUP_UPDATE_ROOT = "https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup"
 BUILD_ARG_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FROM_LINE = re.compile(
     r"^(?P<prefix>\s*FROM(?:\s+--platform=\S+)?\s+)"
@@ -131,33 +148,6 @@ def log(message: str) -> None:
 
 def digest_bytes(data: bytes) -> str:
     return f"sha256:{hashlib.sha256(data).hexdigest()}"
-
-
-def environment_content_hash(environment_dir: Path, truncate: int = 32) -> str:
-    """Mirror Harbor 0.18's stable environment content identity."""
-    candidates: list[tuple[str, Path]] = []
-    for path in environment_dir.rglob("*"):
-        if not path.is_file() or path.is_symlink():
-            continue
-        relative = path.relative_to(environment_dir)
-        if CONTENT_HASH_IGNORE_NAMES & set(relative.parts):
-            continue
-        candidates.append((relative.as_posix(), path))
-
-    if not candidates:
-        return hashlib.sha256(environment_dir.name.encode("utf-8")).hexdigest()[
-            :truncate
-        ]
-
-    digest = hashlib.sha256()
-    for relative, path in sorted(candidates, key=lambda item: item[0]):
-        relative_bytes = relative.encode("utf-8")
-        data = path.read_bytes()
-        digest.update(len(relative_bytes).to_bytes(4, "big"))
-        digest.update(relative_bytes)
-        digest.update(len(data).to_bytes(4, "big"))
-        digest.update(data)
-    return digest.hexdigest()[:truncate]
 
 
 def safe_tag_component(value: str) -> str:
@@ -228,24 +218,6 @@ def apt_404_requires_cache_refresh(log_path: Path) -> bool:
     )
 
 
-@dataclass(frozen=True)
-class SourcePolicy:
-    dockerhub_mirror_prefix: str
-    apt_mirror: str
-
-    @property
-    def identity(self) -> str:
-        payload = json.dumps(
-            {
-                "apt_mirror": self.apt_mirror,
-                "dockerhub_mirror_prefix": self.dockerhub_mirror_prefix,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-
-
 def mirror_image_ref(image: str, mirror_prefix: str, aliases: set[str]) -> str:
     if not mirror_prefix or image in aliases or image.startswith("$"):
         return image
@@ -299,7 +271,244 @@ def rewrite_docker_ce_sources(source: str, apt_mirror: str) -> str:
     )
 
 
-def render_build_dockerfile(source: str, policy: SourcePolicy) -> str:
+def _validate_source_url(
+    value: str,
+    label: str,
+    build_network: str,
+    *,
+    sparse: bool = False,
+) -> str:
+    normalized = value.strip()
+    parsed_value = normalized.removeprefix("sparse+") if sparse else normalized
+    parsed = urlparse(parsed_value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            f"{label} must be an absolute query-free HTTP(S) URL without credentials"
+        )
+    host = parsed.hostname.lower()
+    # This is an address-scope check, not a service availability probe. With
+    # isolated BuildKit networking, loopback names the build container itself.
+    if host in {"127.0.0.1", "localhost", "::1"} and build_network != "host":
+        raise ValueError(
+            f"loopback {label} is unreachable from BuildKit without "
+            "--build-network=host; use a build-reachable source instead"
+        )
+    return normalized
+
+
+def validate_apt_mirror(apt_mirror: str, build_network: str) -> str:
+    """Validate mirror syntax and reject container-unreachable loopback use."""
+    normalized = apt_mirror.strip().rstrip("/")
+    if not normalized:
+        raise ValueError(
+            "--apt-mirror or HARBOR_OPENSANDBOX_APT_MIRROR must name an "
+            "APT mirror root"
+        )
+    return _validate_source_url(normalized, "APT mirror", build_network).rstrip("/")
+
+
+def package_source_build_args(
+    args: argparse.Namespace, build_network: str
+) -> dict[str, str]:
+    timeout_value = str(getattr(args, "package_source_timeout_sec", 300)).strip()
+    try:
+        timeout_seconds = int(timeout_value)
+    except ValueError as exc:
+        raise ValueError(
+            "HARBOR_OPENSANDBOX_PACKAGE_SOURCE_TIMEOUT_SEC must be an integer"
+        ) from exc
+    if not 1 <= timeout_seconds <= 3600:
+        raise ValueError(
+            "HARBOR_OPENSANDBOX_PACKAGE_SOURCE_TIMEOUT_SEC must be between 1 and 3600"
+        )
+    pip_index = _validate_source_url(
+        getattr(args, "pip_index_url", DEFAULT_PIP_INDEX_URL),
+        "pip index",
+        build_network,
+    )
+    npm_registry = _validate_source_url(
+        getattr(args, "npm_registry", DEFAULT_NPM_REGISTRY),
+        "npm registry",
+        build_network,
+    )
+    cargo_index = _validate_source_url(
+        getattr(args, "cargo_registry_url", DEFAULT_CARGO_REGISTRY_URL),
+        "Cargo registry",
+        build_network,
+        sparse=True,
+    )
+    rustup_dist = _validate_source_url(
+        getattr(args, "rustup_dist_server", DEFAULT_RUSTUP_DIST_SERVER),
+        "rustup dist server",
+        build_network,
+    )
+    rustup_update = _validate_source_url(
+        getattr(args, "rustup_update_root", DEFAULT_RUSTUP_UPDATE_ROOT),
+        "rustup update root",
+        build_network,
+    )
+
+    goproxy = getattr(args, "goproxy", DEFAULT_GOPROXY).strip()
+    if not goproxy:
+        raise ValueError("GOPROXY must not be empty")
+    for candidate in goproxy.split(","):
+        candidate = candidate.strip()
+        if candidate not in {"direct", "off"}:
+            _validate_source_url(
+                candidate, "Go proxy", build_network
+            )
+
+    gosumdb = getattr(args, "gosumdb", DEFAULT_GOSUMDB).strip()
+    if not gosumdb:
+        raise ValueError("GOSUMDB must not be empty")
+    gosumdb_parts = gosumdb.split()
+    if len(gosumdb_parts) > 2:
+        raise ValueError("GOSUMDB must be 'off', a verifier name, or 'name URL'")
+    if len(gosumdb_parts) == 2:
+        _validate_source_url(
+            gosumdb_parts[1], "Go checksum database", build_network
+        )
+
+    return {
+        "CARGO_HTTP_TIMEOUT": str(timeout_seconds),
+        "CARGO_REGISTRIES_CRATES_IO_INDEX": cargo_index,
+        "CARGO_REGISTRIES_CRATES_IO_PROTOCOL": (
+            "sparse" if cargo_index.startswith("sparse+") else "git"
+        ),
+        "GOPROXY": goproxy,
+        "GOSUMDB": gosumdb,
+        "NPM_CONFIG_FETCH_TIMEOUT": str(timeout_seconds * 1000),
+        "NPM_CONFIG_REGISTRY": npm_registry,
+        "PIP_DEFAULT_TIMEOUT": str(timeout_seconds),
+        "PIP_INDEX_URL": pip_index,
+        "RUSTUP_DIST_SERVER": rustup_dist,
+        "RUSTUP_UPDATE_ROOT": rustup_update,
+    }
+
+
+def optional_package_source_urls(
+    args: argparse.Namespace, build_network: str
+) -> tuple[str, str]:
+    rustup_init = getattr(args, "rustup_init_url", "").strip()
+    pytorch_index = getattr(args, "pytorch_index_url", "").strip()
+    if rustup_init:
+        rustup_init = _validate_source_url(
+            rustup_init, "rustup bootstrap", build_network
+        )
+    if pytorch_index:
+        pytorch_index = _validate_source_url(
+            pytorch_index, "PyTorch index", build_network
+        )
+    return rustup_init, pytorch_index
+
+
+def package_source_hosts(
+    build_args: dict[str, str], *additional_urls: str
+) -> set[str]:
+    values = [
+        value
+        for name, value in build_args.items()
+        if name
+        not in {
+            "CARGO_HTTP_TIMEOUT",
+            "CARGO_REGISTRIES_CRATES_IO_PROTOCOL",
+            "NPM_CONFIG_FETCH_TIMEOUT",
+            "PIP_DEFAULT_TIMEOUT",
+        }
+    ]
+    values.extend(additional_urls)
+    hosts: set[str] = set()
+    for value in values:
+        for candidate in re.split(r"[,\s]+", value):
+            candidate = candidate.removeprefix("sparse+").strip()
+            if not candidate or candidate in {"direct", "off"}:
+                continue
+            parsed = urlparse(candidate)
+            if parsed.hostname:
+                hosts.add(parsed.hostname.lower())
+            elif "/" not in candidate and "." in candidate:
+                hosts.add(candidate.lower())
+    return hosts
+
+
+def rewrite_package_source_urls(
+    source: str, *, rustup_init_url: str = "", pytorch_index_url: str = ""
+) -> str:
+    rewritten = source
+    if rustup_init_url:
+        rewritten = rewritten.replace(
+            "https://sh.rustup.rs/rustup-init.sh", rustup_init_url
+        ).replace("https://sh.rustup.rs", rustup_init_url)
+    if pytorch_index_url:
+        rewritten = rewritten.replace(
+            "https://download.pytorch.org/whl", pytorch_index_url.rstrip("/")
+        )
+    if rustup_init_url.startswith("http://"):
+        rewritten = "".join(
+            line.replace("--proto '=https'", "--proto '=http,https'").replace(
+                '--proto "=https"', '--proto "=http,https"'
+            )
+            if rustup_init_url in line
+            else line
+            for line in rewritten.splitlines(keepends=True)
+        )
+    return rewritten
+
+
+def materialize_package_source_context(
+    source_dir: Path,
+    destination: Path,
+    *,
+    rustup_init_url: str = "",
+    pytorch_index_url: str = "",
+) -> tuple[Path, tuple[str, ...]]:
+    """Copy and exactly rewrite reviewed package origins in build scripts."""
+    if not rustup_init_url and not pytorch_index_url:
+        return source_dir, ()
+    rewritten: dict[Path, str] = {}
+    for path in source_dir.rglob("*"):
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or (path.name != "Dockerfile" and path.suffix not in {".sh", ".bash", ".zsh"})
+        ):
+            continue
+        try:
+            original = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        updated = rewrite_package_source_urls(
+            original,
+            rustup_init_url=rustup_init_url,
+            pytorch_index_url=pytorch_index_url,
+        )
+        if updated != original:
+            rewritten[path.relative_to(source_dir)] = updated
+    if not rewritten:
+        return source_dir, ()
+    shutil.copytree(source_dir, destination, symlinks=True)
+    for relative_path, content in rewritten.items():
+        destination.joinpath(relative_path).write_text(content, encoding="utf-8")
+    return destination, tuple(sorted(str(path) for path in rewritten))
+
+
+def render_build_dockerfile(
+    source: str,
+    *,
+    dockerhub_mirror_prefix: str,
+    apt_mirror: str,
+    package_build_args: dict[str, str] | None = None,
+    rustup_init_url: str = "",
+    pytorch_index_url: str = "",
+) -> str:
+    package_build_args = package_build_args or {}
     output: list[str] = []
     aliases: set[str] = set()
     active_instruction: str | None = None
@@ -319,21 +528,30 @@ def render_build_dockerfile(source: str, policy: SourcePolicy) -> str:
         if instruction:
             active_instruction = instruction.group("name").upper()
 
-        line = rewrite_docker_ce_sources(source_line, policy.apt_mirror)
+        line = rewrite_package_source_urls(
+            rewrite_docker_ce_sources(source_line, apt_mirror),
+            rustup_init_url=rustup_init_url,
+            pytorch_index_url=pytorch_index_url,
+        )
         match = FROM_LINE.match(line)
         if match:
             source_image = match.group("image")
             mirrored_image = mirror_image_ref(
-                source_image, policy.dockerhub_mirror_prefix, aliases
+                source_image, dockerhub_mirror_prefix, aliases
             )
             output.append(
                 f"{match.group('prefix')}{mirrored_image}{match.group('suffix')}"
             )
+            if package_build_args:
+                # ARG values affect only Dockerfile RUN instructions. They are
+                # intentionally not persisted in the published image config,
+                # where a same-host mirror may be unreachable at runtime.
+                output.extend(f"ARG {name}" for name in sorted(package_build_args))
             alias_match = AS_ALIAS.search(match.group("suffix"))
             if alias_match:
                 aliases.add(alias_match.group("alias"))
             if source_image not in aliases:
-                command = apt_mirror_command(source_image, policy.apt_mirror)
+                command = apt_mirror_command(source_image, apt_mirror)
                 if command:
                     output.append(command)
         else:
@@ -366,7 +584,9 @@ def parse_build_args(raw: str) -> dict[str, str]:
 
 
 def proxy_build_args(
-    enabled: bool, build_network: str = "default"
+    enabled: bool,
+    build_network: str = "default",
+    direct_hosts: Iterable[str] = (),
 ) -> dict[str, str]:
     if not enabled:
         return {}
@@ -415,6 +635,14 @@ def proxy_build_args(
     for name in ("NO_PROXY", "no_proxy"):
         if os.environ.get(name):
             result[name] = os.environ[name]
+    if direct_hosts:
+        existing = result.get("NO_PROXY", result.get("no_proxy", ""))
+        entries = [entry.strip() for entry in existing.split(",") if entry.strip()]
+        for direct_host in sorted(set(direct_hosts)):
+            if direct_host not in entries:
+                entries.append(direct_host)
+        result["NO_PROXY"] = ",".join(entries)
+        result["no_proxy"] = result["NO_PROXY"]
     return result
 
 
@@ -820,43 +1048,13 @@ def atomic_write_json(path: Path, payload: dict) -> None:
     temporary.replace(path)
 
 
-def image_identity(
-    environment_hash: str,
-    policy: SourcePolicy,
-    platform: str,
-    build_args: dict[str, str],
-) -> str:
-    # Input identity is available before the build.  Never salt it with a
-    # manager/schema version: only inputs which can change the image belong
-    # here.
-    payload = {
-        "build_input": environment_hash,
-        "source_policy": policy.identity,
-        "platform": platform,
-        "build_args": build_args,
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
-def build_tag(
-    prefix: str,
-    task_name: str,
-    identity: str,
-    force: bool,
-    *,
-    service_name: str | None = None,
-) -> str:
-    # Kept as a small compatibility helper for third-party callers. New code
-    # uses RegistryTarget.tag(), whose service tag deliberately has no
-    # benchmark/task prefix because those belong in the repository path.
-    components = [safe_tag_component(service_name or "main"), identity[:20]]
-    base = "-".join(components)
-    if force:
-        suffix = datetime.now(timezone.utc).strftime("r%Y%m%d%H%M%S") + f"-{os.getpid()}"
-        base = f"{base}-{suffix}"
-    return base[:128].rstrip(".-")
+def image_identity(environment_dir: Path, *, docker_image: str | None = None) -> str:
+    """Return the Harbor benchmark framework's static environment identity."""
+    return environment_content_hash(
+        environment_dir,
+        docker_image=docker_image,
+        truncate=64,
+    )
 
 
 @dataclass(frozen=True)
@@ -871,23 +1069,6 @@ def _path_relative_to_environment(path: Path, environment_dir: Path) -> str:
         return path.relative_to(environment_dir).as_posix()
     except ValueError as exc:
         raise ValueError(f"build path escapes task environment: {path}") from exc
-
-
-def build_input_hash(build: BuildSpec, environment_dir: Path) -> str:
-    payload = {
-        "context_hash": environment_content_hash(build.context_dir, truncate=64),
-        "context": _path_relative_to_environment(
-            build.context_dir, environment_dir
-        ),
-        "dockerfile": _path_relative_to_environment(
-            build.dockerfile, environment_dir
-        ),
-        "dockerfile_digest": digest_bytes(build.dockerfile.read_bytes()),
-        "target": build.target,
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
 
 
 def _string_argv(value: object, *, label: str) -> list[str] | None:
@@ -1088,10 +1269,14 @@ def _compose_runtime(
 
 
 def inspect_external_image(
-    image_ref: str, policy: SourcePolicy, platform: str, *, dry_run: bool
+    image_ref: str,
+    dockerhub_mirror_prefix: str,
+    platform: str,
+    *,
+    dry_run: bool,
 ) -> tuple[str, str]:
     resolved_ref = mirror_image_ref(
-        image_ref, policy.dockerhub_mirror_prefix, aliases=set()
+        image_ref, dockerhub_mirror_prefix, aliases=set()
     )
     if dry_run:
         payload = f"dry-run\0{resolved_ref}\0{platform}".encode()
@@ -1112,10 +1297,20 @@ def inspect_external_image(
     return resolved_ref, digest_bytes(completed.stdout)
 
 
-def _source_policy_record(policy: SourcePolicy) -> dict[str, str]:
+def _transport_record(
+    *,
+    dockerhub_mirror_prefix: str,
+    apt_mirror: str,
+    package_build_args: dict[str, str],
+    rustup_init_url: str,
+    pytorch_index_url: str,
+) -> dict[str, str]:
     return {
-        "apt_mirror": policy.apt_mirror,
-        "dockerhub_mirror_prefix": policy.dockerhub_mirror_prefix,
+        "apt_mirror": apt_mirror,
+        "dockerhub_mirror_prefix": dockerhub_mirror_prefix,
+        "package_source_args": ",".join(sorted(package_build_args)),
+        "pytorch_index_configured": str(bool(pytorch_index_url)).lower(),
+        "rustup_init_configured": str(bool(rustup_init_url)).lower(),
     }
 
 
@@ -1133,23 +1328,49 @@ def _service_image_inputs(
     service: ServiceSpec,
     *,
     bundle: BundleSpec,
-    policy: SourcePolicy,
+    dockerhub_mirror_prefix: str,
+    package_build_args: dict[str, str],
     platform: str,
     explicit_build_args: dict[str, str],
     dry_run: bool,
-) -> tuple[str, dict[str, str], str | None, str | None]:
+) -> tuple[
+    str,
+    dict[str, str],
+    dict[str, str],
+    str | None,
+    str | None,
+]:
     if service.build is not None:
-        build_args = {**service.build.args, **explicit_build_args}
-        source_identity = build_input_hash(service.build, bundle.environment_dir)
-        identity = image_identity(source_identity, policy, platform, build_args)
-        return identity, build_args, None, None
+        # Mirror routes are defaults. A task/Compose build arg may select an
+        # explicit package source, and the operator's explicit JSON override
+        # remains authoritative over both.
+        effective_build_args = {
+            **package_build_args,
+            **service.build.args,
+            **explicit_build_args,
+        }
+        declared_build_args = {
+            **service.build.args,
+            **explicit_build_args,
+        }
+        # OCI Registry cache identity tracks static task intent only. Dynamic
+        # build args and source/proxy rewrites are deployment adaptations; use
+        # --force when the same task must be rebuilt against changed inputs.
+        identity = image_identity(bundle.environment_dir)
+        return identity, declared_build_args, effective_build_args, None, None
     if not service.source_image:
         raise ValueError(f"service {service.name!r} has no build or source image")
     resolved_ref, source_digest = inspect_external_image(
-        service.source_image, policy, platform, dry_run=dry_run
+        service.source_image,
+        dockerhub_mirror_prefix,
+        platform,
+        dry_run=dry_run,
     )
-    identity = image_identity(source_digest, policy, platform, {})
-    return identity, {}, resolved_ref, source_digest
+    identity = image_identity(
+        bundle.environment_dir,
+        docker_image=service.source_image,
+    )
+    return identity, {}, {}, resolved_ref, source_digest
 
 
 def _prepare_service_image(
@@ -1157,24 +1378,27 @@ def _prepare_service_image(
     service: ServiceSpec,
     bundle: BundleSpec,
     args: argparse.Namespace,
-    policy: SourcePolicy,
     explicit_build_args: dict[str, str],
     proxy_args: dict[str, str],
     cache_root: Path,
     target: RegistryTarget,
     publisher: SkopeoPublisher | None,
     registry: RegistryClient | None,
-    artifact_cache: dict[str, dict[str, object]],
 ) -> dict[str, object]:
-    identity, service_build_args, resolved_external_ref, source_digest = (
-        _service_image_inputs(
-            service,
-            bundle=bundle,
-            policy=policy,
-            platform=args.platform,
-            explicit_build_args=explicit_build_args,
-            dry_run=args.dry_run,
-        )
+    (
+        identity,
+        declared_build_args,
+        effective_service_build_args,
+        resolved_external_ref,
+        source_digest,
+    ) = _service_image_inputs(
+        service,
+        bundle=bundle,
+        dockerhub_mirror_prefix=args.dockerhub_mirror_prefix,
+        package_build_args=args.package_build_args,
+        platform=args.platform,
+        explicit_build_args=explicit_build_args,
+        dry_run=args.dry_run,
     )
     input_hash = f"sha256:{identity}"
     tag = target.tag(service.name, input_hash)
@@ -1189,7 +1413,7 @@ def _prepare_service_image(
         "digest_ref": None,
         "media_type": DOCKER_MANIFEST,
         "platform": args.platform,
-        "build_arg_names": sorted(service_build_args),
+        "build_arg_names": sorted(declared_build_args),
         "config": {
             "entrypoint": None,
             "cmd": None,
@@ -1238,8 +1462,14 @@ def _prepare_service_image(
                     "digest_ref": artifact["digest_ref"],
                     "source": existing_record.get("source", image_source),
                     "last_resolution": "registry-cache",
-                    "source_policy": _source_policy_record(policy),
-                    "build_arg_names": sorted(service_build_args),
+                    "transport": _transport_record(
+                        dockerhub_mirror_prefix=args.dockerhub_mirror_prefix,
+                        apt_mirror=args.apt_mirror,
+                        package_build_args=args.package_build_args,
+                        rustup_init_url=args.rustup_init_url,
+                        pytorch_index_url=args.pytorch_index_url,
+                    ),
+                    "build_arg_names": sorted(declared_build_args),
                     "service": service.name,
                     "task_dir": str(bundle.task_dir),
                     "last_resolved_at": datetime.now(timezone.utc).isoformat(),
@@ -1247,57 +1477,66 @@ def _prepare_service_image(
             )
             return artifact
 
-        # Equal build inputs can share one Registry artifact within this
-        # Bundle, while every service keeps its own deterministic tag.
-        cached_content = artifact_cache.get(identity)
         local_image_config: dict[str, object] | None = None
-        if cached_content is not None and not args.force:
-            inspected = publisher.copy(str(cached_content["tag_ref"]), tag_ref)
-            artifact["artifact_digest"] = inspected["artifact_digest"]
-            artifact["digest_ref"] = target.digest_ref(inspected["artifact_digest"])
-            artifact["media_type"] = inspected["media_type"]
-            cached_config = cached_content.get("config")
-            if not isinstance(cached_config, dict):
-                raise RuntimeError("cached artifact has no normalized OCI image config")
-            local_image_config = dict(cached_config)
-            resolution = "service-tag-alias"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        if service.build is None:
+            if not resolved_external_ref:
+                raise RuntimeError("external service resolved without an image ref")
+            inspected = publisher.copy(resolved_external_ref, tag_ref)
         else:
-            cache_root.mkdir(parents=True, exist_ok=True)
-            if service.build is None:
-                if not resolved_external_ref:
-                    raise RuntimeError("external service resolved without an image ref")
-                inspected = publisher.copy(resolved_external_ref, tag_ref)
-            else:
-                with tempfile.TemporaryDirectory(prefix=f"{tag}-", dir=cache_root) as temporary_dir:
-                    temporary = Path(temporary_dir)
-                    build_context = service.build.context_dir
-                    dockerfile_source = service.build.dockerfile.read_text(encoding="utf-8")
-                    target_stage = service.build.target
-                    rendered_dockerfile = temporary / "Dockerfile"
-                    rendered_dockerfile.write_text(render_build_dockerfile(dockerfile_source, policy), encoding="utf-8")
-                    archive_path = temporary / "image.oci.tar"
-                    effective_build_args = {**proxy_args, **service_build_args}
-                    build_timeout = getattr(args, "build_timeout_sec", None) or load_build_timeout(bundle.task_dir)
-                    log(f"building task={bundle.task_identity} service={service.name} platform={args.platform}; log={log_path}")
-                    run_build(
-                        environment_dir=build_context,
-                        dockerfile=rendered_dockerfile,
-                        archive_path=archive_path,
-                        log_path=log_path,
-                        platform=args.platform,
-                        timeout_sec=build_timeout,
-                        build_args=effective_build_args,
-                        target=target_stage,
-                        no_cache=getattr(args, "no_cache", False),
-                        build_network=getattr(args, "build_network", "default"),
+            with tempfile.TemporaryDirectory(prefix=f"{tag}-", dir=cache_root) as temporary_dir:
+                temporary = Path(temporary_dir)
+                build_context, rewritten_scripts = materialize_package_source_context(
+                    service.build.context_dir,
+                    temporary / "context",
+                    rustup_init_url=args.rustup_init_url,
+                    pytorch_index_url=args.pytorch_index_url,
+                )
+                if rewritten_scripts:
+                    log(
+                        "package source configuration rewrote an exact origin URL in "
+                        f"{len(rewritten_scripts)} build script(s)"
                     )
-                    local_image_config = oci_archive_image_config(archive_path)
-                    log(f"publishing service={service.name}: {tag_ref}")
-                    inspected = publisher.copy(str(archive_path), tag_ref, source_is_archive=True)
-            artifact["artifact_digest"] = inspected["artifact_digest"]
-            artifact["digest_ref"] = target.digest_ref(inspected["artifact_digest"])
-            artifact["media_type"] = inspected["media_type"]
-            resolution = "built-and-pushed"
+                dockerfile_source = service.build.dockerfile.read_text(encoding="utf-8")
+                target_stage = service.build.target
+                rendered_dockerfile = temporary / "Dockerfile"
+                rendered_dockerfile.write_text(
+                    render_build_dockerfile(
+                        dockerfile_source,
+                        dockerhub_mirror_prefix=args.dockerhub_mirror_prefix,
+                        apt_mirror=args.apt_mirror,
+                        package_build_args=args.package_build_args,
+                        rustup_init_url=args.rustup_init_url,
+                        pytorch_index_url=args.pytorch_index_url,
+                    ),
+                    encoding="utf-8",
+                )
+                archive_path = temporary / "image.oci.tar"
+                effective_build_args = {
+                    **proxy_args,
+                    **effective_service_build_args,
+                }
+                build_timeout = getattr(args, "build_timeout_sec", None) or load_build_timeout(bundle.task_dir)
+                log(f"building task={bundle.task_identity} service={service.name} platform={args.platform}; log={log_path}")
+                run_build(
+                    environment_dir=build_context,
+                    dockerfile=rendered_dockerfile,
+                    archive_path=archive_path,
+                    log_path=log_path,
+                    platform=args.platform,
+                    timeout_sec=build_timeout,
+                    build_args=effective_build_args,
+                    target=target_stage,
+                    no_cache=getattr(args, "no_cache", False),
+                    build_network=getattr(args, "build_network", "default"),
+                )
+                local_image_config = oci_archive_image_config(archive_path)
+                log(f"publishing service={service.name}: {tag_ref}")
+                inspected = publisher.copy(str(archive_path), tag_ref, source_is_archive=True)
+        artifact["artifact_digest"] = inspected["artifact_digest"]
+        artifact["digest_ref"] = target.digest_ref(inspected["artifact_digest"])
+        artifact["media_type"] = inspected["media_type"]
+        resolution = "built-and-pushed"
         artifact["config"] = local_image_config or publisher.inspect_config(tag_ref)
         artifact["config_resolved"] = True
         atomic_write_json(
@@ -1315,14 +1554,19 @@ def _prepare_service_image(
                 "source": image_source,
                 "source_manifest_digest": source_digest,
                 "last_resolution": resolution,
-                "source_policy": _source_policy_record(policy),
-                "build_arg_names": sorted(service_build_args),
+                "transport": _transport_record(
+                    dockerhub_mirror_prefix=args.dockerhub_mirror_prefix,
+                    apt_mirror=args.apt_mirror,
+                    package_build_args=args.package_build_args,
+                    rustup_init_url=args.rustup_init_url,
+                    pytorch_index_url=args.pytorch_index_url,
+                ),
+                "build_arg_names": sorted(declared_build_args),
                 "service": service.name,
                 "task_dir": str(bundle.task_dir),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },
         )
-    artifact_cache.setdefault(identity, dict(artifact))
     log(f"ready service={service.name}: {artifact['digest_ref']}")
     return artifact
 
@@ -1346,8 +1590,8 @@ def _service_manifest(
                 service.build.dockerfile, environment_dir
             ),
             "target": service.build.target,
-            # Values may be credentials.  The immutable manifest only exposes
-            # names; their values affect image_identity but are never persisted.
+            # Values may be credentials. The immutable manifest exposes only
+            # names; runtime overrides never participate in image identity.
             "build_arg_names": artifact["build_arg_names"],
         }
     image_config = artifact.get("config")
@@ -1418,7 +1662,15 @@ def _bundle_identity(
 def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
     task_dir = resolve_task_dir(args.task_dir, args.dataset_root, args.include)
     bundle = resolve_bundle_spec(task_dir)
-    policy = SourcePolicy(args.dockerhub_mirror_prefix, args.apt_mirror)
+    build_network = getattr(args, "build_network", "default")
+    args.apt_mirror = validate_apt_mirror(
+        getattr(args, "apt_mirror", DEFAULT_APT_MIRROR),
+        build_network,
+    )
+    args.package_build_args = package_source_build_args(args, build_network)
+    args.rustup_init_url, args.pytorch_index_url = optional_package_source_urls(
+        args, build_network
+    )
     explicit_build_args = parse_build_args(args.build_args_json)
     cache_root = args.cache_root.resolve()
     target = RegistryTarget(
@@ -1429,7 +1681,6 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
     publisher: SkopeoPublisher | None = None
     registry: RegistryClient | None = None
     proxy_args: dict[str, str] = {}
-    build_network = getattr(args, "build_network", "default")
     if not args.dry_run:
         username, password = registry_credentials(args.docker_config, args.registry)
         publisher = SkopeoPublisher(
@@ -1439,23 +1690,29 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
             tls_verify=args.registry_tls_verify,
         )
         registry = RegistryClient(target, publisher)
-        proxy_args = proxy_build_args(args.use_proxy, build_network)
+        proxy_args = proxy_build_args(
+            args.use_proxy,
+            build_network,
+            direct_hosts=package_source_hosts(
+                args.package_build_args,
+                args.apt_mirror,
+                args.rustup_init_url,
+                args.pytorch_index_url,
+            ),
+        )
 
     artifacts: dict[str, dict[str, object]] = {}
-    artifact_cache: dict[str, dict[str, object]] = {}
     for name in sorted(bundle.services):
         artifacts[name] = _prepare_service_image(
             service=bundle.services[name],
             bundle=bundle,
             args=args,
-            policy=policy,
             explicit_build_args=explicit_build_args,
             proxy_args=proxy_args,
             cache_root=cache_root,
             target=target,
             publisher=publisher,
             registry=registry,
-            artifact_cache=artifact_cache,
         )
 
     services = {
@@ -1545,7 +1802,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--project",
         default=os.environ.get("YICLOUD_HARBOR_PROJECT", ""),
-        help="pre-created Harbor Project for this benchmark",
+        help="pre-created Registry Project for this benchmark",
     )
     parser.add_argument(
         "--task-repository",
@@ -1593,8 +1850,65 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--apt-mirror",
+        default=os.environ.get("HARBOR_OPENSANDBOX_APT_MIRROR", DEFAULT_APT_MIRROR),
+        help="APT mirror root containing ubuntu, debian, debian-security and docker-ce",
+    )
+    parser.add_argument(
+        "--pip-index-url",
         default=os.environ.get(
-            "HARBOR_OPENSANDBOX_APT_MIRROR", "http://mirrors.tuna.tsinghua.edu.cn"
+            "HARBOR_OPENSANDBOX_PIP_INDEX_URL", DEFAULT_PIP_INDEX_URL
+        ),
+    )
+    parser.add_argument(
+        "--npm-registry",
+        default=os.environ.get(
+            "HARBOR_OPENSANDBOX_NPM_REGISTRY", DEFAULT_NPM_REGISTRY
+        ),
+    )
+    parser.add_argument(
+        "--goproxy",
+        default=os.environ.get("HARBOR_OPENSANDBOX_GOPROXY", DEFAULT_GOPROXY),
+    )
+    parser.add_argument(
+        "--gosumdb",
+        default=os.environ.get("HARBOR_OPENSANDBOX_GOSUMDB", DEFAULT_GOSUMDB),
+    )
+    parser.add_argument(
+        "--cargo-registry-url",
+        default=os.environ.get(
+            "HARBOR_OPENSANDBOX_CARGO_REGISTRY_URL",
+            DEFAULT_CARGO_REGISTRY_URL,
+        ),
+    )
+    parser.add_argument(
+        "--rustup-dist-server",
+        default=os.environ.get(
+            "HARBOR_OPENSANDBOX_RUSTUP_DIST_SERVER",
+            DEFAULT_RUSTUP_DIST_SERVER,
+        ),
+    )
+    parser.add_argument(
+        "--rustup-update-root",
+        default=os.environ.get(
+            "HARBOR_OPENSANDBOX_RUSTUP_UPDATE_ROOT",
+            DEFAULT_RUSTUP_UPDATE_ROOT,
+        ),
+    )
+    parser.add_argument(
+        "--rustup-init-url",
+        default=os.environ.get("HARBOR_OPENSANDBOX_RUSTUP_INIT_URL", ""),
+        help="optional trusted replacement for exact sh.rustup.rs bootstrap URLs",
+    )
+    parser.add_argument(
+        "--pytorch-index-url",
+        default=os.environ.get("HARBOR_OPENSANDBOX_PYTORCH_INDEX_URL", ""),
+        help="optional trusted replacement for exact download.pytorch.org/whl URLs",
+    )
+    parser.add_argument(
+        "--package-source-timeout-sec",
+        type=int,
+        default=int(
+            os.environ.get("HARBOR_OPENSANDBOX_PACKAGE_SOURCE_TIMEOUT_SEC", "300")
         ),
     )
     parser.add_argument(
@@ -1662,7 +1976,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     if not args.project:
         parser.error("--project or YICLOUD_HARBOR_PROJECT is required")
     if "/" in args.project:
-        parser.error("--project must be a single Harbor Project name")
+        parser.error("--project must be a single Registry Project name")
     if args.task_repository and "/" in args.task_repository:
         parser.error("--task-repository must be a single repository name")
     return args
