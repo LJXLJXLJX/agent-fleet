@@ -1,7 +1,7 @@
 """Content-addressed S3 staging for YiCloud OpenSandbox uploads.
 
-The Harbor runner owns the S3 credentials. Sandboxes receive only short-lived,
-single-object download URLs plus the expected size and SHA-256 digest.
+The Harbor runner owns the S3 write credentials. Sandboxes receive only
+anonymous internal object URLs plus the expected size and SHA-256 digest.
 """
 
 from __future__ import annotations
@@ -20,13 +20,12 @@ import stat
 import subprocess
 import tarfile
 import tempfile
-import time
 import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit
 
 BUFFER_SIZE = 4 * 1024 * 1024
 SAMPLE_SIZE = 4 * 1024 * 1024
@@ -90,22 +89,22 @@ class S3UploadArtifact:
     local_payload_path: str
     object_key: str
     object_uri: str
-    signed_url: str = ""
+    download_url: str = ""
 
 
 class S3UploadStore:
-    """Build deterministic payloads, publish once, and issue fresh GET URLs."""
+    """Build deterministic payloads and publish anonymous-read object URLs."""
 
     def __init__(
         self,
         *,
         config_path: Path | str,
         bucket: str,
+        read_origin: str,
         prefix: str = "agent-fleet-upload/v1",
         cache_root: Path | str = "/data/harbor-runs/opensandbox-s3-cache",
         lock_root: Path | str = "/data/harbor-runs/opensandbox-s3-locks",
         directory_compression: str = "auto",
-        signed_url_ttl_sec: int | str = 3600,
         s3cmd: str = "s3cmd",
     ) -> None:
         self.config_path = _absolute_path(
@@ -114,6 +113,7 @@ class S3UploadStore:
         self.bucket = bucket.strip()
         if not self.bucket or "/" in self.bucket:
             raise ValueError("YICLOUD_SANDBOX_S3_BUCKET is invalid")
+        self.read_origin = self._validate_read_origin(read_origin)
         self.prefix = _safe_prefix(prefix)
         self.cache_root = _absolute_path(
             str(cache_root), "YICLOUD_SANDBOX_S3_CACHE_ROOT"
@@ -128,10 +128,6 @@ class S3UploadStore:
                 "auto, none, or gzip"
             )
         self.directory_compression = compression
-        self.signed_url_ttl_sec = _positive_int(
-            signed_url_ttl_sec,
-            "YICLOUD_SANDBOX_S3_SIGNED_URL_TTL_SEC",
-        )
         self.s3cmd = s3cmd.strip()
         if not self.s3cmd:
             raise ValueError("YICLOUD_SANDBOX_S3CMD must not be empty")
@@ -141,6 +137,9 @@ class S3UploadStore:
         return cls(
             config_path=os.environ.get("YICLOUD_SANDBOX_S3_CONFIG", ""),
             bucket=os.environ.get("YICLOUD_SANDBOX_S3_BUCKET", ""),
+            read_origin=os.environ.get(
+                "YICLOUD_SANDBOX_S3_READ_ORIGIN", ""
+            ),
             prefix=os.environ.get(
                 "YICLOUD_SANDBOX_S3_PREFIX",
                 "agent-fleet-upload/v1",
@@ -157,12 +156,33 @@ class S3UploadStore:
                 "YICLOUD_SANDBOX_S3_DIRECTORY_COMPRESSION",
                 "auto",
             ),
-            signed_url_ttl_sec=os.environ.get(
-                "YICLOUD_SANDBOX_S3_SIGNED_URL_TTL_SEC",
-                "3600",
-            ),
             s3cmd=os.environ.get("YICLOUD_SANDBOX_S3CMD", "s3cmd"),
         )
+
+    @staticmethod
+    def _validate_read_origin(value: str) -> str:
+        origin = value.strip().rstrip("/")
+        parsed = urlsplit(origin)
+        try:
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValueError(
+                "YICLOUD_SANDBOX_S3_READ_ORIGIN has an invalid port"
+            ) from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or any(character.isspace() for character in origin)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "YICLOUD_SANDBOX_S3_READ_ORIGIN must be an HTTP(S) URL "
+                "without credentials, query, or fragment"
+            )
+        return origin
 
     def _executable(self) -> str:
         if "/" in self.s3cmd:
@@ -376,36 +396,12 @@ class S3UploadStore:
                 f"expected={artifact.payload_size} actual={remote_size}"
             )
 
-    def _path_style_url(self, signed_url: str) -> str:
-        parsed = urlsplit(signed_url)
-        hostname = parsed.hostname or ""
-        bucket_prefix = f"{self.bucket}."
-        if hostname.startswith(bucket_prefix):
-            hostname = hostname[len(bucket_prefix) :]
-            netloc = hostname
-            if parsed.port is not None:
-                netloc += f":{parsed.port}"
-            parsed = parsed._replace(
-                netloc=netloc,
-                path=f"/{self.bucket}{parsed.path}",
-            )
-        return urlunsplit(parsed)
-
-    def _signed_url(self, artifact: S3UploadArtifact) -> str:
-        expires_at = int(time.time()) + self.signed_url_ttl_sec
-        completed = self._run(
-            "signurl",
-            artifact.object_uri,
-            str(expires_at),
-        )
-        signed_url = completed.stdout.strip()
-        if not signed_url.startswith(("http://", "https://")):
-            raise RuntimeError("s3cmd did not return a signed HTTP URL")
-        return self._path_style_url(signed_url)
+    def _download_url(self, artifact: S3UploadArtifact) -> str:
+        return f"{self.read_origin}/{quote(artifact.object_key, safe='/')}"
 
     def _publish(self, artifact: S3UploadArtifact) -> S3UploadArtifact:
         self._ensure_remote(artifact)
-        return replace(artifact, signed_url=self._signed_url(artifact))
+        return replace(artifact, download_url=self._download_url(artifact))
 
     def stage_file(self, source_path: Path | str) -> S3UploadArtifact:
         source = Path(source_path)

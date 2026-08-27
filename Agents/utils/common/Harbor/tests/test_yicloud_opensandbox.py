@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, Mock, call, patch
 
 HARBOR_DIR = Path(__file__).resolve().parents[1]
 MODULE_PATH = HARBOR_DIR / "yicloud_opensandbox.py"
+REGISTRY_HOST = "harbor.example.internal"
 sys.path.insert(0, str(HARBOR_DIR))
 
 
@@ -126,12 +127,18 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
                         "services": {
                             "main": {
                                 "image": {
-                                    "digest_ref": "registry/seta/0@sha256:" + "a" * 64
+                                    "digest_ref": (
+                                        f"{REGISTRY_HOST}/seta/0@sha256:"
+                                        + "a" * 64
+                                    )
                                 }
                             },
                             "worker": {
                                 "image": {
-                                    "digest_ref": "registry/seta/0@sha256:" + "b" * 64
+                                    "digest_ref": (
+                                        f"{REGISTRY_HOST}/seta/0@sha256:"
+                                        + "b" * 64
+                                    )
                                 }
                             },
                         },
@@ -144,7 +151,11 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             instance._bundle = None
             instance._services = {}
             instance._main_service = "main"
-            instance._load_bundle()
+            with patch.dict(
+                os.environ,
+                {"YICLOUD_HARBOR_HOST": REGISTRY_HOST},
+            ):
+                instance._load_bundle()
 
         self.assertEqual(instance._main_service, "main")
         self.assertEqual(set(instance._services), {"main", "worker"})
@@ -152,6 +163,56 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         instance._bundle["requirements"] = {"fixed_ip": True}
         with self.assertRaisesRegex(RuntimeError, "capability gate rejected"):
             instance._capability_gate()
+
+    def test_image_refs_must_use_configured_registry(self) -> None:
+        digest = "sha256:" + "a" * 64
+        with patch.dict(
+            os.environ,
+            {"YICLOUD_HARBOR_HOST": REGISTRY_HOST},
+        ):
+            yicloud_opensandbox._validate_managed_image_ref(
+                f"{REGISTRY_HOST}/seta/0@{digest}",
+                "test image",
+            )
+            for ref in (
+                f"registry.gate.yicloud.com.cn/seta/0@{digest}",
+                f"seta/0@{digest}",
+            ):
+                with self.subTest(ref=ref), self.assertRaisesRegex(
+                    RuntimeError,
+                    "must use the configured OpenSandbox registry",
+                ):
+                    yicloud_opensandbox._validate_managed_image_ref(
+                        ref,
+                        "test image",
+                    )
+
+    def test_legacy_image_override_rejects_other_registry(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._bundle_manifest_path = ""
+        instance._bundle = None
+        instance._services = {}
+        instance._main_service = "main"
+        instance._image_ref_override = (
+            "registry.gate.yicloud.com.cn/seta/0@sha256:" + "a" * 64
+        )
+        instance.task_env_config = SimpleNamespace(docker_image=None)
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(
+                os.environ,
+                {"YICLOUD_HARBOR_HOST": REGISTRY_HOST},
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "must use the configured OpenSandbox registry",
+            ),
+        ):
+            instance.environment_dir = Path(tmp)
+            instance._validate_definition()
 
     def test_service_port_parsing_uses_compose_container_ports(self) -> None:
         self.assertEqual(
@@ -184,7 +245,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "non-empty string list"):
             start({"runtime": {"start_argv": []}})
 
-    def test_all_composite_entrypoints_wait_for_alias_wiring(self) -> None:
+    def test_all_opensandbox_services_use_sleep_infinity_entrypoint(self) -> None:
         instance = object.__new__(
             yicloud_opensandbox.YiCloudOpenSandboxEnvironment
         )
@@ -208,22 +269,19 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         instance._services = {"main": main, "worker": worker}
 
         for runtime in (main, worker):
-            entrypoint = instance._service_entrypoint(runtime)
-            assert entrypoint is not None
-            self.assertEqual(entrypoint[:2], ["sh", "-c"])
-            self.assertIn(
-                yicloud_opensandbox.COMPOSE_START_MARKER_PREFIX
-                + runtime.sandbox_name,
-                entrypoint[2],
+            self.assertEqual(
+                instance._service_entrypoint(runtime),
+                ["sleep", "infinity"],
             )
-            self.assertIn('exec "$@"', entrypoint[2])
-            self.assertEqual(entrypoint[-1], runtime.name)
 
-    def test_release_service_entrypoint_touches_its_marker(self) -> None:
+    def test_release_service_entrypoint_starts_real_command_via_execd(self) -> None:
         instance = object.__new__(
             yicloud_opensandbox.YiCloudOpenSandboxEnvironment
         )
-        runtime = yicloud_opensandbox.ServiceRuntime("worker", {})
+        runtime = yicloud_opensandbox.ServiceRuntime(
+            "worker",
+            {"runtime": {"start_argv": ["worker", "--serve"]}},
+        )
         runtime.sandbox_name = "test-worker"
         instance._run_service_command = AsyncMock(
             return_value=SimpleNamespace(return_code=0, stdout="", stderr="")
@@ -233,9 +291,42 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
         instance._run_service_command.assert_awaited_once_with(
             runtime,
-            "touch /tmp/.harbor-compose-start-test-worker",
+            "nohup worker --serve >/tmp/harbor-service-worker.log 2>&1 "
+            "</dev/null & pid=$!; echo $pid >/tmp/harbor-service-worker.pid; "
+            "sleep 1; "
+            "if ! kill -0 $pid 2>/dev/null; then "
+            "tail -n 50 /tmp/harbor-service-worker.log >&2; exit 1; fi",
             timeout_sec=60,
         )
+
+    def test_release_service_entrypoint_raises_on_startup_crash(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        runtime = yicloud_opensandbox.ServiceRuntime(
+            "worker",
+            {"runtime": {"start_argv": ["worker", "--serve"]}},
+        )
+        runtime.sandbox_name = "test-worker"
+        instance._run_service_command = AsyncMock(
+            return_value=SimpleNamespace(
+                return_code=1, stdout="", stderr="exec: worker: not found"
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "worker: not found"):
+            asyncio.run(instance._release_service_entrypoint(runtime))
+
+    def test_release_service_entrypoint_leaves_commandless_image_running(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        runtime = yicloud_opensandbox.ServiceRuntime("main", {})
+        instance._run_service_command = AsyncMock()
+
+        asyncio.run(instance._release_service_entrypoint(runtime))
+
+        instance._run_service_command.assert_not_awaited()
 
     def test_service_hosts_block_uses_real_newlines(self) -> None:
         instance = object.__new__(
@@ -471,10 +562,8 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         self.assertEqual(instance._sandbox_id, "sbx-main")
         self.assertEqual(main.state, "READY")
         self.assertEqual(worker.state, "READY")
-        self.assertEqual(entrypoints["worker"][-1], "worker")
-        self.assertEqual(entrypoints["main"][-1], "main")
-        self.assertIn(".harbor-compose-start-", entrypoints["worker"][2])
-        self.assertIn(".harbor-compose-start-", entrypoints["main"][2])
+        self.assertEqual(entrypoints["worker"], ["sleep", "infinity"])
+        self.assertEqual(entrypoints["main"], ["sleep", "infinity"])
         self.assertEqual(worker.internal_address, "10.0.0.2")
         self.assertEqual(main.internal_address, "10.0.0.2")
 
@@ -848,7 +937,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             local_payload_path="/cache/payload",
             object_key="objects/payload",
             object_uri="s3://cache/objects/payload",
-            signed_url="http://ceph.example/cache/object?secret=signature",
+            download_url="http://ceph.example/cache/object",
         )
 
         asyncio.run(
@@ -860,12 +949,111 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         )
 
         call = instance.exec.await_args
-        self.assertNotIn("secret=signature", call.args[0])
+        self.assertNotIn("http://ceph.example", call.args[0])
         self.assertIn("chmod 755", call.args[0])
         self.assertEqual(
             call.kwargs["env"]["HARBOR_S3_URL"],
-            artifact.signed_url,
+            artifact.download_url,
         )
+
+    def test_auto_file_upload_falls_back_to_existing_http_transport(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._upload_backend = "auto"
+        instance._s3_upload_store = SimpleNamespace(
+            stage_file=Mock(side_effect=RuntimeError("S3 unavailable"))
+        )
+        instance._upload_file_http = AsyncMock()
+        instance.logger = Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "agent.tgz"
+            source.write_bytes(b"agent")
+            source.chmod(0o640)
+            asyncio.run(instance.upload_file(source, "/opt/agent.tgz"))
+
+        instance._upload_file_http.assert_awaited_once_with(
+            source, "/opt/agent.tgz", "640"
+        )
+        instance.logger.warning.assert_called_once()
+
+    def test_strict_s3_file_upload_does_not_hide_transport_failure(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._upload_backend = "s3"
+        instance._s3_upload_store = SimpleNamespace(
+            stage_file=Mock(side_effect=RuntimeError("S3 unavailable"))
+        )
+        instance._upload_file_http = AsyncMock()
+        instance.logger = Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "agent.tgz"
+            source.write_bytes(b"agent")
+            with self.assertRaisesRegex(RuntimeError, "S3 unavailable"):
+                asyncio.run(instance.upload_file(source, "/opt/agent.tgz"))
+
+        instance._upload_file_http.assert_not_awaited()
+
+    def test_auto_file_upload_falls_back_when_sandbox_cannot_read_s3(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        artifact = yicloud_opensandbox.S3UploadArtifact(
+            kind="file",
+            logical_digest="a" * 64,
+            payload_digest="b" * 64,
+            payload_size=5,
+            compression="none",
+            local_payload_path="/cache/payload",
+            object_key="objects/payload",
+            object_uri="s3://cache/objects/payload",
+            download_url="http://ceph.example/cache/object",
+        )
+        instance._upload_backend = "auto"
+        instance._s3_upload_store = SimpleNamespace(
+            stage_file=Mock(return_value=artifact)
+        )
+        instance._materialize_s3_file = AsyncMock(
+            side_effect=RuntimeError("anonymous read unavailable")
+        )
+        instance._upload_file_http = AsyncMock()
+        instance.logger = Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "agent.tgz"
+            source.write_bytes(b"agent")
+            source.chmod(0o644)
+            asyncio.run(instance.upload_file(source, "/opt/agent.tgz"))
+
+        instance._materialize_s3_file.assert_awaited_once_with(
+            artifact, "/opt/agent.tgz", "644"
+        )
+        instance._upload_file_http.assert_awaited_once_with(
+            source, "/opt/agent.tgz", "644"
+        )
+
+    def test_auto_directory_upload_falls_back_to_existing_http_transport(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._upload_backend = "auto"
+        instance._s3_upload_store = SimpleNamespace(
+            stage_directory=Mock(side_effect=RuntimeError("S3 unavailable"))
+        )
+        instance._upload_dir_http = AsyncMock()
+        instance.logger = Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "deps"
+            source.mkdir()
+            (source / "dep.whl").write_bytes(b"wheel")
+            asyncio.run(instance.upload_dir(source, "/opt/deps"))
+
+        instance._upload_dir_http.assert_awaited_once_with(source, "/opt/deps")
+        instance.logger.warning.assert_called_once()
 
     def test_s3_bootstrap_is_uploaded_once_only_when_native_tools_are_missing(
         self,
@@ -903,9 +1091,9 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         instance._upload_file_fast = AsyncMock(side_effect=capture_upload)
 
         async def ensure_twice() -> None:
-            signed_url = "http://ceph.example/cache/object?signature=test"
-            await instance._ensure_s3_downloader(signed_url)
-            await instance._ensure_s3_downloader(signed_url)
+            download_url = "http://ceph.example/cache/object"
+            await instance._ensure_s3_downloader(download_url)
+            await instance._ensure_s3_downloader(download_url)
 
         with patch.dict(
             yicloud_opensandbox.os.environ,

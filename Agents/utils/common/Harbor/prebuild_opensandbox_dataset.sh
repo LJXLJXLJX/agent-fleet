@@ -2,10 +2,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+
+# Use the same project configuration and runtime-override precedence as the
+# normal Agent Fleet entry points.
+# shellcheck source=../../../../scripts/config_loader.sh
+source "$REPO_ROOT/scripts/config_loader.sh"
+agent_fleet_load_config "$REPO_ROOT"
 
 DATASET_ROOT="${1:?usage: prebuild_opensandbox_dataset.sh DATASET_ROOT BENCHMARK_NAME}"
 BENCHMARK_NAME="${2:?usage: prebuild_opensandbox_dataset.sh DATASET_ROOT BENCHMARK_NAME}"
-YICLOUD_HARBOR_HOST="${YICLOUD_HARBOR_HOST:-${HARBOR_OPENSANDBOX_REGISTRY:-registry.gate.yicloud.com.cn}}"
+YICLOUD_HARBOR_HOST="${YICLOUD_HARBOR_HOST:-}"
 YICLOUD_HARBOR_PROJECT="${YICLOUD_HARBOR_PROJECT:-}"
 YICLOUD_HARBOR_TLS_VERIFY="${YICLOUD_HARBOR_TLS_VERIFY:-0}"
 HARBOR_OPENSANDBOX_DOCKER_CONFIG="${HARBOR_OPENSANDBOX_DOCKER_CONFIG:-${HOME}/.docker/config.json}"
@@ -107,6 +114,10 @@ print_warning() {
   fi
 }
 
+[[ -n "${YICLOUD_HARBOR_HOST}" ]] || {
+  print_error "[ERROR] set YICLOUD_HARBOR_HOST in config.env or config.local.env"
+  exit 1
+}
 [[ -n "${YICLOUD_HARBOR_PROJECT}" ]] || {
   print_error "[ERROR] set externally provisioned YICLOUD_HARBOR_PROJECT in config.local.env"
   exit 1
@@ -300,15 +311,16 @@ stop_periodic_gc() {
 }
 trap stop_periodic_gc EXIT
 
-if [[ "${HARBOR_OPENSANDBOX_DRY_RUN}" != 1 \
-  && "${HARBOR_OPENSANDBOX_PREBUILD_GC_INTERVAL_SEC}" != 0 ]]; then
+if [[ "${HARBOR_OPENSANDBOX_DRY_RUN}" != 1 ]]; then
   run_buildkit_gc
-  (
-    while sleep "${HARBOR_OPENSANDBOX_PREBUILD_GC_INTERVAL_SEC}"; do
-      run_buildkit_gc
-    done
-  ) &
-  gc_pid="$!"
+  if [[ "${HARBOR_OPENSANDBOX_PREBUILD_GC_INTERVAL_SEC}" != 0 ]]; then
+    (
+      while sleep "${HARBOR_OPENSANDBOX_PREBUILD_GC_INTERVAL_SEC}"; do
+        run_buildkit_gc
+      done
+    ) &
+    gc_pid="$!"
+  fi
 fi
 
 for task_dir in "${DATASET_ROOT}"/*; do

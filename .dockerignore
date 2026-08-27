@@ -1,0 +1,14 @@
+# Project-local credentials and configuration must never enter a Docker build
+# context. These files are mounted or loaded only at runtime.
+.env
+.env.*
+*.local.env
+*.local.env.bak.agent-fleet
+config.local.env
+.s3-profiles/
+
+# Local certificates and private keys follow the same rule.
+*.pem
+*.key
+*.crt
+*.cert

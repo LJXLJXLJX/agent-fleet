@@ -28,6 +28,7 @@ from opensandbox_image_manager import (  # noqa: E402
     environment_content_hash,
     normalize_oci_image_config,
     oci_archive_image_config,
+    package_source_build_args,
     parse_args,
     prepare,
     prepare_bundle,
@@ -84,6 +85,8 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
                 [
                     "--task-dir",
                     "/tmp/example-task",
+                    "--registry",
+                    "harbor.example.internal",
                     "--project",
                     "test-project",
                     "--dry-run",
@@ -91,6 +94,9 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
             )
 
         self.assertTrue(args.use_proxy)
+        self.assertEqual(
+            args.registry, "harbor.example.internal"
+        )
         self.assertEqual(args.build_network, "host")
         self.assertEqual(
             args.apt_mirror, "http://mirrors.tuna.tsinghua.edu.cn"
@@ -105,6 +111,23 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
             args.cargo_registry_url,
             "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/",
         )
+
+    def test_prepare_requires_registry_from_cli_or_environment(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "--registry or YICLOUD_HARBOR_HOST is required",
+        ):
+            prepare_bundle(Namespace(registry=""))
+
+        for registry in (
+            "https://harbor.example",
+            "harbor.example/project",
+        ):
+            with self.subTest(registry=registry), self.assertRaisesRegex(
+                ValueError,
+                "bare OCI registry host",
+            ):
+                prepare_bundle(Namespace(registry=registry))
 
     def test_loopback_proxy_requires_host_build_network(self) -> None:
         with patch.dict(
@@ -330,7 +353,7 @@ networks:
                 task_dir=task,
                 dataset_root=None,
                 include="",
-                registry="registry.gate.yicloud.com.cn",
+                registry="harbor.example.internal",
                 project="test-project",
                 task_repository="",
                 benchmark_name="seta",
@@ -359,7 +382,7 @@ networks:
         )
         self.assertRegex(
             prepared.main_image_ref,
-            r"^registry\.gate\.yicloud\.com\.cn/test-project/973@sha256:[0-9a-f]{64}$",
+            r"^harbor\.example\.internal/test-project/973@sha256:[0-9a-f]{64}$",
         )
         self.assertTrue(manifest["requirements"]["multi_service"])
 
@@ -389,6 +412,19 @@ networks:
         self.assertEqual(rendered.count("RUN set -eu;"), 1)
         self.assertIn("ARG NPM_CONFIG_REGISTRY", rendered)
         self.assertIn("ARG PIP_INDEX_URL", rendered)
+
+    def test_http_pip_index_is_explicitly_trusted(self) -> None:
+        http_args = package_source_build_args(
+            Namespace(pip_index_url="http://packages.internal:8080/simple"),
+            "host",
+        )
+        https_args = package_source_build_args(
+            Namespace(pip_index_url="https://pypi.tuna.tsinghua.edu.cn/simple"),
+            "host",
+        )
+
+        self.assertEqual(http_args["PIP_TRUSTED_HOST"], "packages.internal")
+        self.assertNotIn("PIP_TRUSTED_HOST", https_args)
 
     def test_render_preserves_debian_security_repository_path(self) -> None:
         rendered = render_build_dockerfile(
@@ -625,7 +661,7 @@ networks:
                 task_dir=None,
                 dataset_root=root,
                 include="0",
-                registry="registry.gate.yicloud.com.cn",
+                registry="harbor.example.internal",
                 project="test-project",
                 task_repository="",
                 benchmark_name="seta",
@@ -641,7 +677,10 @@ networks:
                 dry_run=True,
             )
             image_ref = prepare(args)
-        self.assertRegex(image_ref, r"^registry\.gate\.yicloud\.com\.cn/test-project/0@sha256:[0-9a-f]{64}$")
+        self.assertRegex(
+            image_ref,
+            r"^harbor\.example\.internal/test-project/0@sha256:[0-9a-f]{64}$",
+        )
 
     def test_registry_target_keeps_project_and_task_repository_separate(self) -> None:
         target = RegistryTarget("registry.example", "seta", "973")

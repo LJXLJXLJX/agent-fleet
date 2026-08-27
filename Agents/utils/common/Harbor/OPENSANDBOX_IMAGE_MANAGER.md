@@ -174,6 +174,29 @@ HARBOR_OPENSANDBOX_IMAGE_REF=<main digest_ref>
 
 An explicitly supplied Bundle takes precedence and can supply the main ref. An
 explicit image ref without a Bundle retains the old single-image behavior.
+Both forms must use fully qualified image references under the configured
+`YICLOUD_HARBOR_HOST`; the provider rejects bare references and other registries
+before creating a Sandbox.
+
+## Prebuild cache cleanup
+
+Dataset prebuild bounds local BuildKit cache growth. It runs one
+non-`--all` `docker buildx prune` before the batch and repeats it every 30
+minutes by default. Configure the interval, maximum cache size, minimum free
+space, and reserved cache space with:
+
+```bash
+HARBOR_OPENSANDBOX_PREBUILD_GC_INTERVAL_SEC=1800
+HARBOR_OPENSANDBOX_PREBUILD_GC_MAX_USED_SPACE=500GB
+HARBOR_OPENSANDBOX_PREBUILD_GC_MIN_FREE_SPACE=300GB
+HARBOR_OPENSANDBOX_PREBUILD_GC_RESERVED_SPACE=100GB
+```
+
+The initial prune always runs for a non-dry-run batch. Set the interval to `0`
+to disable only periodic GC after that initial prune. GC failures are logged
+without aborting the batch. Detailed prune output is written to the run's
+`buildkit-gc.log`. Images, containers, volumes, and OCI Registry artifacts are
+outside this cleanup.
 
 ## Prebuild cache cleanup
 

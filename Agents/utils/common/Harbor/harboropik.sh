@@ -262,6 +262,10 @@ validate_environment_backend() {
           exit 1
         fi
       done
+      if [[ -z "$YICLOUD_HARBOR_HOST" ]]; then
+        echo '[ERROR] required environment variable is unset: YICLOUD_HARBOR_HOST' >&2
+        exit 1
+      fi
       if [[ -z "${YICLOUD_SANDBOX_ENVIRONMENT_ID:-}" \
         && -z "${YICLOUD_SANDBOX_ENVIRONMENT_NAME:-}" ]]; then
         echo '[ERROR] OpenSandbox requires YICLOUD_SANDBOX_ENVIRONMENT_ID or YICLOUD_SANDBOX_ENVIRONMENT_NAME' >&2

@@ -46,7 +46,6 @@ TERMINAL_FAILURE_STATES = {
 }
 HOSTS_BLOCK_BEGIN = "# HARBOR COMPOSE BEGIN"
 HOSTS_BLOCK_END = "# HARBOR COMPOSE END"
-COMPOSE_START_MARKER_PREFIX = "/tmp/.harbor-compose-start-"
 # The YiCloud gateway currently rejects multipart bodies around 1 MiB and
 # above. Base64 expands each chunk by 4/3, so 512 KiB leaves enough room for
 # multipart metadata while avoiding thousands of tiny requests.
@@ -158,6 +157,28 @@ def _required_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"required environment variable is unset: {name}")
     return value
+
+
+def _required_registry_host() -> str:
+    host = _required_env("YICLOUD_HARBOR_HOST")
+    if "://" in host or "/" in host or "@" in host or any(
+        character.isspace() for character in host
+    ):
+        raise ValueError(
+            "YICLOUD_HARBOR_HOST must be a bare OCI registry host, "
+            f"got: {host!r}"
+        )
+    return host
+
+
+def _validate_managed_image_ref(ref: str, source: str) -> None:
+    host = _required_registry_host()
+    registry, separator, repository = ref.partition("/")
+    if registry != host or not separator or not repository:
+        raise RuntimeError(
+            f"{source} must use the configured OpenSandbox registry "
+            f"{host!r}, got: {ref!r}"
+        )
 
 
 def _require_yicloud_sdk() -> None:
@@ -478,9 +499,9 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         self._upload_backend = os.environ.get(
             "YICLOUD_SANDBOX_UPLOAD_BACKEND", "http"
         ).strip().lower()
-        if self._upload_backend not in {"http", "s3"}:
+        if self._upload_backend not in {"http", "s3", "auto"}:
             raise ValueError(
-                "YICLOUD_SANDBOX_UPLOAD_BACKEND must be http or s3"
+                "YICLOUD_SANDBOX_UPLOAD_BACKEND must be http, s3, or auto"
             )
         self._s3_download_timeout_sec = _positive_int(
             os.environ.get(
@@ -490,7 +511,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         )
         self._s3_upload_store = (
             S3UploadStore.from_environment()
-            if self._upload_backend == "s3"
+            if self._upload_backend in {"s3", "auto"}
             else None
         )
         self._s3_downloader_ready = False
@@ -529,8 +550,10 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             "YICLOUD_PUBLIC_KEY",
             "YICLOUD_SECRET_KEY",
             "YICLOUD_PROJECT_NAME",
+            "YICLOUD_HARBOR_HOST",
         ):
             _required_env(name)
+        _required_registry_host()
         if not (
             os.environ.get("YICLOUD_SANDBOX_ENVIRONMENT_ID", "").strip()
             or os.environ.get(
@@ -583,6 +606,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             ref = image.get("digest_ref") if schema == 2 else image.get("sandbox_ref")
             if not isinstance(ref, str) or not ref:
                 raise RuntimeError(f"Bundle service {name!r} has no immutable image reference")
+            _validate_managed_image_ref(ref, f"Bundle service {name!r} image")
             resolved[name] = ServiceRuntime(name=name, spec=spec)
         self._bundle = bundle
         self._services = resolved
@@ -637,6 +661,10 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
                 "YiCloud OpenSandbox requires a prebuilt image via "
                 "task.environment.docker_image or environment kwarg image_ref"
             )
+        _validate_managed_image_ref(
+            self._image_source_ref,
+            "YiCloud OpenSandbox image",
+        )
 
     def _initialize_service(self) -> None:
         _require_yicloud_sdk()
@@ -1065,25 +1093,10 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         )
 
     def _service_entrypoint(self, runtime: ServiceRuntime) -> list[str] | None:
-        start_command = self._service_start_command(runtime.spec)
-        if len(self._services) <= 1:
-            return start_command
-        if start_command is None:
-            raise RuntimeError(
-                "OpenSandbox multi-service startup requires an explicit start command"
-            )
-        # Compose service discovery is independent of depends_on. Hold every
-        # process until the controller has addresses for all peer aliases.
-        marker = shlex.quote(
-            f"{COMPOSE_START_MARKER_PREFIX}{runtime.sandbox_name}"
-        )
-        return [
-            "sh",
-            "-c",
-            f'set -e\nwhile [ ! -e {marker} ]; do sleep 1; done\nexec "$@"',
-            "harbor-compose-entrypoint",
-            *start_command,
-        ]
+        # YiCloud only schedules custom-image Sandboxes reliably with this
+        # neutral long-lived entrypoint. Start the Bundle's real command over
+        # execd after every service reaches Running and aliases are wired.
+        return ["sleep", "infinity"]
 
     def _make_service_sandbox_name(self, service: str) -> str:
         base = f"{self._make_sandbox_name()}-{service}".lower()
@@ -1324,11 +1337,24 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
                 raise RuntimeError(f"failed to inject service aliases into {runtime.name!r}: {result.stderr or result.stdout}")
 
     async def _release_service_entrypoint(self, runtime: ServiceRuntime) -> None:
-        marker = shlex.quote(
-            f"{COMPOSE_START_MARKER_PREFIX}{runtime.sandbox_name}"
-        )
+        start_command = self._service_start_command(runtime.spec)
+        if start_command is None:
+            return
+        service_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", runtime.name)
+        log_path = shlex.quote(f"/tmp/harbor-service-{service_name}.log")
+        pid_path = shlex.quote(f"/tmp/harbor-service-{service_name}.pid")
+        argv = " ".join(shlex.quote(item) for item in start_command)
         result = await self._run_service_command(
-            runtime, f"touch {marker}", timeout_sec=60
+            runtime,
+            # The wrapper's exit code comes from the liveness check, not the
+            # backgrounded service, so an instantly-crashing start command
+            # still surfaces here instead of leaving the sandbox Running.
+            f"nohup {argv} >{log_path} 2>&1 </dev/null & pid=$!; "
+            f"echo $pid >{pid_path}; "
+            "sleep 1; "
+            f"if ! kill -0 $pid 2>/dev/null; then "
+            f"tail -n 50 {log_path} >&2; exit 1; fi",
+            timeout_sec=60,
         )
         if result.return_code != 0:
             raise RuntimeError(
@@ -1604,7 +1630,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
                 EnvironmentId=self._environment_id,
                 Name=self._sandbox_name,
                 Image=self._create_image_input(sandbox, self._image_source_ref),
-                Entrypoint=["sh", "-c", "while :; do sleep 60; done"],
+                Entrypoint=["sleep", "infinity"],
                 Env=dict(self._persistent_env),
                 Resources=sandbox.models.CreateSandboxReqResources(
                     Cpu=self._request_cpu,
@@ -2509,7 +2535,10 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         await self._delete_service(runtime)
 
     def _uses_s3_upload(self) -> bool:
-        return getattr(self, "_upload_backend", "http") == "s3"
+        return getattr(self, "_upload_backend", "http") in {"s3", "auto"}
+
+    def _allows_http_upload_fallback(self) -> bool:
+        return getattr(self, "_upload_backend", "http") == "auto"
 
     def _s3_store(self) -> S3UploadStore:
         store = getattr(self, "_s3_upload_store", None)
@@ -2517,7 +2546,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             raise RuntimeError("YiCloud S3 upload backend is not configured")
         return store
 
-    async def _ensure_s3_downloader(self, signed_url: str) -> None:
+    async def _ensure_s3_downloader(self, download_url: str) -> None:
         if getattr(self, "_s3_downloader_ready", False):
             return
         lock = getattr(self, "_s3_downloader_lock", None)
@@ -2548,10 +2577,10 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
                     "task image cannot download S3 artifacts: install curl, "
                     "wget, python3, or bash"
                 )
-            if urlsplit(signed_url).scheme != "http":
+            if urlsplit(download_url).scheme != "http":
                 raise RuntimeError(
                     "task image only has bash, but the minimal S3 downloader "
-                    "requires an HTTP signed URL"
+                    "requires an HTTP object URL"
                 )
             upload_url = self._fast_upload_url()
             if not upload_url:
@@ -2628,7 +2657,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         target_path: str,
         mode: str,
     ) -> None:
-        await self._ensure_s3_downloader(artifact.signed_url)
+        await self._ensure_s3_downloader(artifact.download_url)
         parent = str(Path(target_path).parent)
         temporary = f"{target_path}.harbor-upload-{time.time_ns()}.tmp"
         command = (
@@ -2640,7 +2669,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         result = await self.exec(
             command,
             cwd="/",
-            env={"HARBOR_S3_URL": artifact.signed_url},
+            env={"HARBOR_S3_URL": artifact.download_url},
             timeout_sec=self._s3_download_timeout_sec + 60,
             user="root",
         )
@@ -2655,7 +2684,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
     async def _materialize_s3_directory(
         self, artifact: S3UploadArtifact, target_dir: str
     ) -> None:
-        await self._ensure_s3_downloader(artifact.signed_url)
+        await self._ensure_s3_downloader(artifact.download_url)
         temporary = f"/tmp/harbor-s3-{time.time_ns()}.tar"
         command = (
             f"({self._s3_download_command(artifact, temporary)}) && "
@@ -2667,7 +2696,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         result = await self.exec(
             command,
             cwd="/",
-            env={"HARBOR_S3_URL": artifact.signed_url},
+            env={"HARBOR_S3_URL": artifact.download_url},
             timeout_sec=self._s3_download_timeout_sec + 300,
             user="root",
         )
@@ -2686,20 +2715,36 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         mode = f"{stat.S_IMODE(source.stat().st_mode):o}"
         if self._uses_s3_upload():
             started = time.monotonic()
-            artifact = await asyncio.to_thread(
-                self._s3_store().stage_file, source
-            )
-            await self._materialize_s3_file(artifact, target_path, mode)
-            elapsed = max(time.monotonic() - started, 0.001)
-            self.logger.info(
-                "YiCloud upload complete backend=s3 kind=file "
-                "target=%s digest=%s size_bytes=%s elapsed_seconds=%.3f",
-                target_path,
-                artifact.logical_digest,
-                artifact.payload_size,
-                elapsed,
-            )
-            return
+            try:
+                artifact = await asyncio.to_thread(
+                    self._s3_store().stage_file, source
+                )
+                await self._materialize_s3_file(artifact, target_path, mode)
+            except Exception as exc:
+                if not self._allows_http_upload_fallback():
+                    raise
+                self.logger.warning(
+                    "YiCloud S3 file transport failed; falling back to HTTP "
+                    "target=%s error=%s",
+                    target_path,
+                    exc,
+                )
+            else:
+                elapsed = max(time.monotonic() - started, 0.001)
+                self.logger.info(
+                    "YiCloud upload complete backend=s3 kind=file "
+                    "target=%s digest=%s size_bytes=%s elapsed_seconds=%.3f",
+                    target_path,
+                    artifact.logical_digest,
+                    artifact.payload_size,
+                    elapsed,
+                )
+                return
+        await self._upload_file_http(source, target_path, mode)
+
+    async def _upload_file_http(
+        self, source: Path, target_path: str, mode: str
+    ) -> None:
         parent = str(Path(target_path).parent)
         fast_upload_url = self._fast_upload_url()
         remote_chunk = f"/tmp/harbor-upload-{time.time_ns()}.chunk"
@@ -2771,28 +2816,43 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             raise RuntimeError(f"upload source is not a directory: {source}")
         if self._uses_s3_upload():
             started = time.monotonic()
-            artifact = await asyncio.to_thread(
-                self._s3_store().stage_directory, source
-            )
-            await self._materialize_s3_directory(artifact, target_dir)
-            elapsed = max(time.monotonic() - started, 0.001)
-            self.logger.info(
-                "YiCloud upload complete backend=s3 kind=directory "
-                "target=%s digest=%s payload_bytes=%s compression=%s "
-                "elapsed_seconds=%.3f",
-                target_dir,
-                artifact.logical_digest,
-                artifact.payload_size,
-                artifact.compression,
-                elapsed,
-            )
-            return
+            try:
+                artifact = await asyncio.to_thread(
+                    self._s3_store().stage_directory, source
+                )
+                await self._materialize_s3_directory(artifact, target_dir)
+            except Exception as exc:
+                if not self._allows_http_upload_fallback():
+                    raise
+                self.logger.warning(
+                    "YiCloud S3 directory transport failed; falling back to "
+                    "HTTP target=%s error=%s",
+                    target_dir,
+                    exc,
+                )
+            else:
+                elapsed = max(time.monotonic() - started, 0.001)
+                self.logger.info(
+                    "YiCloud upload complete backend=s3 kind=directory "
+                    "target=%s digest=%s payload_bytes=%s compression=%s "
+                    "elapsed_seconds=%.3f",
+                    target_dir,
+                    artifact.logical_digest,
+                    artifact.payload_size,
+                    artifact.compression,
+                    elapsed,
+                )
+                return
+        await self._upload_dir_http(source, target_dir)
+
+    async def _upload_dir_http(self, source: Path, target_dir: str) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             archive = Path(tmp_dir) / "upload.tar.gz"
             with tarfile.open(archive, "w:gz") as tar:
                 tar.add(source, arcname=".")
             remote_archive = f"/tmp/harbor-upload-{time.time_ns()}.tar.gz"
-            await self.upload_file(archive, remote_archive)
+            mode = f"{stat.S_IMODE(archive.stat().st_mode):o}"
+            await self._upload_file_http(archive, remote_archive, mode)
             result = await self.exec(
                 f"mkdir -p {shlex.quote(target_dir)} && "
                 f"tar xzf {shlex.quote(remote_archive)} -C {shlex.quote(target_dir)} && "

@@ -53,10 +53,46 @@ YICLOUD_HARBOR_PASSWORD=your-harbor-password
 # is verified with 0.
 YICLOUD_HARBOR_TLS_VERIFY=0
 
-YICLOUD_SANDBOX_UPLOAD_BACKEND=s3
-YICLOUD_SANDBOX_S3_CONFIG=/absolute/path/to/s3cfg
-YICLOUD_SANDBOX_S3_BUCKET=your-bucket
+YICLOUD_SANDBOX_S3_PROFILE=provider-name
 ```
+
+Each provider is an ignored, project-local profile:
+
+```text
+.s3-profiles/provider-name/
+├── profile.env
+└── s3cfg
+```
+
+`profile.env` binds the provider credentials and write endpoint in `s3cfg` to
+one bucket, credential-free Sandbox read origin, and immutable object prefix:
+
+```bash
+YICLOUD_SANDBOX_S3_BUCKET=your-bucket
+YICLOUD_SANDBOX_S3_READ_ORIGIN=http://s3.internal.example/your-bucket
+YICLOUD_SANDBOX_S3_PREFIX=agent-fleet-upload/v1
+```
+
+Create a separate directory, and preferably separate least-privilege
+write credentials, for every S3 provider. The read origin must already address
+the bucket and must not contain credentials, query parameters, or fragments;
+the bucket policy must allow anonymous `GetObject` from Sandbox networks.
+Switch providers only by changing
+`YICLOUD_SANDBOX_S3_PROFILE` in `config.local.env`. Agent Fleet rejects path
+traversal, symlinked profile files, unknown or duplicate metadata keys, and
+standalone S3 values that conflict with the selected profile. Selecting a
+profile defaults `YICLOUD_SANDBOX_UPLOAD_BACKEND` to `auto`: S3 is preferred,
+while an S3 staging or Sandbox materialization failure falls back to the
+existing authenticated HTTP upload path. Set the value explicitly to `s3`
+when failure must be strict. Without a profile, either backend plus
+`YICLOUD_SANDBOX_S3_CONFIG`, `YICLOUD_SANDBOX_S3_BUCKET`, and
+`YICLOUD_SANDBOX_S3_READ_ORIGIN` remain supported.
+
+Every YiCloud OpenSandbox create request uses the provider-required
+`["sleep", "infinity"]` entrypoint. After the Sandbox reaches `Running` and
+service aliases are installed, Agent Fleet launches the Bundle's resolved
+start command through execd. This changes only OpenSandbox startup; task images
+and other environment backends retain their original behavior.
 
 Use the immutable environment ID in automation. The runner rejects requests
 without an explicit environment ID or exact environment name.
@@ -104,9 +140,10 @@ Prebuild performs a bounded BuildKit cache prune before starting and every 30
 minutes while it runs. Defaults are `max-used-space=500GB`,
 `min-free-space=300GB`, and `reserved-space=100GB`; all four values are
 configurable through `HARBOR_OPENSANDBOX_PREBUILD_GC_*`. Set
-`HARBOR_OPENSANDBOX_PREBUILD_GC_INTERVAL_SEC=0` to disable GC. It prunes only
-unused BuildKit cache and does not delete images, containers, volumes, or
-artifacts already published to the OCI Registry.
+`HARBOR_OPENSANDBOX_PREBUILD_GC_INTERVAL_SEC=0` to disable only periodic GC;
+the initial prune still runs for every non-dry-run batch. It prunes only unused
+BuildKit cache and does not delete images, containers, volumes, or artifacts
+already published to the OCI Registry.
 
 Already published content-addressed images are reused in the task-specific
 repository. Unsupported environment definitions are listed as skipped in the
@@ -119,7 +156,7 @@ prebuild report; unsupported runtime capabilities fail before creation.
 - An image preparation failure occurs before Sandbox creation. Verify Buildx,
   registry login, and the task Dockerfile.
 - An upload failure should be diagnosed separately from agent execution. Check
-  S3 credentials, bucket access, DNS, and the signed download URL.
+  development-host S3 credentials, bucket policy, anonymous read URL, and DNS.
 - A model request failure means the instance started, but its configured model
   gateway is unreachable or rejected the request.
 

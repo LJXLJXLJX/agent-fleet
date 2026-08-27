@@ -177,10 +177,10 @@ Typical dataset paths:
 | `HARBOR_TIMEOUT_MULTIPLIER` | General Harbor timeout multiplier |
 | `HARBOR_AGENT_TIMEOUT_MULTIPLIER` | Agent execution timeout override |
 | `HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER` | Agent setup timeout multiplier |
-| `HARBOR_OPENSANDBOX_IMAGE_REF` | Legacy explicit single-image override; automatic preparation is skipped when set without a Bundle Manifest |
-| `HARBOR_OPENSANDBOX_BUNDLE_MANIFEST` | Optional versioned service Bundle Manifest; automatic preparation writes one under the current task attempt's job directory |
+| `HARBOR_OPENSANDBOX_IMAGE_REF` | Legacy explicit single-image override; it must be fully qualified under `YICLOUD_HARBOR_HOST` |
+| `HARBOR_OPENSANDBOX_BUNDLE_MANIFEST` | Optional versioned service Bundle Manifest; every service image must be fully qualified under `YICLOUD_HARBOR_HOST` |
 | `HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT` | H-local Registry records, image locks, build logs, and immutable Bundle cache root |
-| `YICLOUD_HARBOR_HOST` | New Harbor registry host used by `skopeo` |
+| `YICLOUD_HARBOR_HOST` | Required Harbor registry host used for publication and every OpenSandbox image pull; set the real value in `config.local.env` or the environment |
 | `YICLOUD_HARBOR_PROJECT` | Externally provisioned Harbor Project for the selected benchmark; task repositories are derived per task |
 | `YICLOUD_HARBOR_TLS_VERIFY` | Whether `skopeo` verifies the configured Harbor TLS certificate; current internal ingress requires `0` |
 | `YICLOUD_SANDBOX_CPU` | OpenSandbox request CPU flavor, default `2` to match the current prewarm pool |
@@ -190,13 +190,14 @@ Typical dataset paths:
 | `YICLOUD_SANDBOX_STATUS_LOG_INTERVAL_SEC` | Interval for Pending/state progress diagnostics, default `30` |
 | `YICLOUD_SANDBOX_RETAIN_ON_START_FAILURE` | Debug-only switch that skips automatic deletion after environment start failure, default `0` |
 | `YICLOUD_SANDBOX_RETAIN_AFTER_TRIAL` | Debug-only switch that retains a completed trial Sandbox until platform expiry, default `0` |
-| `YICLOUD_SANDBOX_UPLOAD_BACKEND` | Agent/task input transport: `http` or direct object-store `s3`; generic default `http`, YiCloud launcher default `s3` |
-| `YICLOUD_SANDBOX_S3_CONFIG` | Read-only s3cmd configuration path inside the Harbor runner |
+| `YICLOUD_SANDBOX_UPLOAD_BACKEND` | OpenSandbox Agent/task input transport: `http`, strict object-store `s3`, or S3-preferred `auto` with the existing HTTP fallback; default `http`, while selecting an S3 profile implies `auto` unless explicitly set to strict `s3` |
+| `YICLOUD_SANDBOX_S3_PROFILE` | Project-local provider profile under `.s3-profiles/<name>`; selecting one implies the `auto` backend by default and atomically resolves config, bucket, anonymous read origin, and prefix |
+| `YICLOUD_SANDBOX_S3_CONFIG` | s3cmd configuration path available to the Harbor runner; resolved from the selected profile or supplied directly for legacy use |
 | `YICLOUD_SANDBOX_S3_BUCKET` | Bucket for immutable Agent and task input objects |
+| `YICLOUD_SANDBOX_S3_READ_ORIGIN` | Credential-free internal HTTP(S) URL that addresses the bucket; Sandbox object URLs append the immutable object key |
 | `YICLOUD_SANDBOX_S3_PREFIX` | Versioned content-addressed object prefix, default `agent-fleet-upload/v1` |
 | `YICLOUD_SANDBOX_S3_CACHE_ROOT` | H-local persistent cache for deterministic file and directory payloads |
 | `YICLOUD_SANDBOX_S3_LOCK_ROOT` | H-local lock and publication index directory; never store it in S3 |
-| `YICLOUD_SANDBOX_S3_SIGNED_URL_TTL_SEC` | Lifetime of per-object signed GET URLs, default `3600` |
 | `YICLOUD_SANDBOX_S3_DOWNLOAD_TIMEOUT_SEC` | Sandbox download and verification timeout, default `1800` |
 | `YICLOUD_SANDBOX_S3_DIRECTORY_COMPRESSION` | Deterministic directory snapshot mode: `auto`, `none`, or `gzip`; default `auto` |
 | `YICLOUD_SANDBOX_S3CMD` | s3cmd executable used by the Harbor runner; defaults to the pinned runner environment |

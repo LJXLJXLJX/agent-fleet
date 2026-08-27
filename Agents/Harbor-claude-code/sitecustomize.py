@@ -210,6 +210,19 @@ def _patch_claude_code_realtime_hooks() -> None:
     async def patched_install(self, environment):  # type: ignore[no-untyped-def]
         extra_env = getattr(self, "_extra_env", None)
         npm_registry = (extra_env or {}).get("NPM_CONFIG_REGISTRY", "")
+        opensandbox_runtime = (
+            os.environ.get("HARBOR_ENVIRONMENT_TYPE", "").strip().lower()
+            == "opensandbox"
+        )
+        local_claude_tgz = (extra_env or {}).get(
+            "CC_OPIK_CLAUDE_TGZ_PATH", "/opt/tb-opik/claude-code.tgz"
+        )
+        local_node_runtime = (
+            (extra_env or {}).get(
+                "CC_OPIK_PY_WHEEL_DIR", "/opt/tb-opik/python-wheels"
+            )
+            + "/node-runtime.tar.xz"
+        )
 
         # Intercept both exec_as_root and exec_as_agent during install so that:
         #   exec_as_root: keep the task image's apt sources intact and only
@@ -233,20 +246,29 @@ def _patch_claude_code_realtime_hooks() -> None:
                 if npm_registry
                 else ""
             )
-            claude_tgz_path = shlex.quote(
-                (extra_env or {}).get("CC_OPIK_CLAUDE_TGZ_PATH", "/opt/tb-opik/claude-code.tgz")
-            )
+            claude_tgz_path = shlex.quote(local_claude_tgz)
             claude_tgz_url = shlex.quote((extra_env or {}).get("HARBOR_LOCAL_CLAUDE_TGZ_URL", ""))
-            node_runtime_path = shlex.quote(
-                (extra_env or {}).get("CC_OPIK_PY_WHEEL_DIR", "/opt/tb-opik/python-wheels")
-                + "/node-runtime.tar.xz"
-            )
+            node_runtime_path = shlex.quote(local_node_runtime)
             npm_cache_path = shlex.quote(
                 (extra_env or {}).get("CC_OPIK_NPM_CACHE_DIR", "")
                 or (extra_env or {}).get("CC_OPIK_PY_WHEEL_DIR", "/opt/tb-opik/python-wheels")
                 + "/npm-cache"
             )
             node_dist_url = shlex.quote((extra_env or {}).get("CC_NODE_DIST_URL", ""))
+            node_runtime_condition = (
+                f"[ -f {node_runtime_path} ]"
+                if opensandbox_runtime
+                else (
+                    "! command -v npm >/dev/null 2>&1 && "
+                    f"[ -f {node_runtime_path} ] && "
+                    "command -v python3 >/dev/null 2>&1"
+                )
+            )
+            node_fallback_condition = (
+                "node_runtime_required"
+                if opensandbox_runtime
+                else "! command -v npm >/dev/null 2>&1"
+            )
             return (
                 "set -euo pipefail; "
                 f"if [ ! -f {claude_tgz_path} ] && [ -n {claude_tgz_url} ]; then "
@@ -259,34 +281,54 @@ def _patch_claude_code_realtime_hooks() -> None:
                 "else "
                 f"  claude_tgz_path={claude_tgz_path}; "
                 "fi; "
+                "node_runtime_required() { "
+                "  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then "
+                "    return 0; "
+                "  fi; "
+                "  node -e 'process.exit(Number(process.versions.node.split(\".\")[0]) >= 18 ? 0 : 1)' "
+                "    >/dev/null 2>&1; "
+                "}; "
                 # Prefer the offline Node runtime prepared by monitor_harbor.sh.
-                # SWE-bench task images often lack npm, and apt may be slow or
-                # unavailable inside the isolated task container.
-                "if ! command -v npm >/dev/null 2>&1 && [ -f "
-                f"{node_runtime_path}"
-                " ] && command -v python3 >/dev/null 2>&1; then "
+                # Task images may lack npm or carry a Node release too old for
+                # Claude Code. In both cases the S3-materialized runtime is the
+                # authoritative Node environment; apt is only a final fallback.
+                f"if {node_runtime_condition}; then "
                 "  node_dir=\"$(mktemp -d /tmp/tb-node-XXXXXX)\"; "
-                "  python3 - <<'PY' "
+                "  node_extract_ok=0; "
+                "  if command -v python3 >/dev/null 2>&1; then "
+                "    if python3 - <<'PY' "
                 f"{node_runtime_path}"
                 " \"$node_dir\"\n"
                 "import sys, tarfile\n"
                 "with tarfile.open(sys.argv[1]) as archive:\n"
                 "    archive.extractall(sys.argv[2])\n"
                 "PY\n"
-                "  node_bin=\"$(find \"$node_dir\" -path '*/bin/npm' -print -quit 2>/dev/null)\"; "
-                "  if [ -n \"$node_bin\" ]; then "
+                "    then node_extract_ok=1; fi; "
+                "  elif command -v tar >/dev/null 2>&1 && "
+                f"tar -xJf {node_runtime_path} -C \"$node_dir\"; then "
+                "    node_extract_ok=1; "
+                "  fi; "
+                "  node_bin=\"\"; "
+                "  if [ \"$node_extract_ok\" = 1 ]; then "
+                "    node_bin=\"$(find \"$node_dir\" -type f -path '*/bin/node' -print -quit 2>/dev/null)\"; "
+                "  fi; "
+                "  if [ -n \"$node_bin\" ] && "
+                "\"$node_bin\" -e 'process.exit(Number(process.versions.node.split(\".\")[0]) >= 18 ? 0 : 1)' "
+                "    >/dev/null 2>&1; then "
                 "    node_runtime_bin=\"$(dirname \"$node_bin\")\"; "
                 "    mkdir -p \"$HOME/.local/bin\"; "
                 "    ln -sf \"$node_runtime_bin/node\" \"$HOME/.local/bin/node\" 2>/dev/null || true; "
                 "    ln -sf \"$node_runtime_bin/npm\" \"$HOME/.local/bin/npm\" 2>/dev/null || true; "
                 "    ln -sf \"$node_runtime_bin/npx\" \"$HOME/.local/bin/npx\" 2>/dev/null || true; "
-                "    export PATH=\"$HOME/.local/bin:$node_runtime_bin:$PATH\"; "
+                "    export PATH=\"$node_runtime_bin:$HOME/.local/bin:$PATH\"; "
+                "    hash -r 2>/dev/null || true; "
+                "    echo \"Using S3 Node runtime: $(node --version)\" >&2; "
                 "  fi; "
                 "fi; "
                 # Sandboxes without host mounts can get Node from an explicitly
                 # configured, Sandbox-reachable dist endpoint instead of
                 # depending on the task image's package manager.
-                "if ! command -v npm >/dev/null 2>&1 && [ -n "
+                f"if {node_fallback_condition} && [ -n "
                 f"{node_dist_url}"
                 " ] && command -v python3 >/dev/null 2>&1; then "
                 "  node_dist_tgz=\"$(mktemp /tmp/tb-node-dist-XXXXXX.tgz)\"; "
@@ -303,7 +345,7 @@ def _patch_claude_code_realtime_hooks() -> None:
                 "    archive.extractall(sys.argv[2])\n"
                 "PY\n"
                 "    then "
-                "      node_bin=\"$(find \"$node_dir\" -path '*/bin/npm' -print -quit 2>/dev/null)\"; "
+                "      node_bin=\"$(find \"$node_dir\" -type f -path '*/bin/node' -print -quit 2>/dev/null)\"; "
                 "      if [ -n \"$node_bin\" ]; then "
                 "        node_runtime_bin=\"$(dirname \"$node_bin\")\"; "
                 "        mkdir -p \"$HOME/.local/bin\"; "
@@ -311,6 +353,7 @@ def _patch_claude_code_realtime_hooks() -> None:
                 "        ln -sf \"$node_runtime_bin/npm\" \"$HOME/.local/bin/npm\" 2>/dev/null || true; "
                 "        ln -sf \"$node_runtime_bin/npx\" \"$HOME/.local/bin/npx\" 2>/dev/null || true; "
                 "        export PATH=\"$HOME/.local/bin:$node_runtime_bin:$PATH\"; "
+                "        hash -r 2>/dev/null || true; "
                 "      fi; "
                 "    fi; "
                 "  fi; "
@@ -328,7 +371,7 @@ def _patch_claude_code_realtime_hooks() -> None:
                 "  done; "
                 "  return 1; "
                 "}; "
-                "if ! command -v npm >/dev/null 2>&1; then "
+                f"if {node_fallback_condition}; then "
                 "  if command -v apk >/dev/null 2>&1; then "
                 "    apk add --no-cache nodejs npm bash curl; "
                 "  elif command -v apt-get >/dev/null 2>&1; then "
@@ -378,7 +421,19 @@ def _patch_claude_code_realtime_hooks() -> None:
             _self, environment, command=None, env=None, cwd=None, timeout_sec=None,
         ):
             if command and "apt-get" in command:
-                command = f"set -euo pipefail; {_apt_fix}{command}"
+                original_command = f"set -euo pipefail; {_apt_fix}{command}"
+                if opensandbox_runtime:
+                    local_runtime_guard = (
+                        f"[ -f {shlex.quote(local_claude_tgz)} ] && "
+                        f"[ -f {shlex.quote(local_node_runtime)} ]"
+                    )
+                    command = (
+                        f"if {local_runtime_guard}; then "
+                        "echo 'OpenSandbox local Claude runtime ready; skip APT bootstrap' >&2; "
+                        f"else {original_command}; fi"
+                    )
+                else:
+                    command = original_command
             return await original_exec_as_root(
                 environment, command=command, env=env, cwd=cwd, timeout_sec=timeout_sec,
             )

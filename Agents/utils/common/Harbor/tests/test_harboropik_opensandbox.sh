@@ -86,7 +86,7 @@ run_dry() {
     HARBOR_ENVIRONMENT_TYPE="$environment_type" \
     HARBOR_OPENSANDBOX_IMAGE_REF="$image_ref" \
     HARBOR_OPENSANDBOX_BUNDLE_MANIFEST="$bundle_manifest" \
-    YICLOUD_HARBOR_HOST=registry.gate.yicloud.com.cn \
+    YICLOUD_HARBOR_HOST=harbor.example.internal \
     YICLOUD_HARBOR_PROJECT="${RUN_DRY_HARBOR_PROJECT-test-project}" \
     HARBOR_OPENSANDBOX_IMAGE_MANAGER="$manager" \
     HARBOR_OPIK_BIN="$tmp/bin/fake-harbor" \
@@ -105,7 +105,7 @@ run_dry() {
 
 automatic="$(run_dry '' "$HARBOR_DIR/opensandbox_image_manager.py" '{}')"
 grep -F -- '--env yicloud_opensandbox:YiCloudOpenSandboxEnvironment' <<< "$automatic" >/dev/null
-grep -E -- '--ek image_ref=registry\.gate\.yicloud\.com\.cn/test-project/0@sha256:[0-9a-f]{64}' \
+grep -E -- '--ek image_ref=harbor\.example\.internal/test-project/0@sha256:[0-9a-f]{64}' \
   <<< "$automatic" >/dev/null
 grep -F -- '--ek lifecycle_minutes=120' <<< "$automatic" >/dev/null
 grep -F -- '--mounts-json' <<< "$automatic" >/dev/null
@@ -125,7 +125,7 @@ assert bundle["schema_version"] == 2
 assert bundle["main"] == "main"
 assert bundle["registry"]["repository"] == "test-project/0"
 assert bundle["services"]["main"]["image"]["digest_ref"].startswith(
-    "registry.gate.yicloud.com.cn/test-project/0@sha256:"
+    "harbor.example.internal/test-project/0@sha256:"
 )
 ' "$automatic_bundle"
 
@@ -171,7 +171,7 @@ for force_build in 1 true; do
     '' "$HARBOR_DIR/opensandbox_image_manager.py" '{}' auto opensandbox \
     "$force_build")"
   grep -E -- \
-    '--ek image_ref=registry\.gate\.yicloud\.com\.cn/test-project/0@sha256:[0-9a-f]{64}' \
+    '--ek image_ref=harbor\.example\.internal/test-project/0@sha256:[0-9a-f]{64}' \
     <<< "$forced" >/dev/null
 done
 
@@ -185,7 +185,7 @@ if grep -F -- '--ek image_ref=' <<< "$docker_run" >/dev/null; then
 fi
 
 automatic_seta="$(run_dry '' "$HARBOR_DIR/opensandbox_image_manager.py" '{}' seta)"
-grep -E -- '--ek image_ref=registry\.gate\.yicloud\.com\.cn/test-project/0@sha256:[0-9a-f]{64}' \
+grep -E -- '--ek image_ref=harbor\.example\.internal/test-project/0@sha256:[0-9a-f]{64}' \
   <<< "$automatic_seta" >/dev/null
 grep -F -- "--path $tmp/dataset" <<< "$automatic_seta" >/dev/null
 if grep -F -- '--dataset seta-env' <<< "$automatic_seta" >/dev/null; then

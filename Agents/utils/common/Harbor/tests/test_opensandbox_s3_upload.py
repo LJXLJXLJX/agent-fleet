@@ -21,20 +21,14 @@ class S3UploadStoreTest(unittest.TestCase):
         return S3UploadStore(
             config_path=config,
             bucket="cache",
+            read_origin="http://ceph.example/cache",
             cache_root=root / "cache",
             lock_root=root / "locks",
             directory_compression="none",
         )
 
     def publish_locally(self, store: S3UploadStore):
-        return (
-            patch.object(store, "_ensure_remote"),
-            patch.object(
-                store,
-                "_signed_url",
-                return_value="http://ceph.example/cache/object?signature=test",
-            ),
-        )
+        return patch.object(store, "_ensure_remote")
 
     def test_file_uses_stable_content_addressed_object(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -42,9 +36,9 @@ class S3UploadStoreTest(unittest.TestCase):
             source = root / "agent.tgz"
             source.write_bytes(b"agent-runtime")
             store = self.make_store(root)
-            remote, signed = self.publish_locally(store)
+            remote = self.publish_locally(store)
 
-            with remote, signed:
+            with remote:
                 first = store.stage_file(source)
                 second = store.stage_file(source)
 
@@ -53,6 +47,11 @@ class S3UploadStoreTest(unittest.TestCase):
             self.assertEqual(first.logical_digest, digest)
             self.assertIn(f"/{digest[:2]}/{digest}/", first.object_key)
             self.assertTrue(Path(first.local_payload_path).is_file())
+            self.assertEqual(
+                first.download_url,
+                f"http://ceph.example/cache/{first.object_key}",
+            )
+            self.assertNotIn("?", first.download_url)
 
     def test_directory_archive_preserves_modes_and_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -64,9 +63,9 @@ class S3UploadStoreTest(unittest.TestCase):
             executable.chmod(0o755)
             (source / "run-link").symlink_to("run.sh")
             store = self.make_store(root)
-            remote, signed = self.publish_locally(store)
+            remote = self.publish_locally(store)
 
-            with remote, signed:
+            with remote:
                 artifact = store.stage_directory(source)
             extracted = root / "extracted"
             extracted.mkdir()
@@ -76,16 +75,24 @@ class S3UploadStoreTest(unittest.TestCase):
             self.assertEqual((extracted / "run.sh").stat().st_mode & 0o777, 0o755)
             self.assertEqual(os.readlink(extracted / "run-link"), "run.sh")
 
-    def test_virtual_host_signed_url_is_rewritten_to_path_style(self) -> None:
+    def test_read_origin_rejects_credentials_query_and_fragment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = self.make_store(Path(tmp))
-            rewritten = store._path_style_url(
-                "http://cache.ceph.example:80/prefix/object?sig=abc"
-            )
-            self.assertEqual(
-                rewritten,
-                "http://ceph.example:80/cache/prefix/object?sig=abc",
-            )
+            root = Path(tmp)
+            config = root / "s3cfg"
+            config.write_text("[default]\n", encoding="utf-8")
+            for origin in (
+                "http://key@ceph.example/cache",
+                "http://ceph.example/cache?signature=test",
+                "http://ceph.example/cache#fragment",
+            ):
+                with self.subTest(origin=origin), self.assertRaises(ValueError):
+                    S3UploadStore(
+                        config_path=config,
+                        bucket="cache",
+                        read_origin=origin,
+                        cache_root=root / "cache",
+                        lock_root=root / "locks",
+                    )
 
 
 if __name__ == "__main__":
