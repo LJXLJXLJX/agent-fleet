@@ -1,17 +1,23 @@
 import hashlib
 import os
+import subprocess
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
+from urllib.request import ProxyHandler, Request
 
 HARBOR_DIR = Path(__file__).resolve().parents[1]
 if str(HARBOR_DIR) not in os.sys.path:
     os.sys.path.insert(0, str(HARBOR_DIR))
 
-from opensandbox_s3_upload import S3UploadStore, S3WriteUnavailableError
+from opensandbox_s3_upload import (
+    S3UploadStore,
+    S3WriteUnavailableError,
+    _direct_urlopen,
+)
 
 
 class S3UploadStoreTest(unittest.TestCase):
@@ -38,6 +44,22 @@ class S3UploadStoreTest(unittest.TestCase):
 
     def publish_locally(self, store: S3UploadStore):
         return patch.object(store, "_ensure_remote")
+
+    def test_anonymous_probe_bypasses_ambient_proxy(self) -> None:
+        opener = MagicMock()
+        response = MagicMock()
+        opener.open.return_value = response
+        request = Request("http://ceph.example/cache/object", method="HEAD")
+
+        with patch(
+            "opensandbox_s3_upload.build_opener", return_value=opener
+        ) as build:
+            self.assertIs(_direct_urlopen(request, 15), response)
+
+        handler = build.call_args.args[0]
+        self.assertIsInstance(handler, ProxyHandler)
+        self.assertEqual(handler.proxies, {})
+        opener.open.assert_called_once_with(request, timeout=15)
 
     def test_file_uses_stable_content_addressed_object(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -112,7 +134,7 @@ class S3UploadStoreTest(unittest.TestCase):
 
             with (
                 patch(
-                    "opensandbox_s3_upload.urlopen",
+                    "opensandbox_s3_upload._direct_urlopen",
                     return_value=self.anonymous_response(
                         source.stat().st_size
                     ),
@@ -142,7 +164,9 @@ class S3UploadStoreTest(unittest.TestCase):
             )
 
             with (
-                patch("opensandbox_s3_upload.urlopen", side_effect=missing),
+                patch(
+                    "opensandbox_s3_upload._direct_urlopen", side_effect=missing
+                ),
                 self.assertRaises(S3WriteUnavailableError),
             ):
                 store.stage_file(source)
@@ -164,7 +188,9 @@ class S3UploadStoreTest(unittest.TestCase):
             )
 
             with (
-                patch("opensandbox_s3_upload.urlopen", side_effect=missing),
+                patch(
+                    "opensandbox_s3_upload._direct_urlopen", side_effect=missing
+                ),
                 patch("opensandbox_s3_upload.subprocess.run") as run,
                 self.assertRaises(PermissionError),
             ):
@@ -183,7 +209,7 @@ class S3UploadStoreTest(unittest.TestCase):
 
             with (
                 patch(
-                    "opensandbox_s3_upload.urlopen",
+                    "opensandbox_s3_upload._direct_urlopen",
                     return_value=self.anonymous_response(
                         source.stat().st_size
                     ),
@@ -222,6 +248,112 @@ class S3UploadStoreTest(unittest.TestCase):
                 artifact.local_payload_path,
                 artifact.object_uri,
             )
+
+    def test_anonymous_forbidden_uses_authenticated_exact_key_probe(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "agent.tgz"
+            source.write_bytes(b"agent-runtime")
+            store = self.make_store(root)
+            forbidden = HTTPError(
+                "http://ceph.example/cache/object",
+                403,
+                "Forbidden",
+                None,
+                None,
+            )
+            missing = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            uploaded = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+
+            with (
+                patch(
+                    "opensandbox_s3_upload._direct_urlopen",
+                    side_effect=[
+                        forbidden,
+                        self.anonymous_response(source.stat().st_size),
+                    ],
+                ),
+                patch.object(store, "_run", side_effect=[missing, uploaded]) as run,
+            ):
+                artifact = store.stage_file(source)
+
+            self.assertEqual(run.call_args_list[0].args, ("ls", artifact.object_uri))
+            self.assertEqual(
+                run.call_args_list[1].args,
+                (
+                    "--no-progress",
+                    "put",
+                    artifact.local_payload_path,
+                    artifact.object_uri,
+                ),
+            )
+
+    def test_anonymous_forbidden_existing_private_object_is_not_overwritten(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "agent.tgz"
+            source.write_bytes(b"agent-runtime")
+            store = self.make_store(root)
+            forbidden = HTTPError(
+                "http://ceph.example/cache/object",
+                403,
+                "Forbidden",
+                None,
+                None,
+            )
+
+            def authenticated_ls(*args: str, **_kwargs: object):
+                object_uri = args[-1]
+                return subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=f"2026-08-28 00:00 13 {object_uri}\n",
+                    stderr="",
+                )
+
+            with (
+                patch(
+                    "opensandbox_s3_upload._direct_urlopen",
+                    side_effect=forbidden,
+                ),
+                patch.object(store, "_run", side_effect=authenticated_ls) as run,
+                self.assertRaisesRegex(RuntimeError, "not anonymously readable"),
+            ):
+                store.stage_file(source)
+
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0], "ls")
+
+    def test_anonymous_forbidden_without_writer_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "agent.tgz"
+            source.write_bytes(b"agent-runtime")
+            store = self.make_store(root, writer=False)
+            forbidden = HTTPError(
+                "http://ceph.example/cache/object",
+                403,
+                "Forbidden",
+                None,
+                None,
+            )
+
+            with (
+                patch(
+                    "opensandbox_s3_upload._direct_urlopen",
+                    side_effect=forbidden,
+                ),
+                self.assertRaises(S3WriteUnavailableError),
+            ):
+                store.stage_file(source)
 
     def test_preflight_without_writer_does_not_require_s3cmd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

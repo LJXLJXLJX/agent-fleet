@@ -81,11 +81,16 @@ bucket policy must allow anonymous `GetObject` from Sandbox networks without
 granting anonymous writes.
 
 Agent Fleet computes the immutable object key locally and checks its ordinary
-anonymous URL first. An existing object therefore requires no S3 key. Only a
-confirmed missing object uses the optional `s3cfg`; the file must be a regular
-file that is not group- or world-readable. In `auto` mode, a missing object
-without a safe write configuration uses the existing HTTP transport instead.
-In strict `s3` mode, the same condition is an error.
+anonymous URL first. An existing object therefore requires no S3 key. Some S3
+providers return `403` rather than `404` for a missing object when anonymous
+`ListBucket` is intentionally disabled. In that case, a configured writer uses
+an authenticated exact-key listing to distinguish a miss from an existing
+object whose anonymous-read policy is broken. Writer credentials must therefore
+include `ListBucket` restricted to the configured prefix as well as permission
+to publish objects there. The `s3cfg` must be a regular file that is not group-
+or world-readable. In `auto` mode, a missing object without a safe write
+configuration uses the existing HTTP transport instead. In strict `s3` mode,
+the same condition is an error.
 Switch providers only by changing
 `YICLOUD_SANDBOX_S3_PROFILE` in `config.local.env`. Agent Fleet rejects path
 traversal, symlinked profile files, unknown or duplicate metadata keys, and

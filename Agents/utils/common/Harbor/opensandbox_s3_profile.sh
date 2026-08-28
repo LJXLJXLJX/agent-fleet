@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
 # Resolve one project-local S3 profile into the existing OpenSandbox settings.
 # A profile always binds its anonymous read location and object prefix. Its

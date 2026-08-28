@@ -27,11 +27,18 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 from urllib.error import HTTPError
 from urllib.parse import quote, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 BUFFER_SIZE = 4 * 1024 * 1024
 SAMPLE_SIZE = 4 * 1024 * 1024
 ANONYMOUS_PROBE_TIMEOUT_SEC = 15
+
+
+def _direct_urlopen(request: Request, timeout: int):
+    # The read origin is an internal S3 endpoint. Match the Sandbox downloader's
+    # --noproxy behavior so an ambient development-host proxy cannot turn a
+    # valid object response into a gateway error.
+    return build_opener(ProxyHandler({})).open(request, timeout=timeout)
 
 
 def _sha256_file(path: Path) -> str:
@@ -97,6 +104,10 @@ class S3UploadArtifact:
 
 class S3WriteUnavailableError(RuntimeError):
     """The immutable object is absent and no safe writer is configured."""
+
+
+class _AnonymousS3ProbeForbiddenError(RuntimeError):
+    """An anonymous probe could not distinguish a missing object."""
 
 
 class S3UploadStore:
@@ -389,13 +400,18 @@ class S3UploadStore:
             headers={"User-Agent": "agent-fleet-opensandbox/1"},
         )
         try:
-            with urlopen(
+            with _direct_urlopen(
                 request, timeout=ANONYMOUS_PROBE_TIMEOUT_SEC
             ) as response:
                 raw_size = response.headers.get("Content-Length")
         except HTTPError as exc:
             if exc.code == 404:
                 return False, None
+            if exc.code == 403:
+                raise _AnonymousS3ProbeForbiddenError(
+                    "anonymous S3 object probe was forbidden: "
+                    f"key={artifact.object_key!r}"
+                ) from exc
             raise RuntimeError(
                 "anonymous S3 object probe failed: "
                 f"key={artifact.object_key!r} status={exc.code}"
@@ -426,22 +442,45 @@ class S3UploadStore:
                 f"expected={artifact.payload_size} actual={remote_size}"
             )
 
+    def _authenticated_object_exists(self, artifact: S3UploadArtifact) -> bool:
+        """Resolve an anonymous 403 without granting public bucket listing."""
+        completed = self._run("ls", artifact.object_uri)
+        for line in completed.stdout.splitlines():
+            fields = line.split(maxsplit=3)
+            if len(fields) == 4 and fields[3] == artifact.object_uri:
+                return True
+        return False
+
     def _ensure_remote(self, artifact: S3UploadArtifact) -> None:
-        exists, remote_size = self._anonymous_remote_size(artifact)
+        try:
+            exists, remote_size = self._anonymous_remote_size(artifact)
+        except _AnonymousS3ProbeForbiddenError as exc:
+            if self._authenticated_object_exists(artifact):
+                raise RuntimeError(
+                    "content-addressed S3 object exists but is not "
+                    "anonymously readable: "
+                    f"key={artifact.object_key!r}"
+                ) from exc
+            exists, remote_size = False, None
         if exists:
             self._validate_remote_size(artifact, remote_size)
             return
 
-        # Content-addressed keys are immutable. Only a confirmed anonymous 404
-        # enables the optional authenticated write path; existing objects never
-        # require or expose development-host credentials.
+        # A public 404 or an authenticated exact-key miss enables the optional
+        # writer. Existing public objects never require or expose credentials.
         self._run(
             "--no-progress",
             "put",
             artifact.local_payload_path,
             artifact.object_uri,
         )
-        exists, remote_size = self._anonymous_remote_size(artifact)
+        try:
+            exists, remote_size = self._anonymous_remote_size(artifact)
+        except _AnonymousS3ProbeForbiddenError as exc:
+            raise RuntimeError(
+                "S3 upload completed but the object is not anonymously "
+                f"readable: key={artifact.object_key!r}"
+            ) from exc
         if not exists:
             raise RuntimeError(
                 "S3 upload completed but the object is not anonymously readable: "
