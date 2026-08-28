@@ -1050,6 +1050,16 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
                 raise RuntimeError(
                     "Bundle runtime.start_argv must be a non-empty string list"
                 )
+            if (
+                runtime.get("start_argv_source") == "image-config.cmd"
+                and len(argv) == 1
+                and Path(argv[0]).name in {"bash", "sh"}
+            ):
+                # Interactive task images commonly retain a shell-only default
+                # CMD. OpenSandbox is already held by ``sleep infinity`` and
+                # Harbor launches task commands through execd, so releasing
+                # that shell without a TTY would only make it exit immediately.
+                return None
             return list(argv)
 
         entrypoint = spec.get("entrypoint")
@@ -1340,6 +1350,14 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         start_command = self._service_start_command(runtime.spec)
         if start_command is None:
             return
+        contract = runtime.spec.get("runtime") or {}
+        workdir = contract.get("workdir") if isinstance(contract, dict) else None
+        if workdir is not None and (
+            not isinstance(workdir, str) or not workdir.startswith("/")
+        ):
+            raise RuntimeError(
+                f"OpenSandbox service {runtime.name!r} has invalid runtime workdir"
+            )
         service_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", runtime.name)
         log_path = shlex.quote(f"/tmp/harbor-service-{service_name}.log")
         pid_path = shlex.quote(f"/tmp/harbor-service-{service_name}.pid")
@@ -1354,6 +1372,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             "sleep 1; "
             f"if ! kill -0 $pid 2>/dev/null; then "
             f"tail -n 50 {log_path} >&2; exit 1; fi",
+            cwd=workdir or "/",
             timeout_sec=60,
         )
         if result.return_code != 0:

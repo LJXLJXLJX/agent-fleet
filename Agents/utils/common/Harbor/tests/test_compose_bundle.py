@@ -6,7 +6,7 @@ from pathlib import Path
 HARBOR_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HARBOR_DIR))
 
-from compose_bundle import resolve_bundle_spec  # noqa: E402
+from compose_bundle import resolve_bundle_spec
 
 
 class ComposeBundleTest(unittest.TestCase):
@@ -257,7 +257,7 @@ services:
 
         self.assertEqual(list(spec.services), ["main"])
 
-    def test_surfaces_unhandled_runtime_fields_as_requirements(self) -> None:
+    def test_preserves_compose_working_directory(self) -> None:
         compose = """
 services:
   main:
@@ -268,13 +268,10 @@ services:
             task = self.make_task(Path(tmp), compose)
             spec = resolve_bundle_spec(task)
 
-        self.assertEqual(
-            spec.services["main"].unsupported_fields,
-            ["services.main.working_dir"],
-        )
-        self.assertIn(
-            "services.main.working_dir",
-            spec.requirements["unsupported_features"],
+        self.assertEqual(spec.services["main"].working_dir, "/workspace")
+        self.assertEqual(spec.services["main"].unsupported_fields, [])
+        self.assertNotIn(
+            "services.main.working_dir", spec.requirements["unsupported_features"]
         )
 
     def test_preserves_compose_override_presence_and_expose_metadata(self) -> None:

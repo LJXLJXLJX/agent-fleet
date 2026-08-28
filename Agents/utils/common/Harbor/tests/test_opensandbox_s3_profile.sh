@@ -41,6 +41,28 @@ harbor_resolve_opensandbox_s3_profile "${TEST_ROOT}"
 # Re-resolution in worker processes must accept the inherited exact values.
 harbor_resolve_opensandbox_s3_profile "${TEST_ROOT}"
 
+mkdir -p "${PROFILE_ROOT}/read-only"
+printf '%s\n' \
+  'YICLOUD_SANDBOX_S3_BUCKET=bucket-cache' \
+  'YICLOUD_SANDBOX_S3_READ_ORIGIN=http://ceph.example/bucket-cache' \
+  'YICLOUD_SANDBOX_S3_PREFIX=agent-fleet-upload/v1' \
+  > "${PROFILE_ROOT}/read-only/profile.env"
+reset_s3_environment
+YICLOUD_SANDBOX_S3_PROFILE=read-only
+harbor_resolve_opensandbox_s3_profile "${TEST_ROOT}"
+[[ "${YICLOUD_SANDBOX_UPLOAD_BACKEND}" == auto ]]
+[[ -z "${YICLOUD_SANDBOX_S3_CONFIG}" ]]
+[[ "${YICLOUD_SANDBOX_S3_BUCKET}" == bucket-cache ]]
+[[ "${YICLOUD_SANDBOX_S3_READ_ORIGIN}" == http://ceph.example/bucket-cache ]]
+
+reset_s3_environment
+YICLOUD_SANDBOX_S3_PROFILE=read-only
+YICLOUD_SANDBOX_S3_CONFIG="${PROFILE_ROOT}/ceph/s3cfg"
+if harbor_resolve_opensandbox_s3_profile "${TEST_ROOT}" 2>/dev/null; then
+  echo 'read-only profile accepted an external write config' >&2
+  exit 1
+fi
+
 reset_s3_environment
 YICLOUD_SANDBOX_S3_PROFILE=ceph
 YICLOUD_SANDBOX_UPLOAD_BACKEND=s3

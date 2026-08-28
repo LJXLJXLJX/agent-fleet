@@ -1463,7 +1463,7 @@ harbor_prewarm_s3_upload_cache() {
     return 0
   fi
   if [[ "$YICLOUD_SANDBOX_UPLOAD_BACKEND" == "auto" ]]; then
-    echo '[WARN] OpenSandbox S3 prewarm failed; runtime will use the existing HTTP upload fallback' >&2
+    echo '[WARN] OpenSandbox S3 prewarm was unavailable; runtime will retry anonymous reads and fall back to HTTP when necessary' >&2
     return 0
   fi
   return 1

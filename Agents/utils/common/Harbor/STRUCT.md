@@ -190,9 +190,9 @@ Typical dataset paths:
 | `YICLOUD_SANDBOX_STATUS_LOG_INTERVAL_SEC` | Interval for Pending/state progress diagnostics, default `30` |
 | `YICLOUD_SANDBOX_RETAIN_ON_START_FAILURE` | Debug-only switch that skips automatic deletion after environment start failure, default `0` |
 | `YICLOUD_SANDBOX_RETAIN_AFTER_TRIAL` | Debug-only switch that retains a completed trial Sandbox until platform expiry, default `0` |
-| `YICLOUD_SANDBOX_UPLOAD_BACKEND` | OpenSandbox Agent/task input transport: `http`, strict object-store `s3`, or S3-preferred `auto` with the existing HTTP fallback; default `http`, while selecting an S3 profile implies `auto` unless explicitly set to strict `s3` |
-| `YICLOUD_SANDBOX_S3_PROFILE` | Project-local provider profile under `.s3-profiles/<name>`; selecting one implies the `auto` backend by default and atomically resolves config, bucket, anonymous read origin, and prefix |
-| `YICLOUD_SANDBOX_S3_CONFIG` | s3cmd configuration path available to the Harbor runner; resolved from the selected profile or supplied directly for legacy use |
+| `YICLOUD_SANDBOX_UPLOAD_BACKEND` | OpenSandbox Agent/task input transport: `http`, strict object-store `s3`, or S3-preferred `auto` with the existing HTTP fallback; default `http`, while selecting an S3 profile implies `auto` unless explicitly set to strict `s3`. In `auto`, users without write credentials can reuse anonymously readable objects and fall back to HTTP when an object is absent |
+| `YICLOUD_SANDBOX_S3_PROFILE` | Project-local provider profile under `.s3-profiles/<name>`; selecting one implies the `auto` backend by default and atomically resolves the bucket, anonymous read origin, prefix, and optional sibling write config |
+| `YICLOUD_SANDBOX_S3_CONFIG` | Optional s3cmd write configuration path available only to the Harbor runner; it is consulted when an immutable object is absent, never sent to a Sandbox, and may be omitted by read-only users |
 | `YICLOUD_SANDBOX_S3_BUCKET` | Bucket for immutable Agent and task input objects |
 | `YICLOUD_SANDBOX_S3_READ_ORIGIN` | Credential-free internal HTTP(S) URL that addresses the bucket; Sandbox object URLs append the immutable object key |
 | `YICLOUD_SANDBOX_S3_PREFIX` | Versioned content-addressed object prefix, default `agent-fleet-upload/v1` |

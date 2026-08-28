@@ -245,6 +245,30 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "non-empty string list"):
             start({"runtime": {"start_argv": []}})
 
+    def test_shell_only_image_cmd_is_kept_on_opensandbox_hold(self) -> None:
+        start = yicloud_opensandbox.YiCloudOpenSandboxEnvironment._service_start_command
+        self.assertIsNone(
+            start(
+                {
+                    "runtime": {
+                        "start_argv": ["/bin/bash"],
+                        "start_argv_source": "image-config.cmd",
+                    }
+                }
+            )
+        )
+        self.assertEqual(
+            start(
+                {
+                    "runtime": {
+                        "start_argv": ["/bin/bash"],
+                        "start_argv_source": "compose.command",
+                    }
+                }
+            ),
+            ["/bin/bash"],
+        )
+
     def test_all_opensandbox_services_use_sleep_infinity_entrypoint(self) -> None:
         instance = object.__new__(
             yicloud_opensandbox.YiCloudOpenSandboxEnvironment
@@ -280,7 +304,12 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         )
         runtime = yicloud_opensandbox.ServiceRuntime(
             "worker",
-            {"runtime": {"start_argv": ["worker", "--serve"]}},
+            {
+                "runtime": {
+                    "start_argv": ["worker", "--serve"],
+                    "workdir": "/srv/worker",
+                }
+            },
         )
         runtime.sandbox_name = "test-worker"
         instance._run_service_command = AsyncMock(
@@ -296,6 +325,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             "sleep 1; "
             "if ! kill -0 $pid 2>/dev/null; then "
             "tail -n 50 /tmp/harbor-service-worker.log >&2; exit 1; fi",
+            cwd="/srv/worker",
             timeout_sec=60,
         )
 
@@ -325,6 +355,26 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         instance._run_service_command = AsyncMock()
 
         asyncio.run(instance._release_service_entrypoint(runtime))
+
+        instance._run_service_command.assert_not_awaited()
+
+    def test_release_service_entrypoint_rejects_relative_workdir(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        runtime = yicloud_opensandbox.ServiceRuntime(
+            "worker",
+            {
+                "runtime": {
+                    "start_argv": ["worker", "--serve"],
+                    "workdir": "relative/path",
+                }
+            },
+        )
+        instance._run_service_command = AsyncMock()
+
+        with self.assertRaisesRegex(RuntimeError, "invalid runtime workdir"):
+            asyncio.run(instance._release_service_entrypoint(runtime))
 
         instance._run_service_command.assert_not_awaited()
 

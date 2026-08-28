@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
 # Resolve one project-local S3 profile into the existing OpenSandbox settings.
-# A profile binds an s3cmd config, bucket, anonymous read origin, and object
-# prefix so callers cannot combine values from different S3 providers.
+# A profile always binds its anonymous read location and object prefix. Its
+# sibling s3cfg is an optional development-host write capability, not a
+# prerequisite for consuming objects that another maintainer has published.
 harbor_resolve_opensandbox_s3_profile() {
   local repo_root="$1"
   local profile="${YICLOUD_SANDBOX_S3_PROFILE:-}"
@@ -41,9 +42,13 @@ harbor_resolve_opensandbox_s3_profile() {
     echo "[ERROR] S3 profile metadata is not a readable regular file: ${profile_file}" >&2
     return 1
   fi
-  if [[ -L "${s3cfg}" || ! -f "${s3cfg}" || ! -r "${s3cfg}" ]]; then
-    echo "[ERROR] S3 profile config is not a readable regular file: ${s3cfg}" >&2
-    return 1
+  if [[ -e "${s3cfg}" || -L "${s3cfg}" ]]; then
+    if [[ -L "${s3cfg}" || ! -f "${s3cfg}" || ! -r "${s3cfg}" ]]; then
+      echo "[ERROR] S3 profile write config is not a readable regular file: ${s3cfg}" >&2
+      return 1
+    fi
+  else
+    s3cfg=""
   fi
 
   while IFS= read -r raw_line || [[ -n "${raw_line}" ]]; do
@@ -121,7 +126,7 @@ harbor_resolve_opensandbox_s3_profile() {
   fi
 
   if [[ -n "${YICLOUD_SANDBOX_S3_CONFIG:-}" &&
-        "${YICLOUD_SANDBOX_S3_CONFIG}" != "${s3cfg}" ]]; then
+        ( -z "${s3cfg}" || "${YICLOUD_SANDBOX_S3_CONFIG}" != "${s3cfg}" ) ]]; then
     echo '[ERROR] YICLOUD_SANDBOX_S3_CONFIG conflicts with the selected S3 profile' >&2
     return 1
   fi

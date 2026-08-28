@@ -52,6 +52,7 @@ SERVICE_KEYS = {
     "image",
     "entrypoint",
     "command",
+    "working_dir",
     "environment",
     "ports",
     "expose",
@@ -302,6 +303,7 @@ class ServiceSpec:
     entrypoint_present: bool
     command: Any
     command_present: bool
+    working_dir: str | None
     environment: dict[str, str | None]
     ports: list[Any]
     expose: list[str | int]
@@ -327,6 +329,7 @@ class ServiceSpec:
             "entrypoint_present": self.entrypoint_present,
             "command": self.command,
             "command_present": self.command_present,
+            "working_dir": self.working_dir,
             "environment": self.environment,
             "ports": self.ports,
             "expose": self.expose,
@@ -469,6 +472,19 @@ def _compose_service(
     container_name = raw.get("container_name")
     if container_name is not None and not isinstance(container_name, str):
         raise TypeError(f"service {name!r} container_name must be a string")
+    working_dir = raw.get("working_dir")
+    if working_dir is not None:
+        if not isinstance(working_dir, str) or not working_dir:
+            raise TypeError(
+                f"service {name!r} working_dir must be a non-empty string"
+            )
+        working_dir = _interpolate(
+            working_dir, variables, label=f"service {name!r} working_dir"
+        )
+        if not working_dir.startswith("/"):
+            raise ValueError(
+                f"service {name!r} working_dir must be an absolute container path"
+            )
     deploy = raw.get("deploy") or {}
     if not isinstance(deploy, dict):
         raise TypeError(f"service {name!r} deploy must be a map")
@@ -516,6 +532,7 @@ def _compose_service(
         entrypoint_present="entrypoint" in raw,
         command=raw.get("command"),
         command_present="command" in raw,
+        working_dir=working_dir,
         environment=_normalize_environment(raw.get("environment"), service=name),
         ports=list(ports),
         expose=_normalize_expose(raw.get("expose"), service=name),
@@ -694,6 +711,7 @@ def resolve_bundle_spec(task_dir: Path) -> BundleSpec:
             entrypoint_present=False,
             command=None,
             command_present=False,
+            working_dir=None,
             environment={},
             ports=[],
             expose=[],

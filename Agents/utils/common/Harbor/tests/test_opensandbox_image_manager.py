@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 HARBOR_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HARBOR_DIR))
 
-from opensandbox_image_manager import (  # noqa: E402
+from opensandbox_image_manager import (
     DOCKER_CONFIG,
     DOCKER_LAYER_GZIP,
     DOCKER_MANIFEST,
@@ -117,8 +117,7 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
             ValueError,
             "--registry or YICLOUD_HARBOR_HOST is required",
         ):
-            prepare_bundle(Namespace(registry=""))
-
+            prepare_bundle(Namespace(platform="linux/amd64", registry=""))
         for registry in (
             "https://harbor.example",
             "harbor.example/project",
@@ -128,6 +127,13 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
                 "bare OCI registry host",
             ):
                 prepare_bundle(Namespace(registry=registry))
+
+    def test_prepare_rejects_unimplemented_platform_before_other_work(self) -> None:
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "platform 'linux/arm64' is not implemented",
+        ):
+            prepare_bundle(Namespace(platform="linux/arm64"))
 
     def test_loopback_proxy_requires_host_build_network(self) -> None:
         with patch.dict(
@@ -186,6 +192,7 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
                 "config": {
                     "Entrypoint": ["/entry"],
                     "Cmd": ["--serve"],
+                    "WorkingDir": "/app",
                     "ExposedPorts": {"8080/tcp": {}, "22/tcp": {}},
                     "Healthcheck": {"Test": ["CMD", "true"]},
                 }
@@ -193,6 +200,7 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
         )
         self.assertEqual(config["entrypoint"], ["/entry"])
         self.assertEqual(config["cmd"], ["--serve"])
+        self.assertEqual(config["working_dir"], "/app")
         self.assertEqual(
             config["exposed_ports"],
             [{"port": 22, "protocol": "tcp"}, {"port": 8080, "protocol": "tcp"}],
@@ -211,6 +219,7 @@ services:
   main:
     build: .
     command: [sh, -c, 'sleep infinity']
+    working_dir: /workspace
   worker:
     build:
       dockerfile: Dockerfile.worker
@@ -222,7 +231,13 @@ services:
             bundle = resolve_bundle_spec(task)
         main = _compose_runtime(
             bundle.services["main"],
-            {"entrypoint": None, "cmd": None, "exposed_ports": [], "healthcheck": None},
+            {
+                "entrypoint": None,
+                "cmd": None,
+                "working_dir": "/image-main",
+                "exposed_ports": [],
+                "healthcheck": None,
+            },
             benchmark="seta",
             task_identity="973",
         )
@@ -231,6 +246,7 @@ services:
             {
                 "entrypoint": None,
                 "cmd": ["/usr/sbin/sshd", "-D"],
+                "working_dir": "/opt/worker",
                 "exposed_ports": [{"port": 22, "protocol": "tcp"}],
                 "healthcheck": None,
             },
@@ -239,8 +255,12 @@ services:
         )
         self.assertEqual(main["start_argv"], ["sh", "-c", "sleep infinity"])
         self.assertEqual(main["start_argv_source"], "compose.command")
+        self.assertEqual(main["workdir"], "/workspace")
+        self.assertEqual(main["workdir_source"], "compose.working_dir")
         self.assertEqual(worker["start_argv"], ["/usr/sbin/sshd", "-D"])
         self.assertEqual(worker["start_argv_source"], "image-config.cmd")
+        self.assertEqual(worker["workdir"], "/opt/worker")
+        self.assertEqual(worker["workdir_source"], "image-config.working-dir")
         self.assertEqual(
             worker["internal_ports"],
             [{"port": 22, "protocol": "tcp", "source": "image-config.exposed-ports"}],

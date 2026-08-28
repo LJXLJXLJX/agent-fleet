@@ -61,11 +61,11 @@ Each provider is an ignored, project-local profile:
 ```text
 .s3-profiles/provider-name/
 ├── profile.env
-└── s3cfg
+└── s3cfg          # optional; development-host write credentials
 ```
 
-`profile.env` binds the provider credentials and write endpoint in `s3cfg` to
-one bucket, credential-free Sandbox read origin, and immutable object prefix:
+`profile.env` identifies one bucket, credential-free Sandbox read origin, and
+immutable object prefix:
 
 ```bash
 YICLOUD_SANDBOX_S3_BUCKET=your-bucket
@@ -73,10 +73,19 @@ YICLOUD_SANDBOX_S3_READ_ORIGIN=http://s3.internal.example/your-bucket
 YICLOUD_SANDBOX_S3_PREFIX=agent-fleet-upload/v1
 ```
 
-Create a separate directory, and preferably separate least-privilege
-write credentials, for every S3 provider. The read origin must already address
-the bucket and must not contain credentials, query parameters, or fragments;
-the bucket policy must allow anonymous `GetObject` from Sandbox networks.
+Create a separate directory for every S3 provider. Maintainers who publish new
+objects may add a sibling `s3cfg` containing least-privilege write credentials;
+read-only users should omit that file. The read origin must already address the
+bucket and must not contain credentials, query parameters, or fragments. The
+bucket policy must allow anonymous `GetObject` from Sandbox networks without
+granting anonymous writes.
+
+Agent Fleet computes the immutable object key locally and checks its ordinary
+anonymous URL first. An existing object therefore requires no S3 key. Only a
+confirmed missing object uses the optional `s3cfg`; the file must be a regular
+file that is not group- or world-readable. In `auto` mode, a missing object
+without a safe write configuration uses the existing HTTP transport instead.
+In strict `s3` mode, the same condition is an error.
 Switch providers only by changing
 `YICLOUD_SANDBOX_S3_PROFILE` in `config.local.env`. Agent Fleet rejects path
 traversal, symlinked profile files, unknown or duplicate metadata keys, and
@@ -84,9 +93,9 @@ standalone S3 values that conflict with the selected profile. Selecting a
 profile defaults `YICLOUD_SANDBOX_UPLOAD_BACKEND` to `auto`: S3 is preferred,
 while an S3 staging or Sandbox materialization failure falls back to the
 existing authenticated HTTP upload path. Set the value explicitly to `s3`
-when failure must be strict. Without a profile, either backend plus
-`YICLOUD_SANDBOX_S3_CONFIG`, `YICLOUD_SANDBOX_S3_BUCKET`, and
-`YICLOUD_SANDBOX_S3_READ_ORIGIN` remain supported.
+when failure must be strict. Without a profile, the bucket and read origin may
+be configured directly; `YICLOUD_SANDBOX_S3_CONFIG` remains an optional legacy
+write configuration.
 
 Every YiCloud OpenSandbox create request uses the provider-required
 `["sleep", "infinity"]` entrypoint. After the Sandbox reaches `Running` and
@@ -155,8 +164,10 @@ prebuild report; unsupported runtime capabilities fail before creation.
   the log includes the Sandbox ID and latest status.
 - An image preparation failure occurs before Sandbox creation. Verify Buildx,
   registry login, and the task Dockerfile.
-- An upload failure should be diagnosed separately from agent execution. Check
-  development-host S3 credentials, bucket policy, anonymous read URL, and DNS.
+- An artifact transport failure should be diagnosed separately from agent
+  execution. Existing objects require only the anonymous read URL and bucket
+  policy; publishing a missing object additionally requires a safe local
+  `s3cfg`. Also verify DNS from the relevant host and Sandbox networks.
 - A model request failure means the instance started, but its configured model
   gateway is unreachable or rejected the request.
 

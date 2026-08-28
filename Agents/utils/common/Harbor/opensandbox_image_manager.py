@@ -1131,9 +1131,16 @@ def normalize_oci_image_config(raw: object) -> dict[str, object]:
     normalized_healthcheck = dict(healthcheck) if healthcheck is not None else None
     if normalized_healthcheck is not None and "Test" in normalized_healthcheck:
         normalized_healthcheck["test"] = normalized_healthcheck.pop("Test")
+    working_dir = config.get("WorkingDir")
+    if working_dir is not None and not isinstance(working_dir, str):
+        raise RuntimeError("OCI image config WorkingDir must be a string or null")
+    working_dir = working_dir or None
+    if working_dir is not None and not working_dir.startswith("/"):
+        raise RuntimeError("OCI image config WorkingDir must be an absolute path")
     return {
         "entrypoint": _string_argv(config.get("Entrypoint"), label="Entrypoint"),
         "cmd": _string_argv(config.get("Cmd"), label="Cmd"),
+        "working_dir": working_dir,
         "exposed_ports": _oci_port_entries(config.get("ExposedPorts")),
         "healthcheck": normalized_healthcheck,
     }
@@ -1190,10 +1197,13 @@ def _compose_runtime(
     """Materialize OCI defaults and Compose overrides for one provider run."""
     image_entrypoint = image_config.get("entrypoint")
     image_command = image_config.get("cmd")
+    image_working_dir = image_config.get("working_dir")
     if image_entrypoint is not None and not isinstance(image_entrypoint, list):
         raise RuntimeError("normalized OCI image entrypoint is invalid")
     if image_command is not None and not isinstance(image_command, list):
         raise RuntimeError("normalized OCI image command is invalid")
+    if image_working_dir is not None and not isinstance(image_working_dir, str):
+        raise RuntimeError("normalized OCI image working directory is invalid")
 
     entrypoint_overridden = service.entrypoint_present and service.entrypoint is not None
     if entrypoint_overridden:
@@ -1222,6 +1232,13 @@ def _compose_runtime(
     if not start_argv and legacy_dockerfile_keepalive:
         start_argv = list(LEGACY_DOCKERFILE_KEEPALIVE)
         start_source = "adapter.legacy-keepalive"
+
+    if service.working_dir is not None:
+        workdir = service.working_dir
+        workdir_source = "compose.working_dir"
+    else:
+        workdir = image_working_dir
+        workdir_source = "image-config.working-dir" if workdir else None
 
     ports: list[dict[str, object]] = []
     seen_ports: set[tuple[int, str]] = set()
@@ -1282,6 +1299,8 @@ def _compose_runtime(
     return {
         "start_argv": start_argv,
         "start_argv_source": start_source,
+        "workdir": workdir,
+        "workdir_source": workdir_source,
         "internal_ports": ports,
         "readiness": readiness,
     }
@@ -1624,6 +1643,7 @@ def _service_manifest(
         "entrypoint_present": service.entrypoint_present,
         "command": service.command,
         "command_present": service.command_present,
+        "working_dir": service.working_dir,
         "environment": service.environment,
         "ports": service.ports,
         "expose": service.expose,
@@ -1665,6 +1685,7 @@ def _bundle_identity(
                 key: services[name].get(key)
                 for key in (
                     "entrypoint", "entrypoint_present", "command", "command_present",
+                    "working_dir",
                     "environment", "ports", "expose", "aliases",
                     "depends_on", "healthcheck", "volumes", "networks", "cap_add",
                     "privileged", "resources", "unsupported_fields", "runtime",
@@ -1679,6 +1700,16 @@ def _bundle_identity(
 
 
 def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
+    # Platform deliberately stays out of the content hash. If a real task ever
+    # requires another architecture, isolate its images and local artifacts in
+    # an architecture-specific Harbor Project/namespace before relaxing this
+    # guard; never reuse or overwrite the default amd64 cache with --force.
+    args.platform = getattr(args, "platform", DEFAULT_PLATFORM)
+    if args.platform != DEFAULT_PLATFORM:
+        raise NotImplementedError(
+            f"OpenSandbox task-image platform {args.platform!r} is not implemented; "
+            f"only {DEFAULT_PLATFORM!r} is currently supported"
+        )
     args.registry = validate_registry_host(args.registry)
     task_dir = resolve_task_dir(args.task_dir, args.dataset_root, args.include)
     bundle = resolve_bundle_spec(task_dir)
@@ -1855,6 +1886,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--platform",
         default=os.environ.get("HARBOR_OPENSANDBOX_IMAGE_PLATFORM", DEFAULT_PLATFORM),
+        help=f"target image platform; currently only {DEFAULT_PLATFORM} is implemented",
     )
     parser.add_argument(
         "--tag-prefix",
@@ -2002,12 +2034,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.platform != DEFAULT_PLATFORM:
-        log(
-            f"warning: platform {args.platform!r} does not participate in the "
-            "registry cache identity; a cache hit may serve an image built for "
-            "a different platform, re-run with --force when switching platforms"
-        )
     prepared = prepare_bundle(args)
     if args.output == "image-ref":
         print(prepared.main_image_ref)

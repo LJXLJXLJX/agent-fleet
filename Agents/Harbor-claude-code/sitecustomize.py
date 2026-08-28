@@ -39,7 +39,7 @@ HARBOR_RUNTIME_DIR = (
 )
 sys.path.append(str(HARBOR_RUNTIME_DIR))
 
-from opik_trace_gate import _is_true, opik_tracing_enabled  # noqa: E402
+from opik_trace_gate import _is_true, opik_tracing_enabled
 
 _HOOK_EVENTS = [
     "UserPromptSubmit",
@@ -285,7 +285,7 @@ def _patch_claude_code_realtime_hooks() -> None:
                 "  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then "
                 "    return 0; "
                 "  fi; "
-                "  node -e 'process.exit(Number(process.versions.node.split(\".\")[0]) >= 18 ? 0 : 1)' "
+                "  ! node -e 'process.exit(Number(process.versions.node.split(\".\")[0]) >= 18 ? 0 : 1)' "
                 "    >/dev/null 2>&1; "
                 "}; "
                 # Prefer the offline Node runtime prepared by monitor_harbor.sh.
@@ -429,7 +429,20 @@ def _patch_claude_code_realtime_hooks() -> None:
                     )
                     command = (
                         f"if {local_runtime_guard}; then "
-                        "echo 'OpenSandbox local Claude runtime ready; skip APT bootstrap' >&2; "
+                        "if command -v bash >/dev/null 2>&1 && "
+                        "command -v ps >/dev/null 2>&1 && "
+                        "command -v pgrep >/dev/null 2>&1; then "
+                        "echo 'OpenSandbox local Claude runtime and system prerequisites ready; skip package bootstrap' >&2; "
+                        "elif command -v apk >/dev/null 2>&1; then "
+                        "apk add --no-cache bash procps; "
+                        "elif command -v apt-get >/dev/null 2>&1; then "
+                        f"{_apt_fix}apt-get update && apt-get install -y bash procps; "
+                        "elif command -v yum >/dev/null 2>&1; then "
+                        "yum install -y bash procps-ng; "
+                        "else "
+                        "echo 'OpenSandbox local Claude runtime requires bash, ps, and pgrep' >&2; "
+                        "exit 1; "
+                        "fi; "
                         f"else {original_command}; fi"
                     )
                 else:

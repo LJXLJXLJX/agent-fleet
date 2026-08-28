@@ -1,7 +1,8 @@
-"""Content-addressed S3 staging for YiCloud OpenSandbox uploads.
+"""Content-addressed S3 staging for YiCloud OpenSandbox artifacts.
 
-The Harbor runner owns the S3 write credentials. Sandboxes receive only
-anonymous internal object URLs plus the expected size and SHA-256 digest.
+Sandboxes receive only anonymous object URLs plus the expected size and
+SHA-256 digest. Development hosts may optionally provide S3 write credentials;
+read-only users can reuse objects that have already been published.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ import gzip
 import hashlib
 import json
 import os
-import re
 import shutil
 import stat
 import subprocess
@@ -25,10 +25,13 @@ from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
+from urllib.error import HTTPError
 from urllib.parse import quote, urlsplit
+from urllib.request import Request, urlopen
 
 BUFFER_SIZE = 4 * 1024 * 1024
 SAMPLE_SIZE = 4 * 1024 * 1024
+ANONYMOUS_PROBE_TIMEOUT_SEC = 15
 
 
 def _sha256_file(path: Path) -> str:
@@ -92,13 +95,22 @@ class S3UploadArtifact:
     download_url: str = ""
 
 
+class S3WriteUnavailableError(RuntimeError):
+    """The immutable object is absent and no safe writer is configured."""
+
+
 class S3UploadStore:
-    """Build deterministic payloads and publish anonymous-read object URLs."""
+    """Build deterministic payloads and publish anonymous-read object URLs.
+
+    Anonymous reads are the primary capability. ``config_path`` is optional
+    and is consulted only when a content-addressed object is not already
+    available through ``read_origin``.
+    """
 
     def __init__(
         self,
         *,
-        config_path: Path | str,
+        config_path: Path | str | None = None,
         bucket: str,
         read_origin: str,
         prefix: str = "agent-fleet-upload/v1",
@@ -107,8 +119,11 @@ class S3UploadStore:
         directory_compression: str = "auto",
         s3cmd: str = "s3cmd",
     ) -> None:
-        self.config_path = _absolute_path(
-            str(config_path), "YICLOUD_SANDBOX_S3_CONFIG"
+        raw_config_path = str(config_path or "").strip()
+        self.config_path = (
+            _absolute_path(raw_config_path, "YICLOUD_SANDBOX_S3_CONFIG")
+            if raw_config_path
+            else None
         )
         self.bucket = bucket.strip()
         if not self.bucket or "/" in self.bucket:
@@ -196,16 +211,38 @@ class S3UploadStore:
             )
         return resolved
 
+    def _writer_config_path(self) -> Path:
+        config_path = self.config_path
+        if config_path is None:
+            raise S3WriteUnavailableError(
+                "S3 object is not anonymously readable and no write "
+                "configuration is available"
+            )
+        if config_path.is_symlink() or not config_path.is_file():
+            raise FileNotFoundError(
+                f"S3 write configuration is not a regular file: {config_path}"
+            )
+        if stat.S_IMODE(config_path.stat().st_mode) & 0o077:
+            raise PermissionError(
+                "S3 write configuration must not be group/world-readable: "
+                f"{config_path}"
+            )
+        return config_path
+
     def _run(
         self,
         *args: str,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
+        # Validate at the point of every credentialed operation. Preflight and
+        # runtime staging execute in separate processes, so preflight alone is
+        # not a security boundary.
+        config_path = self._writer_config_path()
         completed = subprocess.run(
             [
                 self._executable(),
                 "-c",
-                str(self.config_path),
+                str(config_path),
                 *args,
             ],
             capture_output=True,
@@ -221,19 +258,10 @@ class S3UploadStore:
         return completed
 
     def preflight(self) -> None:
-        if not self.config_path.is_file():
-            raise FileNotFoundError(
-                f"S3 configuration is missing: {self.config_path}"
-            )
-        if stat.S_IMODE(self.config_path.stat().st_mode) & 0o077:
-            raise PermissionError(
-                f"S3 configuration must not be group/world-readable: "
-                f"{self.config_path}"
-            )
         self.cache_root.mkdir(parents=True, exist_ok=True)
         self.lock_root.mkdir(parents=True, exist_ok=True)
-        self._run("--version")
-        self._run("ls", f"s3://{self.bucket}/{self.prefix}/")
+        if self.config_path is not None:
+            self._run("--version")
 
     @contextlib.contextmanager
     def _digest_lock(
@@ -352,49 +380,74 @@ class S3UploadStore:
             raise RuntimeError(f"failed to reopen S3 upload cache: {final_dir}")
         return artifact
 
-    @staticmethod
-    def _is_missing(completed: subprocess.CompletedProcess[str]) -> bool:
-        message = f"{completed.stdout}\n{completed.stderr}".lower()
-        return any(
-            marker in message
-            for marker in ("404", "nosuchkey", "not found", "does not exist")
+    def _anonymous_remote_size(
+        self, artifact: S3UploadArtifact
+    ) -> tuple[bool, int | None]:
+        request = Request(
+            self._download_url(artifact),
+            method="HEAD",
+            headers={"User-Agent": "agent-fleet-opensandbox/1"},
         )
+        try:
+            with urlopen(
+                request, timeout=ANONYMOUS_PROBE_TIMEOUT_SEC
+            ) as response:
+                raw_size = response.headers.get("Content-Length")
+        except HTTPError as exc:
+            if exc.code == 404:
+                return False, None
+            raise RuntimeError(
+                "anonymous S3 object probe failed: "
+                f"key={artifact.object_key!r} status={exc.code}"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(
+                "anonymous S3 object probe failed: "
+                f"key={artifact.object_key!r} error={exc}"
+            ) from exc
+        if raw_size is None:
+            return True, None
+        try:
+            return True, int(raw_size)
+        except ValueError as exc:
+            raise RuntimeError(
+                "anonymous S3 object returned an invalid Content-Length: "
+                f"key={artifact.object_key!r} value={raw_size!r}"
+            ) from exc
 
     @staticmethod
-    def _remote_size(output: str) -> int | None:
-        match = re.search(r"File size:\s*(\d+)", output, re.IGNORECASE)
-        return int(match.group(1)) if match else None
+    def _validate_remote_size(
+        artifact: S3UploadArtifact, remote_size: int | None
+    ) -> None:
+        if remote_size is not None and remote_size != artifact.payload_size:
+            raise RuntimeError(
+                "content-addressed S3 object has an unexpected size: "
+                f"uri={artifact.object_uri!r} "
+                f"expected={artifact.payload_size} actual={remote_size}"
+            )
 
     def _ensure_remote(self, artifact: S3UploadArtifact) -> None:
-        info = self._run("info", artifact.object_uri, check=False)
-        if info.returncode == 0:
-            remote_size = self._remote_size(info.stdout)
-            if remote_size is not None and remote_size != artifact.payload_size:
-                raise RuntimeError(
-                    "content-addressed S3 object has an unexpected size: "
-                    f"uri={artifact.object_uri!r} "
-                    f"expected={artifact.payload_size} actual={remote_size}"
-                )
+        exists, remote_size = self._anonymous_remote_size(artifact)
+        if exists:
+            self._validate_remote_size(artifact, remote_size)
             return
-        if not self._is_missing(info):
-            message = (info.stderr or info.stdout).strip()[:1000]
-            raise RuntimeError(
-                f"failed to inspect S3 object {artifact.object_uri!r}: "
-                f"exit_code={info.returncode} {message}"
-            )
+
+        # Content-addressed keys are immutable. Only a confirmed anonymous 404
+        # enables the optional authenticated write path; existing objects never
+        # require or expose development-host credentials.
         self._run(
             "--no-progress",
             "put",
             artifact.local_payload_path,
             artifact.object_uri,
         )
-        verified = self._run("info", artifact.object_uri)
-        remote_size = self._remote_size(verified.stdout)
-        if remote_size is not None and remote_size != artifact.payload_size:
+        exists, remote_size = self._anonymous_remote_size(artifact)
+        if not exists:
             raise RuntimeError(
-                "S3 upload size verification failed: "
-                f"expected={artifact.payload_size} actual={remote_size}"
+                "S3 upload completed but the object is not anonymously readable: "
+                f"key={artifact.object_key!r}"
             )
+        self._validate_remote_size(artifact, remote_size)
 
     def _download_url(self, artifact: S3UploadArtifact) -> str:
         return f"{self.read_origin}/{quote(artifact.object_key, safe='/')}"
