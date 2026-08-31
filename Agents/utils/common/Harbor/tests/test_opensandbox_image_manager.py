@@ -79,6 +79,18 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
         self.assertEqual(args.build_timeout_sec, 7200.0)
         self.assertTrue(args.retry_no_cache_on_apt_404)
 
+    def test_skip_hash_verification_requires_local_upload_cache(self) -> None:
+        with patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--task-dir",
+                    "/tmp/example-task",
+                    "--project",
+                    "test-project",
+                    "--skip-hash-verification",
+                ]
+            )
+
     def test_cli_enables_host_proxy_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             args = parse_args(
@@ -701,6 +713,119 @@ networks:
             image_ref,
             r"^harbor\.example\.internal/test-project/0@sha256:[0-9a-f]{64}$",
         )
+
+    def test_local_uploaded_bundle_avoids_registry_and_can_skip_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task = self.make_task(root, "0")
+            cache_root = root / "cache"
+
+            def make_args(output: Path, *, skip_hash: bool = False) -> Namespace:
+                argv = [
+                    "--task-dir",
+                    str(task),
+                    "--registry",
+                    "harbor.example.internal",
+                    "--project",
+                    "test-project",
+                    "--benchmark-name",
+                    "seta",
+                    "--cache-root",
+                    str(cache_root),
+                    "--bundle-manifest-output",
+                    str(output),
+                    "--reuse-local-upload-cache",
+                    "--no-use-proxy",
+                ]
+                if skip_hash:
+                    argv.append("--skip-hash-verification")
+                with patch.dict(os.environ, {}, clear=True):
+                    return parse_args(argv)
+
+            publisher = Mock()
+            publisher.inspect_config.return_value = {
+                "entrypoint": None,
+                "cmd": None,
+                "working_dir": None,
+                "exposed_ports": [],
+                "healthcheck": None,
+            }
+            registry = Mock()
+            registry.manifest.return_value = {
+                "artifact_digest": "sha256:" + "a" * 64,
+                "media_type": DOCKER_MANIFEST,
+            }
+            first_output = root / "first.json"
+            with (
+                patch(
+                    "opensandbox_image_manager.registry_credentials",
+                    return_value=("user", "password"),
+                ),
+                patch(
+                    "opensandbox_image_manager.SkopeoPublisher",
+                    return_value=publisher,
+                ),
+                patch(
+                    "opensandbox_image_manager.RegistryClient",
+                    return_value=registry,
+                ),
+            ):
+                first = prepare_bundle(make_args(first_output))
+
+            self.assertTrue(first_output.is_file())
+            self.assertEqual(registry.manifest.call_count, 1)
+            uploaded = list((cache_root / "uploaded-bundles").glob("*/*.json"))
+            self.assertEqual(len(uploaded), 1)
+
+            verified_output = root / "verified.json"
+            with (
+                patch(
+                    "opensandbox_image_manager.registry_credentials",
+                    side_effect=AssertionError("Registry access is not expected"),
+                ),
+                patch(
+                    "opensandbox_image_manager.environment_content_hash",
+                    wraps=environment_content_hash,
+                ) as content_hash,
+            ):
+                verified = prepare_bundle(make_args(verified_output))
+
+            self.assertGreater(content_hash.call_count, 0)
+            self.assertEqual(verified.main_image_ref, first.main_image_ref)
+            self.assertEqual(
+                json.loads(verified_output.read_text(encoding="utf-8")),
+                first.manifest,
+            )
+
+            (task / "environment" / "Dockerfile").write_text(
+                "FROM ubuntu:24.04\nRUN echo changed\n", encoding="utf-8"
+            )
+            with (
+                patch(
+                    "opensandbox_image_manager.registry_credentials",
+                    side_effect=AssertionError("stale cache reached Registry fallback"),
+                ),
+                self.assertRaisesRegex(AssertionError, "Registry fallback"),
+            ):
+                prepare_bundle(make_args(root / "stale.json"))
+
+            skipped_output = root / "skipped.json"
+            with (
+                patch(
+                    "opensandbox_image_manager.resolve_bundle_spec",
+                    side_effect=AssertionError("task content must not be resolved"),
+                ),
+                patch(
+                    "opensandbox_image_manager.registry_credentials",
+                    side_effect=AssertionError("Registry access is not expected"),
+                ),
+            ):
+                skipped = prepare_bundle(
+                    make_args(skipped_output, skip_hash=True)
+                )
+
+            self.assertEqual(skipped.main_image_ref, first.main_image_ref)
+            self.assertTrue(skipped_output.is_file())
 
     def test_registry_target_keeps_project_and_task_repository_separate(self) -> None:
         target = RegistryTarget("registry.example", "seta", "973")

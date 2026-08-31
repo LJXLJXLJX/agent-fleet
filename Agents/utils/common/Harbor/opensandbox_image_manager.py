@@ -42,6 +42,8 @@ Each benchmark is a Registry Project and each task has its own repository.
 Deterministic service tags are cache lookup keys; Registry manifest digests are
 the immutable runtime addresses.
 Single-Dockerfile tasks are represented as one implicit ``main`` service.
+Dataset prebuild may additionally trust a persistent local uploaded-Bundle
+index, with an explicit option to skip the otherwise-default content-hash check.
 """
 
 from __future__ import annotations
@@ -141,6 +143,7 @@ OPENSANDBOX_ADAPTER_METADATA: dict[str, dict[str, dict[str, dict[str, object]]]]
     }
 }
 LEGACY_DOCKERFILE_KEEPALIVE = ["sh", "-c", "while :; do sleep 60; done"]
+LOCAL_UPLOAD_INDEX_VERSION = 1
 
 
 def log(message: str) -> None:
@@ -1362,6 +1365,132 @@ def _read_record(path: Path) -> dict[str, object]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def local_upload_manifest_path(
+    cache_root: Path,
+    target: RegistryTarget,
+    *,
+    benchmark: str,
+    platform: str,
+) -> Path:
+    """Return the persistent, target-scoped uploaded-Bundle index entry."""
+    scope = json.dumps(
+        {
+            "benchmark": benchmark,
+            "platform": platform,
+            "project": target.project,
+            "registry": target.registry,
+            "version": LOCAL_UPLOAD_INDEX_VERSION,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    scope_key = hashlib.sha256(scope).hexdigest()[:20]
+    return (
+        cache_root
+        / "uploaded-bundles"
+        / scope_key
+        / f"{target.task_repository}.json"
+    )
+
+
+def _cached_bundle_matches_target(
+    manifest: dict[str, object],
+    *,
+    target: RegistryTarget,
+    benchmark: str,
+    task_identity: str,
+    platform: str,
+) -> bool:
+    registry = manifest.get("registry")
+    benchmark_record = manifest.get("benchmark")
+    services = manifest.get("services")
+    main = manifest.get("main")
+    if (
+        manifest.get("schema_version") != BUNDLE_SCHEMA_VERSION
+        or manifest.get("bundle_format") != BUNDLE_FORMAT_VERSION
+        or manifest.get("task_identity") != task_identity
+        or not isinstance(registry, dict)
+        or registry.get("host") != target.registry
+        or registry.get("project") != target.project
+        or registry.get("task_repository") != target.task_repository
+        or registry.get("repository") != target.repository
+        or not isinstance(benchmark_record, dict)
+        or benchmark_record.get("name") != benchmark
+        or not isinstance(services, dict)
+        or not services
+        or not isinstance(main, str)
+        or main not in services
+    ):
+        return False
+
+    for service_record in services.values():
+        if not isinstance(service_record, dict):
+            return False
+        image = service_record.get("image")
+        if not isinstance(image, dict) or image.get("platform") != platform:
+            return False
+        artifact_digest = image.get("artifact_digest")
+        input_hash = image.get("input_hash")
+        if (
+            not isinstance(artifact_digest, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_digest)
+            or image.get("digest_ref") != target.digest_ref(artifact_digest)
+            or not isinstance(input_hash, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", input_hash)
+        ):
+            return False
+    return True
+
+
+def _cached_bundle_matches_content(
+    manifest: dict[str, object], bundle: BundleSpec
+) -> bool:
+    if manifest.get("definition_identity") != f"sha256:{bundle.definition_identity}":
+        return False
+    services = manifest.get("services")
+    if not isinstance(services, dict) or set(services) != set(bundle.services):
+        return False
+    for name, service in bundle.services.items():
+        service_record = services.get(name)
+        if not isinstance(service_record, dict):
+            return False
+        image = service_record.get("image")
+        if not isinstance(image, dict):
+            return False
+        docker_image = service.source_image if service.build is None else None
+        expected_hash = "sha256:" + image_identity(
+            bundle.environment_dir, docker_image=docker_image
+        )
+        if image.get("input_hash") != expected_hash:
+            return False
+    return True
+
+
+def _prepared_from_cached_bundle(
+    manifest: dict[str, object],
+    *,
+    cached_path: Path,
+    configured_output: Path | None,
+) -> PreparedBundle:
+    manifest_path = cached_path
+    if configured_output is not None:
+        manifest_path = Path(configured_output).expanduser().resolve()
+        atomic_write_json(manifest_path, manifest)
+    services = manifest.get("services")
+    main = manifest.get("main")
+    if not isinstance(services, dict) or not isinstance(main, str):
+        raise TypeError(f"invalid local uploaded-Bundle entry: {cached_path}")
+    main_record = services.get(main)
+    image = main_record.get("image") if isinstance(main_record, dict) else None
+    if not isinstance(image, dict):
+        raise TypeError(f"invalid local uploaded-Bundle main service: {cached_path}")
+    return PreparedBundle(
+        main_image_ref=str(image["digest_ref"]),
+        manifest=manifest,
+        manifest_path=manifest_path,
+    )
+
+
 def _service_image_inputs(
     service: ServiceSpec,
     *,
@@ -1712,7 +1841,61 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
         )
     args.registry = validate_registry_host(args.registry)
     task_dir = resolve_task_dir(args.task_dir, args.dataset_root, args.include)
+    cache_root = args.cache_root.resolve()
+    benchmark = args.benchmark_name or args.project
+    target = RegistryTarget(
+        registry=args.registry,
+        project=args.project,
+        task_repository=args.task_repository or normalize_task_repository(task_dir.name),
+    )
+    reuse_local_upload = bool(getattr(args, "reuse_local_upload_cache", False))
+    skip_hash_verification = bool(getattr(args, "skip_hash_verification", False))
+    upload_manifest_path = local_upload_manifest_path(
+        cache_root,
+        target,
+        benchmark=benchmark,
+        platform=args.platform,
+    )
+    cached_manifest = (
+        _read_record(upload_manifest_path)
+        if reuse_local_upload and not args.force and not args.dry_run
+        else {}
+    )
+    cached_target_matches = bool(cached_manifest) and _cached_bundle_matches_target(
+        cached_manifest,
+        target=target,
+        benchmark=benchmark,
+        task_identity=task_dir.name,
+        platform=args.platform,
+    )
+    configured_output = getattr(args, "bundle_manifest_output", None)
+    if cached_target_matches and skip_hash_verification:
+        log(
+            "local uploaded-Bundle cache hit "
+            f"task={task_dir.name} verification=skipped: {upload_manifest_path}"
+        )
+        return _prepared_from_cached_bundle(
+            cached_manifest,
+            cached_path=upload_manifest_path,
+            configured_output=configured_output,
+        )
+
     bundle = resolve_bundle_spec(task_dir)
+    if cached_target_matches and _cached_bundle_matches_content(cached_manifest, bundle):
+        log(
+            "local uploaded-Bundle cache hit "
+            f"task={task_dir.name} verification=content-hash: {upload_manifest_path}"
+        )
+        return _prepared_from_cached_bundle(
+            cached_manifest,
+            cached_path=upload_manifest_path,
+            configured_output=configured_output,
+        )
+    if cached_manifest and reuse_local_upload and not args.force and not args.dry_run:
+        log(
+            "local uploaded-Bundle cache miss "
+            f"task={task_dir.name}; falling back to Registry resolution"
+        )
     build_network = getattr(args, "build_network", "default")
     args.apt_mirror = validate_apt_mirror(
         getattr(args, "apt_mirror", DEFAULT_APT_MIRROR),
@@ -1723,12 +1906,6 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
         args, build_network
     )
     explicit_build_args = parse_build_args(args.build_args_json)
-    cache_root = args.cache_root.resolve()
-    target = RegistryTarget(
-        registry=args.registry,
-        project=args.project,
-        task_repository=args.task_repository or normalize_task_repository(bundle.task_identity),
-    )
     publisher: SkopeoPublisher | None = None
     registry: RegistryClient | None = None
     proxy_args: dict[str, str] = {}
@@ -1771,7 +1948,7 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
             bundle.services[name],
             artifacts[name],
             bundle.environment_dir,
-            benchmark=args.benchmark_name or args.project,
+            benchmark=benchmark,
             task_identity=bundle.task_identity,
             definition_kind=bundle.definition_kind,
         )
@@ -1781,7 +1958,7 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
     manifest: dict[str, object] = {
         "schema_version": BUNDLE_SCHEMA_VERSION,
         "bundle_format": BUNDLE_FORMAT_VERSION,
-        "benchmark": {"name": args.benchmark_name or args.project},
+        "benchmark": {"name": benchmark},
         "task_identity": bundle.task_identity,
         "registry": {
             "host": target.registry,
@@ -1798,7 +1975,8 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
         "requirements": bundle.requirements,
     }
 
-    configured_output = getattr(args, "bundle_manifest_output", None)
+    if reuse_local_upload and not args.dry_run:
+        atomic_write_json(upload_manifest_path, manifest)
     manifest_path: Path | None = None
     if configured_output is not None:
         manifest_path = Path(configured_output).expanduser().resolve()
@@ -1989,6 +2167,24 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--force", action="store_true")
     parser.add_argument(
+        "--reuse-local-upload-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "reuse a target-scoped local record after verifying the current task "
+            "content hash, avoiding a Registry cache lookup"
+        ),
+    )
+    parser.add_argument(
+        "--skip-hash-verification",
+        action="store_true",
+        default=False,
+        help=(
+            "trust a matching local uploaded-Bundle record without hashing task "
+            "content; requires --reuse-local-upload-cache"
+        ),
+    )
+    parser.add_argument(
         "--no-cache",
         action="store_true",
         help="disable BuildKit layer cache for this build without changing image identity",
@@ -2029,6 +2225,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         parser.error("--project must be a single Registry Project name")
     if args.task_repository and "/" in args.task_repository:
         parser.error("--task-repository must be a single repository name")
+    if args.skip_hash_verification and not args.reuse_local_upload_cache:
+        parser.error(
+            "--skip-hash-verification requires --reuse-local-upload-cache"
+        )
     return args
 
 

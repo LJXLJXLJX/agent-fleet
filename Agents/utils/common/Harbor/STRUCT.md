@@ -180,6 +180,8 @@ Typical dataset paths:
 | `HARBOR_OPENSANDBOX_IMAGE_REF` | Legacy explicit single-image override; it must be fully qualified under `YICLOUD_HARBOR_HOST` |
 | `HARBOR_OPENSANDBOX_BUNDLE_MANIFEST` | Optional versioned service Bundle Manifest; every service image must be fully qualified under `YICLOUD_HARBOR_HOST` |
 | `HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT` | H-local Registry records, image locks, build logs, and immutable Bundle cache root |
+| `HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE` | Dataset prebuild local uploaded-Bundle index switch; defaults to `1` and avoids Registry lookup after a content-hash match |
+| `HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION` | Trust a matching target/task entry in the local uploaded-Bundle index without parsing or hashing task content; defaults to `0` |
 | `YICLOUD_HARBOR_HOST` | Required Harbor registry host used for publication and every OpenSandbox image pull; set the real value in `config.local.env` or the environment |
 | `YICLOUD_HARBOR_PROJECT` | Externally provisioned Harbor Project for the selected benchmark; task repositories are derived per task |
 | `YICLOUD_HARBOR_TLS_VERIFY` | Whether `skopeo` verifies the configured Harbor TLS certificate; current internal ingress requires `0` |

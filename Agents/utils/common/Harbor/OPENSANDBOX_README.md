@@ -150,6 +150,27 @@ bash Agents/utils/common/Harbor/prebuild_opensandbox_dataset.sh \
   /absolute/path/to/Harbor-Dataset seta
 ```
 
+Every successful Registry resolution also updates a target-scoped local
+uploaded-Bundle index under `HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT`. On restart,
+prebuild recomputes each task's static environment hash and, when it still
+matches the local record, skips Registry login and manifest inspection. For a
+stable dataset, hashing can also be skipped:
+
+```bash
+HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION=1 \
+bash Agents/utils/common/Harbor/prebuild_opensandbox_dataset.sh \
+  /absolute/path/to/Harbor-Dataset seta
+```
+
+Fast resume trusts that the recorded Registry artifacts still exist and that
+the task content has not changed. Leave the option at its default `0` to retain
+local hash validation. Set
+`HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE=0` to bypass the local
+index entirely and restore per-task Registry lookup. Fast resume also defers
+configured package-source health probes, so a batch made entirely of local
+hits performs no per-task network request. If a real miss later fails while
+building, the existing health check and trusted-source fallback still run.
+
 Prebuild performs a bounded BuildKit cache prune before starting and every 30
 minutes while it runs. Defaults are `max-used-space=500GB`,
 `min-free-space=300GB`, and `reserved-space=100GB`; all four values are
@@ -160,8 +181,10 @@ BuildKit cache and does not delete images, containers, volumes, or artifacts
 already published to the OCI Registry.
 
 Already published content-addressed images are reused in the task-specific
-repository. Unsupported environment definitions are listed as skipped in the
-prebuild report; unsupported runtime capabilities fail before creation.
+repository, and every current run still gets its per-task Bundle Manifest even
+on a local cache hit. Unsupported environment definitions are listed as
+skipped in the prebuild report; unsupported runtime capabilities fail before
+creation.
 
 ## Troubleshooting
 

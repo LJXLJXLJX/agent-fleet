@@ -54,6 +54,8 @@ HARBOR_OPENSANDBOX_BUILD_NETWORK="${HARBOR_OPENSANDBOX_BUILD_NETWORK:-host}"
 HARBOR_OPENSANDBOX_BUILD_PROXY_URL="${HARBOR_OPENSANDBOX_BUILD_PROXY_URL:-}"
 HARBOR_OPENSANDBOX_PREBUILD_CONCURRENCY="${HARBOR_OPENSANDBOX_PREBUILD_CONCURRENCY:-1}"
 HARBOR_OPENSANDBOX_DRY_RUN="${HARBOR_OPENSANDBOX_DRY_RUN:-0}"
+HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE="${HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE:-1}"
+HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION="${HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION:-0}"
 HARBOR_OPENSANDBOX_PREBUILD_ROOT="${HARBOR_OPENSANDBOX_PREBUILD_ROOT:-/data/harbor-runs/opensandbox-prebuild}"
 HARBOR_OPENSANDBOX_PREBUILD_GC_INTERVAL_SEC="${HARBOR_OPENSANDBOX_PREBUILD_GC_INTERVAL_SEC:-1800}"
 HARBOR_OPENSANDBOX_PREBUILD_GC_MAX_USED_SPACE="${HARBOR_OPENSANDBOX_PREBUILD_GC_MAX_USED_SPACE:-500GB}"
@@ -164,6 +166,19 @@ case "${HARBOR_OPENSANDBOX_DRY_RUN}" in
   0|1) ;;
   *) print_error "[ERROR] HARBOR_OPENSANDBOX_DRY_RUN must be 0 or 1"; exit 1 ;;
 esac
+case "${HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE}" in
+  0|1) ;;
+  *) print_error "[ERROR] HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE must be 0 or 1"; exit 1 ;;
+esac
+case "${HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION}" in
+  0|1) ;;
+  *) print_error "[ERROR] HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION must be 0 or 1"; exit 1 ;;
+esac
+if [[ "${HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION}" == 1 \
+  && "${HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE}" != 1 ]]; then
+  print_error "[ERROR] HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION=1 requires HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE=1"
+  exit 1
+fi
 case "${HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC}" in
   ''|*[!0-9]*|0)
     print_error "[ERROR] HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC must be a positive integer"
@@ -222,7 +237,12 @@ select_domestic_apt_mirror() {
   return 1
 }
 
-if ! package_sources_healthy; then
+# Fast resume returns from the image manager before package-source validation.
+# Defer health traffic in that mode so a fully local batch performs no network
+# request merely to discover its cache hits. A real cache miss still probes and
+# switches sources through the existing failed-build fallback below.
+if [[ "${HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION}" != 1 ]] \
+  && ! package_sources_healthy; then
   print_warning \
     "[WARN] configured package sources are unavailable; using trusted domestic defaults"
   if ! HARBOR_OPENSANDBOX_APT_MIRROR="$(select_domestic_apt_mirror)"; then
@@ -345,6 +365,17 @@ printf '[prebuild] benchmark=%s supported=%s skipped=%s concurrency=%s dry_run=%
   "${HARBOR_OPENSANDBOX_PREBUILD_CONCURRENCY}" "${HARBOR_OPENSANDBOX_DRY_RUN}"
 printf '[prebuild] registry=%s project=%s (task repositories are derived per task)\n' \
   "${YICLOUD_HARBOR_HOST}" "${YICLOUD_HARBOR_PROJECT}"
+local_upload_hash_verification=disabled
+if [[ "${HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE}" == 1 ]]; then
+  local_upload_hash_verification=enabled
+  if [[ "${HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION}" == 1 ]]; then
+    local_upload_hash_verification=skipped
+  fi
+fi
+printf '[prebuild] local_upload_cache=%s hash_verification=%s cache_root=%s\n' \
+  "$([[ "${HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE}" == 1 ]] && printf enabled || printf disabled)" \
+  "${local_upload_hash_verification}" \
+  "${HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT}"
 printf '[prebuild] package_sources=%s apt_mirror=%s fallback_apt_mirrors=%s\n' \
   "$([[ -n "${HARBOR_OPENSANDBOX_PACKAGE_SOURCE_HEALTH_URL}" ]] && printf configured || printf domestic-defaults)" \
   "${HARBOR_OPENSANDBOX_APT_MIRROR}" \
@@ -379,6 +410,8 @@ export HARBOR_OPENSANDBOX_BUILD_USE_PROXY
 export HARBOR_OPENSANDBOX_BUILD_NETWORK
 export HARBOR_OPENSANDBOX_BUILD_PROXY_URL
 export HARBOR_OPENSANDBOX_DRY_RUN
+export HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE
+export HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION
 export HARBOR_OPENSANDBOX_IMAGE_MANAGER
 export HARBOR_OPENSANDBOX_MANAGER_PYTHON
 export run_dir
@@ -447,10 +480,13 @@ xargs -0 -r -P "${HARBOR_OPENSANDBOX_PREBUILD_CONCURRENCY}" -n 1 \
       )
       [[ "${YICLOUD_HARBOR_TLS_VERIFY}" == 1 ]] && command+=(--registry-tls-verify)
       [[ "${HARBOR_OPENSANDBOX_BUILD_USE_PROXY}" == 1 ]] && command+=(--use-proxy)
+      [[ "${HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE}" == 1 ]] && command+=(--reuse-local-upload-cache)
+      [[ "${HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION}" == 1 ]] && command+=(--skip-hash-verification)
       [[ "${HARBOR_OPENSANDBOX_DRY_RUN}" == 1 ]] && command+=(--dry-run)
     }
     active_apt_mirror="${HARBOR_OPENSANDBOX_APT_MIRROR}"
-    if ! package_sources_healthy; then
+    if [[ "${HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION}" != 1 ]] \
+      && ! package_sources_healthy; then
       if ! active_apt_mirror="$(select_domestic_apt_mirror)"; then
         printf "[prebuild][failed] task=%s configured package sources are unavailable and no trusted domestic APT fallback is reachable\n" \
           "${task_name}" >&2

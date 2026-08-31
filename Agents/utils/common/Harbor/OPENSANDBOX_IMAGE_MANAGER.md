@@ -108,10 +108,29 @@ digest ref = <registry>/<project>/<task>@sha256:<artifact-digest>
 
 The `input_hash` is a full SHA-256 calculated before build and the Registry
 `artifact_digest` is collected by an independent `skopeo inspect` after copy.
-The cache authority is the target task repository, not a local record. Each
-Compose service has an independent service tag and artifact resolution. The
-manager does not implement Registry Project management, raw blob
-upload, an old-Registry fallback, or a cross-repository layer index.
+Normal on-demand preparation keeps the target task repository as cache
+authority. Dataset prebuild additionally enables a persistent local
+uploaded-Bundle index under
+`<HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT>/uploaded-bundles/`. Entries are scoped by
+Registry host, Project, benchmark, platform, and normalized task repository.
+They are written only after every service has resolved successfully through the
+Registry path.
+
+On a later prebuild, the default local-cache path parses the current Bundle and
+compares its definition identity and every service's full static environment
+hash before reusing the recorded immutable digest refs. This avoids Registry
+login and manifest inspection. With
+`HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION=1`, a structurally valid
+entry matching the same target and task identity is trusted before task parsing
+or content hashing. That mode deliberately does not prove that the dataset is
+unchanged or that Registry retention has preserved the artifacts. Disable the
+local path with `HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE=0`, remove
+the relevant local entry, or use the manager's `--force` option when Registry
+revalidation/rebuild is required.
+
+Each Compose service has an independent service tag and artifact resolution.
+The manager does not implement Registry Project management, raw blob upload,
+an old-Registry fallback, or a cross-repository layer index.
 
 The current context hash is conservative: generated cache files are ignored,
 but `.dockerignore` is not yet evaluated. This can cause an unnecessary rebuild
@@ -235,4 +254,5 @@ cleanup.
 - Configured domestic Docker and APT mirrors are preferred. Proxy build args
   are forwarded only when explicitly enabled.
 - `--force` bypasses the target-tag cache lookup; it does not change the
-  deterministic tag or the image content identity.
+  deterministic tag or the image content identity. It also bypasses the local
+  uploaded-Bundle index.
