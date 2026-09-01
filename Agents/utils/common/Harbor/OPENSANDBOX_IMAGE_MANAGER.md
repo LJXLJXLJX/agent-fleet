@@ -158,6 +158,14 @@ also not persisted. Credentials come from the ignored
 Docker config fallback and are never written to Bundle files. Sandbox tokens
 and model credentials are outside this layer.
 
+When `HARBOR_OPENSANDBOX_GITHUB_MIRROR_URL` names a GitHub Smart HTTP mirror
+prefix, the manager injects transient Git
+`url.*.insteadOf` entries through a BuildKit secret mounted as `/etc/gitconfig`
+for Dockerfile `RUN` commands. They apply to ordinary clone/fetch and recursive
+GitHub submodules, including HTTPS, SCP-like SSH, `ssh://`, and `git://` URLs.
+The mount exists only while each `RUN` executes, so it is not written into an
+image layer, image environment, or global `.gitconfig`.
+
 `SkopeoPublisher` removes ambient HTTP(S) proxy variables for login, copy, and
 inspect. TLS verification is controlled by `YICLOUD_HARBOR_TLS_VERIFY`; the
 currently verified internal ingress requires `0`, but this is configuration,

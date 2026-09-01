@@ -116,6 +116,14 @@ DEFAULT_CARGO_REGISTRY_URL = (
 )
 DEFAULT_RUSTUP_DIST_SERVER = "https://mirrors.tuna.tsinghua.edu.cn/rustup"
 DEFAULT_RUSTUP_UPDATE_ROOT = "https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup"
+GITHUB_GIT_URL_PREFIXES = (
+    "https://github.com/",
+    "http://github.com/",
+    "git@github.com:",
+    "ssh://git@github.com/",
+    "git://github.com/",
+)
+GITHUB_MIRROR_SECRET_ID = "opensandbox-github-mirror-gitconfig"
 BUILD_ARG_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FROM_LINE = re.compile(
     r"^(?P<prefix>\s*FROM(?:\s+--platform=\S+)?\s+)"
@@ -128,6 +136,7 @@ HEREDOC_MARKER = re.compile(
     r"<<(?P<strip>-)?\s*(?P<quote>['\"]?)"
     r"(?P<delimiter>[A-Za-z0-9_.-]+)(?P=quote)"
 )
+APT_COMMAND = re.compile(r"\bapt(?:-get)?\b", re.IGNORECASE)
 
 # This is deliberately a small, version-controlled adapter contract rather
 # than an inference based on service names or installed software.  It covers
@@ -234,24 +243,33 @@ def mirror_image_ref(image: str, mirror_prefix: str, aliases: set[str]) -> str:
     return image
 
 
-def apt_mirror_command(source_image: str, apt_mirror: str) -> str | None:
+def apt_mirror_command(
+    source_image: str,
+    apt_mirror: str,
+    *,
+    stage_uses_apt: bool = False,
+) -> str | None:
     if not apt_mirror:
         return None
     image = source_image.lower()
     mirror = apt_mirror.rstrip("/")
-    if "ubuntu" in image:
-        replacements = (
-            f"s#https?://(archive|security|ports)\\.ubuntu\\.com/ubuntu/?#"
-            f"{mirror}/ubuntu/#g"
-        )
-    elif any(name in image for name in ("bookworm", "debian", "python:", "golang:")):
-        replacements = (
-            f"s#https?://(deb|security)\\.debian\\.org/debian-security/?#"
-            f"{mirror}/debian-security/#g;"
-            f"s#https?://deb\\.debian\\.org/debian/?#{mirror}/debian/#g"
-        )
-    else:
+    recognized_apt_image = "ubuntu" in image or any(
+        name in image for name in ("bookworm", "debian", "python:", "golang:")
+    )
+    if not recognized_apt_image and not stage_uses_apt:
         return None
+    # Rebench and similar datasets commonly replace the upstream Ubuntu or
+    # Debian image with an internal overlay whose repository name no longer
+    # reveals the distribution. Rewriting both well-known source families is
+    # harmless and lets the commands in the stage, rather than the image name,
+    # prove that APT source routing is required.
+    replacements = (
+        f"s#https?://(archive|security|ports)\\.ubuntu\\.com/ubuntu/?#"
+        f"{mirror}/ubuntu/#g;"
+        f"s#https?://(deb|security)\\.debian\\.org/debian-security/?#"
+        f"{mirror}/debian-security/#g;"
+        f"s#https?://deb\\.debian\\.org/debian/?#{mirror}/debian/#g"
+    )
     return (
         "RUN set -eu; "
         "for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list "
@@ -260,6 +278,41 @@ def apt_mirror_command(source_image: str, apt_mirror: str) -> str | None:
         f"sed -E -i '{replacements}' \"$file\"; "
         "done"
     )
+
+
+def dockerfile_apt_stages(source: str) -> tuple[bool, ...]:
+    """Identify Dockerfile stages that actually invoke apt or apt-get."""
+    stages: list[bool] = []
+    active_instruction: str | None = None
+    heredocs: list[tuple[str, bool]] = []
+    for source_line in source.splitlines():
+        if heredocs:
+            if stages and APT_COMMAND.search(source_line):
+                stages[-1] = True
+            delimiter, strip_tabs = heredocs[0]
+            candidate = source_line.lstrip("\t") if strip_tabs else source_line
+            if candidate == delimiter:
+                heredocs.pop(0)
+                if not heredocs:
+                    active_instruction = None
+            continue
+
+        instruction = DOCKERFILE_INSTRUCTION.match(source_line)
+        if instruction:
+            active_instruction = instruction.group("name").upper()
+            if active_instruction == "FROM":
+                stages.append(False)
+            elif stages and APT_COMMAND.search(source_line):
+                stages[-1] = True
+
+        if active_instruction in {"RUN", "COPY", "ADD"}:
+            heredocs.extend(
+                (item.group("delimiter"), bool(item.group("strip")))
+                for item in HEREDOC_MARKER.finditer(source_line)
+            )
+        if not heredocs and not source_line.rstrip().endswith("\\"):
+            active_instruction = None
+    return tuple(stages)
 
 
 def rewrite_docker_ce_sources(source: str, apt_mirror: str) -> str:
@@ -401,6 +454,24 @@ def package_source_build_args(
     return build_args
 
 
+def validate_github_mirror_url(value: str, build_network: str) -> str:
+    """Validate a GitHub Smart HTTP mirror prefix used only during builds."""
+    if not value.strip():
+        return ""
+    return _validate_source_url(
+        value.strip(), "GitHub mirror", build_network
+    ).rstrip("/") + "/"
+
+
+def github_mirror_config_content(github_mirror_url: str) -> str:
+    """Render transient system Git config mounted only during Dockerfile RUN."""
+    if not github_mirror_url:
+        return ""
+    lines = [f'[url "{github_mirror_url}"]']
+    lines.extend(f"\tinsteadOf = {prefix}" for prefix in GITHUB_GIT_URL_PREFIXES)
+    return "\n".join(lines) + "\n"
+
+
 def optional_package_source_urls(
     args: argparse.Namespace, build_network: str
 ) -> tuple[str, str]:
@@ -423,7 +494,8 @@ def package_source_hosts(
     values = [
         value
         for name, value in build_args.items()
-        if name
+        if not name.startswith("GIT_CONFIG_")
+        and name
         not in {
             "CARGO_HTTP_TIMEOUT",
             "CARGO_REGISTRIES_CRATES_IO_PROTOCOL",
@@ -515,10 +587,13 @@ def render_build_dockerfile(
     package_build_args: dict[str, str] | None = None,
     rustup_init_url: str = "",
     pytorch_index_url: str = "",
+    github_mirror_secret_id: str = "",
 ) -> str:
     package_build_args = package_build_args or {}
     output: list[str] = []
     aliases: set[str] = set()
+    apt_stages = dockerfile_apt_stages(source)
+    stage_index = -1
     active_instruction: str | None = None
     heredocs: list[tuple[str, bool]] = []
     for source_line in source.splitlines():
@@ -541,8 +616,20 @@ def render_build_dockerfile(
             rustup_init_url=rustup_init_url,
             pytorch_index_url=pytorch_index_url,
         )
+        if active_instruction == "RUN" and github_mirror_secret_id:
+            line = re.sub(
+                r"^(\s*RUN\s+)",
+                (
+                    r"\1--mount=type=secret,id="
+                    f"{github_mirror_secret_id},target=/etc/gitconfig,mode=0444,required=true "
+                ),
+                line,
+                count=1,
+                flags=re.IGNORECASE,
+            )
         match = FROM_LINE.match(line)
         if match:
+            stage_index += 1
             source_image = match.group("image")
             mirrored_image = mirror_image_ref(
                 source_image, dockerhub_mirror_prefix, aliases
@@ -558,10 +645,15 @@ def render_build_dockerfile(
             alias_match = AS_ALIAS.search(match.group("suffix"))
             if alias_match:
                 aliases.add(alias_match.group("alias"))
-            if source_image not in aliases:
-                command = apt_mirror_command(source_image, apt_mirror)
-                if command:
-                    output.append(command)
+            command = apt_mirror_command(
+                source_image,
+                apt_mirror,
+                stage_uses_apt=(
+                    stage_index < len(apt_stages) and apt_stages[stage_index]
+                ),
+            )
+            if command:
+                output.append(command)
         else:
             output.append(line)
 
@@ -666,6 +758,7 @@ def run_build(
     target: str | None = None,
     no_cache: bool = False,
     build_network: str = "default",
+    secret_files: dict[str, Path] | None = None,
 ) -> None:
     child_env = os.environ.copy()
     child_env.update(build_args)
@@ -738,6 +831,8 @@ def run_build(
         ]
         for name in sorted(build_args):
             command.extend(("--build-arg", name))
+        for secret_id, secret_path in sorted((secret_files or {}).items()):
+            command.extend(("--secret", f"id={secret_id},src={secret_path}"))
         if build_network != "default":
             command.append(f"--network={build_network}")
         if no_cache:
@@ -1343,12 +1438,14 @@ def _transport_record(
     dockerhub_mirror_prefix: str,
     apt_mirror: str,
     package_build_args: dict[str, str],
+    github_mirror_url: str,
     rustup_init_url: str,
     pytorch_index_url: str,
 ) -> dict[str, str]:
     return {
         "apt_mirror": apt_mirror,
         "dockerhub_mirror_prefix": dockerhub_mirror_prefix,
+        "github_mirror_configured": str(bool(github_mirror_url)).lower(),
         "package_source_args": ",".join(sorted(package_build_args)),
         "pytorch_index_configured": str(bool(pytorch_index_url)).lower(),
         "rustup_init_configured": str(bool(rustup_init_url)).lower(),
@@ -1633,6 +1730,7 @@ def _prepare_service_image(
                         dockerhub_mirror_prefix=args.dockerhub_mirror_prefix,
                         apt_mirror=args.apt_mirror,
                         package_build_args=args.package_build_args,
+                        github_mirror_url=args.github_mirror_url,
                         rustup_init_url=args.rustup_init_url,
                         pytorch_index_url=args.pytorch_index_url,
                     ),
@@ -1667,6 +1765,15 @@ def _prepare_service_image(
                 dockerfile_source = service.build.dockerfile.read_text(encoding="utf-8")
                 target_stage = service.build.target
                 rendered_dockerfile = temporary / "Dockerfile"
+                github_mirror_config = github_mirror_config_content(
+                    args.github_mirror_url
+                )
+                github_mirror_config_path: Path | None = None
+                if github_mirror_config:
+                    github_mirror_config_path = temporary / "gitconfig"
+                    github_mirror_config_path.write_text(
+                        github_mirror_config, encoding="utf-8"
+                    )
                 rendered_dockerfile.write_text(
                     render_build_dockerfile(
                         dockerfile_source,
@@ -1675,6 +1782,9 @@ def _prepare_service_image(
                         package_build_args=args.package_build_args,
                         rustup_init_url=args.rustup_init_url,
                         pytorch_index_url=args.pytorch_index_url,
+                        github_mirror_secret_id=(
+                            GITHUB_MIRROR_SECRET_ID if github_mirror_config else ""
+                        ),
                     ),
                     encoding="utf-8",
                 )
@@ -1696,6 +1806,11 @@ def _prepare_service_image(
                     target=target_stage,
                     no_cache=getattr(args, "no_cache", False),
                     build_network=getattr(args, "build_network", "default"),
+                    secret_files=(
+                        {GITHUB_MIRROR_SECRET_ID: github_mirror_config_path}
+                        if github_mirror_config_path is not None
+                        else None
+                    ),
                 )
                 local_image_config = oci_archive_image_config(archive_path)
                 log(f"publishing service={service.name}: {tag_ref}")
@@ -1725,6 +1840,7 @@ def _prepare_service_image(
                     dockerhub_mirror_prefix=args.dockerhub_mirror_prefix,
                     apt_mirror=args.apt_mirror,
                     package_build_args=args.package_build_args,
+                    github_mirror_url=args.github_mirror_url,
                     rustup_init_url=args.rustup_init_url,
                     pytorch_index_url=args.pytorch_index_url,
                 ),
@@ -1901,6 +2017,9 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
         getattr(args, "apt_mirror", DEFAULT_APT_MIRROR),
         build_network,
     )
+    args.github_mirror_url = validate_github_mirror_url(
+        getattr(args, "github_mirror_url", ""), build_network
+    )
     args.package_build_args = package_source_build_args(args, build_network)
     args.rustup_init_url, args.pytorch_index_url = optional_package_source_urls(
         args, build_network
@@ -1924,6 +2043,7 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
             direct_hosts=package_source_hosts(
                 args.package_build_args,
                 args.apt_mirror,
+                args.github_mirror_url,
                 args.rustup_init_url,
                 args.pytorch_index_url,
             ),
@@ -2120,6 +2240,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=os.environ.get(
             "HARBOR_OPENSANDBOX_RUSTUP_UPDATE_ROOT",
             DEFAULT_RUSTUP_UPDATE_ROOT,
+        ),
+    )
+    parser.add_argument(
+        "--github-mirror-url",
+        default=os.environ.get("HARBOR_OPENSANDBOX_GITHUB_MIRROR_URL", ""),
+        help=(
+            "optional build-only GitHub Smart HTTP mirror prefix; applies to "
+            "clone, fetch, and recursive submodules"
         ),
     )
     parser.add_argument(

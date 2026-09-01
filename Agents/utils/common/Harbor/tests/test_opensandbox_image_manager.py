@@ -26,6 +26,7 @@ from opensandbox_image_manager import (
     _service_manifest,
     apt_404_requires_cache_refresh,
     environment_content_hash,
+    github_mirror_config_content,
     normalize_oci_image_config,
     oci_archive_image_config,
     package_source_build_args,
@@ -36,6 +37,7 @@ from opensandbox_image_manager import (
     render_build_dockerfile,
     run_build,
     schema2_manifest,
+    validate_github_mirror_url,
 )
 
 
@@ -458,6 +460,34 @@ networks:
         self.assertEqual(http_args["PIP_TRUSTED_HOST"], "packages.internal")
         self.assertNotIn("PIP_TRUSTED_HOST", https_args)
 
+    def test_github_mirror_uses_transient_secret_mount_for_submodules(self) -> None:
+        mirror = validate_github_mirror_url(
+            "http://github-mirror.internal:8080/repos", "host"
+        )
+        config = github_mirror_config_content(mirror)
+        rendered = render_build_dockerfile(
+            "FROM ubuntu:24.04 AS builder\nRUN git submodule update --init --recursive\nFROM builder\n",
+            dockerhub_mirror_prefix="m.daocloud.io/docker.io",
+            apt_mirror="https://mirrors.tuna.tsinghua.edu.cn",
+            github_mirror_secret_id="opensandbox-github-mirror-gitconfig",
+        )
+
+        self.assertEqual(mirror, "http://github-mirror.internal:8080/repos/")
+        self.assertIn("insteadOf = https://github.com/", config)
+        self.assertIn("insteadOf = git@github.com:", config)
+        self.assertEqual(
+            rendered.count("id=opensandbox-github-mirror-gitconfig"), 1
+        )
+        self.assertNotIn(mirror, rendered)
+
+    def test_github_mirror_accepts_provider_neutral_prefix(self) -> None:
+        self.assertEqual(
+            validate_github_mirror_url(
+                "https://mirror.example.internal/custom/github", "host"
+            ),
+            "https://mirror.example.internal/custom/github/",
+        )
+
     def test_render_preserves_debian_security_repository_path(self) -> None:
         rendered = render_build_dockerfile(
             "FROM python:3.13-slim-bookworm\n",
@@ -474,6 +504,33 @@ networks:
             rendered,
         )
         self.assertNotIn("debian/-security", rendered)
+
+    def test_render_routes_apt_for_internal_overlay_alias_stage(self) -> None:
+        rendered = render_build_dockerfile(
+            (
+                "FROM registry.internal/rebench/c@sha256:abc AS base\n"
+                "FROM base AS task\n"
+                "RUN <<-BUILD\n"
+                "\tapt-get update -qq\n"
+                "BUILD\n"
+            ),
+            dockerhub_mirror_prefix="registry.internal/public-mirror",
+            apt_mirror="http://apt-mirror.internal/repos",
+        )
+
+        self.assertEqual(rendered.count("RUN set -eu;"), 1)
+        self.assertIn("apt-mirror.internal/repos/ubuntu/", rendered)
+        self.assertIn("apt-mirror.internal/repos/debian/", rendered)
+        self.assertLess(rendered.index("RUN set -eu;"), rendered.index("RUN <<-BUILD"))
+
+    def test_render_does_not_inject_apt_routing_into_scratch_stage(self) -> None:
+        rendered = render_build_dockerfile(
+            "FROM scratch\nCOPY app /app\n",
+            dockerhub_mirror_prefix="registry.internal/public-mirror",
+            apt_mirror="http://apt-mirror.internal/repos",
+        )
+
+        self.assertNotIn("RUN set -eu;", rendered)
 
     def test_render_does_not_rewrite_from_inside_dockerfile_heredocs(self) -> None:
         rendered = render_build_dockerfile(
