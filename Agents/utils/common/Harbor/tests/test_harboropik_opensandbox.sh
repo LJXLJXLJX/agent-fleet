@@ -48,6 +48,20 @@ printf 'FROM alpine:3.20\n' > "$tmp/dataset/1/environment/Dockerfile"
 printf 'fake package\n' > "$tmp/deps/claude.tgz"
 printf 'fake wheel\n' > "$tmp/deps/wheels/dependency.whl"
 printf '# fake Claude Opik hook\n' > "$tmp/deps/claude_realtime_trace.py"
+mkdir -p "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin"
+printf 'target-system-libraries\n' \
+  > "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/.harbor-python-runtime-v2"
+printf '#!/bin/sh\nexit 0\n' \
+  > "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python3.12"
+printf '#!/bin/sh\nexit 0\n' \
+  > "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/harbor-verifier-bundle-check"
+chmod +x \
+  "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python3.12" \
+  "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/harbor-verifier-bundle-check"
+ln -s python3.12 "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python3"
+ln -s python3.12 "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python"
+tar -czf "$tmp/deps/wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" \
+  -C "$tmp/verifier-bundle" agent-fleet-swe-rebench-v2-verifier-bundle
 
 run_dry() {
   local image_ref="$1"
@@ -98,6 +112,8 @@ run_dry() {
     HARBOR_CC_CLAUDE_TGZ_SOURCE="$tmp/deps/claude.tgz" \
     HARBOR_CC_PY_WHEEL_DIR_SOURCE="$tmp/deps/wheels" \
     HARBOR_ENVIRONMENT_TYPE="$environment_type" \
+    YICLOUD_SANDBOX_UPLOAD_BACKEND="${RUN_DRY_UPLOAD_BACKEND:-auto}" \
+    YICLOUD_SANDBOX_S3_PROFILE= \
     HARBOR_OPENSANDBOX_IMAGE_REF="$image_ref" \
     HARBOR_OPENSANDBOX_BUNDLE_MANIFEST="$bundle_manifest" \
     YICLOUD_HARBOR_HOST=harbor.example.internal \
@@ -126,6 +142,82 @@ grep -F -- '--ek lifecycle_minutes=120' <<< "$automatic" >/dev/null
 grep -F -- '--mounts-json' <<< "$automatic" >/dev/null
 grep -F -- 'HARBOR_VERIFIER_UV_BIN_DIR=/opt/tb-uv-backup/bin' \
   <<< "$automatic" >/dev/null
+grep -F -- 'HARBOR_VERIFIER_PATH_PREPEND=/root/.local/bin:' \
+  <<< "$automatic" >/dev/null
+if grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_' <<< "$automatic" >/dev/null; then
+  echo 'non-Rebench OpenSandbox verifier unexpectedly receives a runtime bundle' >&2
+  exit 1
+fi
+if grep -F -- 'FAKE_HARBOR_ARG=PATH=' <<< "$automatic" >/dev/null; then
+  echo 'OpenSandbox verifier unexpectedly replaces the task image PATH' >&2
+  exit 1
+fi
+
+rebench="$(run_dry \
+  'test-project/manual:immutable' "$tmp/does-not-exist.py" '{}' \
+  agent-fleet-swe-rebench-v2)"
+grep -F -- '[INFO] OpenSandbox verifier runtime bundle: benchmark=agent-fleet-swe-rebench-v2 bundle=agent-fleet-swe-rebench-v2-verifier-bundle' \
+  <<< "$rebench" >/dev/null
+grep -F -- 'HARBOR_VERIFIER_PATH_PREPEND=/tmp/harbor-verifier-bundles/agent-fleet-swe-rebench-v2-verifier-bundle/bin:' \
+  <<< "$rebench" >/dev/null
+grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_ID=agent-fleet-swe-rebench-v2-verifier-bundle' \
+  <<< "$rebench" >/dev/null
+if grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_KIND=' <<< "$rebench" >/dev/null; then
+  echo 'Rebench verifier runtime bundle unexpectedly exposes a kind' >&2
+  exit 1
+fi
+grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_ARCHIVE=/opt/tb-opik/python-wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz' \
+  <<< "$rebench" >/dev/null
+grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_ROOT=/tmp/harbor-verifier-bundles/agent-fleet-swe-rebench-v2-verifier-bundle' \
+  <<< "$rebench" >/dev/null
+grep -F -- "$tmp/deps/wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" \
+  <<< "$rebench" >/dev/null
+grep -F -- '/opt/tb-opik/python-wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz' \
+  <<< "$rebench" >/dev/null
+if grep -F -- 'FAKE_HARBOR_ARG=PATH=' <<< "$rebench" >/dev/null; then
+  echo 'Rebench OpenSandbox verifier unexpectedly replaces the task image PATH' >&2
+  exit 1
+fi
+
+set +e
+http_rebench="$(RUN_DRY_UPLOAD_BACKEND=http run_dry \
+  'test-project/manual:immutable' "$tmp/does-not-exist.py" '{}' \
+  agent-fleet-swe-rebench-v2)"
+http_rebench_status="$?"
+set -e
+if [[ "$http_rebench_status" == "0" ]]; then
+  echo 'Rebench verifier runtime bundle unexpectedly accepted HTTP-only transport' >&2
+  exit 1
+fi
+grep -F -- 'requires YICLOUD_SANDBOX_UPLOAD_BACKEND=s3 or auto' \
+  <<< "$http_rebench" >/dev/null
+
+legacy_rebench_alias="$(run_dry \
+  'test-project/manual:immutable' "$tmp/does-not-exist.py" '{}' \
+  swe-rebench-v2)"
+if grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_' \
+  <<< "$legacy_rebench_alias" >/dev/null; then
+  echo 'legacy Rebench alias unexpectedly selects a verifier runtime bundle' >&2
+  exit 1
+fi
+
+mv "$tmp/deps/wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" \
+  "$tmp/deps/wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz.saved"
+set +e
+missing_rebench_runtime="$(run_dry \
+  'test-project/manual:immutable' "$tmp/does-not-exist.py" '{}' \
+  agent-fleet-swe-rebench-v2)"
+missing_rebench_status="$?"
+set -e
+mv "$tmp/deps/wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz.saved" \
+  "$tmp/deps/wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz"
+if [[ "$missing_rebench_status" == "0" ]]; then
+  echo 'Rebench OpenSandbox verifier unexpectedly accepted a missing runtime' >&2
+  exit 1
+fi
+grep -F -- 'runtime bundle agent-fleet-swe-rebench-v2-verifier-bundle selected for agent-fleet-swe-rebench-v2, but its archive is missing' \
+  <<< "$missing_rebench_runtime" >/dev/null
+
 grep -F -- '[INFO] OpenSandbox Bundle Manifest ready:' <<< "$automatic" >/dev/null
 automatic_bundle="$(sed -n \
   's/^\[INFO\] OpenSandbox Bundle Manifest ready: //p' \

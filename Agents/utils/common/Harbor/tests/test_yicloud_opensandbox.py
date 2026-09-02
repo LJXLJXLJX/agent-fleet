@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import types
@@ -113,6 +114,191 @@ class FakeSandbox:
 
 
 class YiCloudOpenSandboxTest(unittest.TestCase):
+    def test_exec_runtime_keeps_missing_environment_as_none(self) -> None:
+        command, env = yicloud_opensandbox._prepare_exec_runtime("true", None)
+
+        self.assertEqual(command, "true")
+        self.assertIsNone(env)
+
+    def test_verifier_runtime_prepends_without_replacing_image_path(self) -> None:
+        wrapped, env = yicloud_opensandbox._prepare_exec_runtime(
+            'printf "%s\\n" "$PATH"',
+            {
+                yicloud_opensandbox.VERIFIER_PATH_PREPEND_ENV: "/verifier/bin",
+                "KEEP": "value",
+            },
+        )
+
+        completed = subprocess.run(
+            ["/bin/sh", "-c", wrapped],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={"PATH": "/image/runtime/bin:/usr/bin:/bin", **env},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.stdout.strip(),
+            "/verifier/bin:/image/runtime/bin:/usr/bin:/bin",
+        )
+        self.assertEqual(env, {"KEEP": "value"})
+
+    def test_verifier_runtime_materializes_portable_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_root = root / "source" / "python3.12-runtime"
+            source_bin = source_root / "bin"
+            source_bin.mkdir(parents=True)
+            python = source_bin / "python3.12"
+            python.write_text("#!/bin/sh\nprintf 'portable-python\\n'\n")
+            python.chmod(0o755)
+            (source_bin / "python3").symlink_to("python3.12")
+            (source_bin / "python").symlink_to("python3.12")
+            check = source_bin / "harbor-verifier-bundle-check"
+            check.write_text('#!/bin/sh\nexec "${0%/*}/python3" >/dev/null\n')
+            check.chmod(0o755)
+            archive = root / "python3.12-runtime.tar.gz"
+            with tarfile.open(archive, "w:gz") as bundle:
+                bundle.add(source_root, arcname=source_root.name)
+
+            runtime_root = root / "runtime" / source_root.name
+            tools = root / "tools"
+            tools.mkdir()
+            for name in ("gzip", "mkdir", "tar"):
+                target = shutil.which(name)
+                self.assertIsNotNone(target)
+                os.symlink(target, tools / name)
+            image_python = tools / "python3"
+            image_python.write_text("#!/bin/sh\nprintf 'image-python\\n'\n")
+            image_python.chmod(0o755)
+
+            wrapped, env = yicloud_opensandbox._prepare_exec_runtime(
+                "command -v python3 && python3",
+                {
+                    yicloud_opensandbox.VERIFIER_PATH_PREPEND_ENV: str(
+                        runtime_root / "bin"
+                    ),
+                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ID_ENV: (
+                        "test-python-verifier-bundle"
+                    ),
+                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV: str(
+                        archive
+                    ),
+                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ROOT_ENV: str(
+                        runtime_root
+                    ),
+                },
+            )
+            completed = subprocess.run(
+                ["/bin/sh", "-c", wrapped],
+                capture_output=True,
+                text=True,
+                check=False,
+                env={"PATH": str(tools), **env},
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.stdout.splitlines(),
+            [str(runtime_root / "bin" / "python3"), "portable-python"],
+        )
+
+    def test_verifier_runtime_reuses_materialized_portable_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_root = root / "runtime" / "python3.12-runtime"
+            runtime_bin = runtime_root / "bin"
+            runtime_bin.mkdir(parents=True)
+            python = runtime_bin / "python3.12"
+            python.write_text("#!/bin/sh\nprintf 'reused-python\\n'\n")
+            python.chmod(0o755)
+            (runtime_bin / "python3").symlink_to("python3.12")
+            (runtime_bin / "python").symlink_to("python3.12")
+            check = runtime_bin / "harbor-verifier-bundle-check"
+            check.write_text('#!/bin/sh\nexec "${0%/*}/python3" >/dev/null\n')
+            check.chmod(0o755)
+            (runtime_root / ".harbor-verifier-bundle-materialized-v1").touch()
+
+            tools = root / "tools"
+            tools.mkdir()
+            for name in ("touch",):
+                target = shutil.which(name)
+                self.assertIsNotNone(target)
+                os.symlink(target, tools / name)
+
+            wrapped, env = yicloud_opensandbox._prepare_exec_runtime(
+                "python3",
+                {
+                    yicloud_opensandbox.VERIFIER_PATH_PREPEND_ENV: str(
+                        runtime_bin
+                    ),
+                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ID_ENV: (
+                        "test-python-verifier-bundle"
+                    ),
+                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV: str(
+                        root / "already-consumed.tar.gz"
+                    ),
+                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ROOT_ENV: str(
+                        runtime_root
+                    ),
+                },
+            )
+            completed = subprocess.run(
+                ["/bin/sh", "-c", wrapped],
+                capture_output=True,
+                text=True,
+                check=False,
+                env={"PATH": str(tools), **(env or {})},
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "reused-python")
+
+    def test_verifier_runtime_bundle_settings_must_be_complete(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be configured together"):
+            yicloud_opensandbox._prepare_exec_runtime(
+                "true",
+                {
+                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV: (
+                        "/runtime.tar.gz"
+                    )
+                },
+            )
+
+    def test_missing_verifier_runtime_bundle_stops_before_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = root / "tools"
+            tools.mkdir()
+            wrapped, env = yicloud_opensandbox._prepare_exec_runtime(
+                "printf 'command-ran\\n'",
+                {
+                    yicloud_opensandbox.VERIFIER_PATH_PREPEND_ENV: str(tools),
+                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ID_ENV: (
+                        "test-python-verifier-bundle"
+                    ),
+                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV: str(
+                        root / "missing.tar.gz"
+                    ),
+                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ROOT_ENV: str(
+                        root / "runtime" / "python3.12-runtime"
+                    ),
+                },
+            )
+            completed = subprocess.run(
+                ["/bin/sh", "-c", wrapped],
+                capture_output=True,
+                text=True,
+                check=False,
+                env={"PATH": str(tools), **(env or {})},
+            )
+
+        self.assertEqual(completed.returncode, 127)
+        self.assertNotIn("command-ran", completed.stdout)
+        self.assertIn("runtime bundle archive is missing", completed.stderr)
+        self.assertIn("/logs/verifier/runtime-bootstrap.log", wrapped)
+
     def test_v2_bundle_loads_digest_refs_and_rejects_unsupported_capabilities(self) -> None:
         instance = object.__new__(
             yicloud_opensandbox.YiCloudOpenSandboxEnvironment
@@ -1026,7 +1212,53 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         instance._upload_file_http.assert_awaited_once_with(
             source, "/opt/agent.tgz", "640"
         )
-        instance.logger.warning.assert_called_once()
+        instance.logger.warning.assert_called_once_with(
+            "YiCloud upload fallback backend=auto "
+            "attempted_backend=s3 fallback_backend=http kind=file "
+            "phase=%s target=%s error=%s",
+            "stage",
+            "/opt/agent.tgz",
+            instance._s3_upload_store.stage_file.side_effect,
+        )
+
+    def test_auto_file_upload_warns_and_falls_back_after_s3_setup_failure(
+        self,
+    ) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._upload_backend = "auto"
+        instance._s3_upload_store = None
+        instance._s3_upload_setup_error = ValueError("invalid S3 profile")
+        instance._upload_file_http = AsyncMock()
+        instance.logger = Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "agent.tgz"
+            source.write_bytes(b"agent")
+            source.chmod(0o640)
+            asyncio.run(instance.upload_file(source, "/opt/agent.tgz"))
+
+        instance._upload_file_http.assert_awaited_once_with(
+            source, "/opt/agent.tgz", "640"
+        )
+        warning = instance.logger.warning.call_args
+        self.assertEqual(
+            warning.args[:3],
+            (
+                (
+                    "YiCloud upload fallback backend=auto "
+                    "attempted_backend=s3 fallback_backend=http kind=file "
+                    "phase=%s target=%s error=%s"
+                ),
+                "stage",
+                "/opt/agent.tgz",
+            ),
+        )
+        self.assertIn(
+            "YiCloud S3 upload backend setup failed: invalid S3 profile",
+            str(warning.args[3]),
+        )
 
     def test_strict_s3_file_upload_does_not_hide_transport_failure(self) -> None:
         instance = object.__new__(
@@ -1084,6 +1316,14 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         instance._upload_file_http.assert_awaited_once_with(
             source, "/opt/agent.tgz", "644"
         )
+        instance.logger.warning.assert_called_once_with(
+            "YiCloud upload fallback backend=auto "
+            "attempted_backend=s3 fallback_backend=http kind=file "
+            "phase=%s target=%s error=%s",
+            "materialize",
+            "/opt/agent.tgz",
+            instance._materialize_s3_file.side_effect,
+        )
 
     def test_auto_directory_upload_falls_back_to_existing_http_transport(self) -> None:
         instance = object.__new__(
@@ -1103,7 +1343,14 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             asyncio.run(instance.upload_dir(source, "/opt/deps"))
 
         instance._upload_dir_http.assert_awaited_once_with(source, "/opt/deps")
-        instance.logger.warning.assert_called_once()
+        instance.logger.warning.assert_called_once_with(
+            "YiCloud upload fallback backend=auto "
+            "attempted_backend=s3 fallback_backend=http "
+            "kind=directory phase=%s target=%s error=%s",
+            "stage",
+            "/opt/deps",
+            instance._s3_upload_store.stage_directory.side_effect,
+        )
 
     def test_s3_bootstrap_is_uploaded_once_only_when_native_tools_are_missing(
         self,

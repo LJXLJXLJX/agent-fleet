@@ -5,10 +5,8 @@ import json
 import os
 import re
 import shutil
-import stat
 import subprocess
 import sys
-import sysconfig
 import tarfile
 import tempfile
 import time
@@ -19,6 +17,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    from . import python_runtime
+except ImportError:
+    import python_runtime
 
 
 def _value(environ: Mapping[str, str], name: str, default: str) -> str:
@@ -450,64 +453,7 @@ class DependencyPreparer:
         )
 
     def _build_py312_runtime_tarball(self) -> None:
-        target = self.config.py312_runtime_tarball
-        if target.is_file():
-            print("[prepare] skip python3.12 runtime tarball (cached)")
-            return
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory() as temporary_name:
-            temporary = Path(temporary_name)
-            runtime_root = temporary / "python3.12-runtime"
-            runtime_bin = runtime_root / "bin"
-            runtime_lib = runtime_root / "lib"
-            runtime_bin.mkdir(parents=True)
-            runtime_lib.mkdir()
-
-            python_real = Path(sys.executable).resolve()
-            stdlib = Path(sysconfig.get_path("stdlib"))
-            version = sysconfig.get_config_var("VERSION") or "3.12"
-            libdir = Path(sysconfig.get_config_var("LIBDIR") or "")
-            libpython = next(iter(sorted(libdir.glob(f"libpython{version}*.so*"))), None)
-            shutil.copy2(python_real, runtime_bin / "python3.12.real")
-            shutil.copytree(stdlib, runtime_lib / "python3.12", symlinks=True)
-            if libpython and libpython.is_file():
-                shutil.copy2(libpython, runtime_lib / libpython.name, follow_symlinks=False)
-
-            system_lib = runtime_lib / "system"
-            system_lib.mkdir()
-            completed = subprocess.run(
-                ["ldd", str(runtime_bin / "python3.12.real")],
-                check=True,
-                text=True,
-                capture_output=True,
-            )
-            libraries = {
-                Path(field)
-                for field in completed.stdout.split()
-                if field.startswith("/") and Path(field).is_file()
-            }
-            for library in libraries:
-                try:
-                    shutil.copy2(library, system_lib / library.name, follow_symlinks=False)
-                except OSError:
-                    pass
-
-            wrapper = runtime_bin / "python3.12"
-            wrapper.write_text(
-                "#!/usr/bin/env bash\n"
-                "set -euo pipefail\n"
-                'SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
-                'RUNTIME_ROOT="$(cd "${SELF_DIR}/.." && pwd)"\n'
-                'export PYTHONHOME="${RUNTIME_ROOT}"\n'
-                'export LD_LIBRARY_PATH="${RUNTIME_ROOT}/lib/system:'
-                '${RUNTIME_ROOT}/lib:${LD_LIBRARY_PATH:-}"\n'
-                'exec "${SELF_DIR}/python3.12.real" "$@"\n',
-                encoding="utf-8",
-            )
-            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-            with tarfile.open(target, "w:gz") as archive:
-                archive.add(runtime_root, arcname=runtime_root.name)
-        print(f"[prepare] built python3.12 runtime tarball: {target}")
+        python_runtime.build(self.config.py312_runtime_tarball)
 
     def _prepare_node_runtime_tarball(self) -> None:
         target = self.config.node_runtime_tarball

@@ -1312,7 +1312,16 @@ def _compose_runtime(
         entrypoint_source = "image-config.entrypoint" if image_entrypoint else None
 
     command_overridden = service.command_present and service.command is not None
-    if command_overridden:
+    if legacy_dockerfile_keepalive:
+        # Harbor's Docker backend overlays every implicit single-Dockerfile
+        # task with ``command: [sh, -c, sleep infinity]``. Mirror that
+        # contract instead of releasing the image's default Cmd as a service
+        # process: language base images commonly default to an interactive
+        # interpreter (for example ``python3``), which exits immediately when
+        # detached from stdin.
+        effective_command = list(LEGACY_DOCKERFILE_KEEPALIVE)
+        command_source = "adapter.legacy-keepalive"
+    elif command_overridden:
         effective_command = _compose_argv(service.command, label="command")
         command_source = "compose.command"
     elif entrypoint_overridden:
@@ -1327,9 +1336,6 @@ def _compose_runtime(
     start_argv = [*effective_entrypoint, *effective_command]
     sources = [source for source in (entrypoint_source, command_source) if source]
     start_source = "+".join(sources) if sources else None
-    if not start_argv and legacy_dockerfile_keepalive:
-        start_argv = list(LEGACY_DOCKERFILE_KEEPALIVE)
-        start_source = "adapter.legacy-keepalive"
 
     if service.working_dir is not None:
         workdir = service.working_dir

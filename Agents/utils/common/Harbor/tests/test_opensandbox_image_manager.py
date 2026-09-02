@@ -314,7 +314,7 @@ services:
             "image-config.entrypoint+compose.command",
         )
 
-    def test_commandless_implicit_dockerfile_gets_legacy_keepalive_only(self) -> None:
+    def test_implicit_dockerfile_overrides_image_cmd_with_keepalive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             task = self.make_task(Path(tmp), "commandless")
             from compose_bundle import resolve_bundle_spec
@@ -324,7 +324,7 @@ services:
             artifact = {
                 "config": {
                     "entrypoint": None,
-                    "cmd": None,
+                    "cmd": ["python3"],
                     "exposed_ports": [],
                     "healthcheck": None,
                 },
@@ -356,8 +356,11 @@ services:
             implicit["runtime"]["start_argv_source"],
             "adapter.legacy-keepalive",
         )
-        self.assertEqual(explicit_compose["runtime"]["start_argv"], [])
-        self.assertIsNone(explicit_compose["runtime"]["start_argv_source"])
+        self.assertEqual(explicit_compose["runtime"]["start_argv"], ["python3"])
+        self.assertEqual(
+            explicit_compose["runtime"]["start_argv_source"],
+            "image-config.cmd",
+        )
 
     def test_compose_dry_run_writes_versioned_bundle_and_keeps_main_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
