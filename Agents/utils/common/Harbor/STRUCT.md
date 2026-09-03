@@ -22,6 +22,9 @@ Agents/utils/common/Harbor/
 ├── qz_task_instruction.py      # Exact QZ setup-prefix handoff before agent run
 ├── prepare_local_deps.sh       # Thin Python launcher
 ├── prepare_local_deps.py       # Package/cache preparation implementation
+├── python_runtime.py           # Shared portable Python runtime builder
+├── verifier_runtime/
+│   └── swe_rebench_v2_bundle_preparer.py # Dataset-specific bundle preparer
 ├── runner-requirements.txt     # Exact direct dependencies for the runner image
 ├── setup_runner_env.sh         # Explicit host setup / image validation
 ├── harbor_prepare_runner_cli.py # Startup validation for the configured CLI
@@ -92,6 +95,8 @@ including external commands required to complete them:
 | Shell caller | Python helper | Delegated responsibility |
 | --- | --- | --- |
 | `prepare_local_deps.sh` | `prepare_local_deps.py` | Downloads, runtime archives, npm caches, and manifest generation |
+| `prepare_local_deps.py` and `env.sh` | `python_runtime.py` | Builds and validates the reusable Python runtime primitive |
+| `env.sh` | `verifier_runtime/swe_rebench_v2_bundle_preparer.py` | Composes and validates the SWE-rebench-V2 verifier bundle |
 | `harboropik.sh` and model-fusion wrappers | `harbor_shell_utils.py` | Structured events, JSON normalization, URL parsing, and read-only mount JSON |
 | `monitor_harbor.sh` | `harbor_monitor_utils.py` | Reward, success, exception, and environment statistics |
 | `Agents/utils/rl/run_rl_rollout_server.sh`, `run_rl_rollout_worker.sh`, `monitor_rl_rollout.sh` | `Agents/utils/rl/rollout_worker_utils.py` | Request headers/JSON, LLM kwargs, result assembly, and monitor rendering |
@@ -179,6 +184,7 @@ Typical dataset paths:
 | `HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER` | Agent setup timeout multiplier |
 | `HARBOR_OPENSANDBOX_IMAGE_REF` | Legacy explicit single-image override; it must be fully qualified under `YICLOUD_HARBOR_HOST` |
 | `HARBOR_OPENSANDBOX_BUNDLE_MANIFEST` | Optional versioned service Bundle Manifest; every service image must be fully qualified under `YICLOUD_HARBOR_HOST` |
+| `HARBOR_OPENSANDBOX_BENCHMARK` | Benchmark identifier recorded in generated Bundles and consumed by the thin verifier-runtime bundle selector |
 | `HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT` | H-local Registry records, image locks, build logs, and immutable Bundle cache root |
 | `HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE` | Dataset prebuild local uploaded-Bundle index switch; defaults to `1` and avoids Registry lookup after a content-hash match |
 | `HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION` | Trust a matching target/task entry in the local uploaded-Bundle index without parsing or hashing task content; defaults to `0` |
@@ -192,7 +198,7 @@ Typical dataset paths:
 | `YICLOUD_SANDBOX_STATUS_LOG_INTERVAL_SEC` | Interval for Pending/state progress diagnostics, default `30` |
 | `YICLOUD_SANDBOX_RETAIN_ON_START_FAILURE` | Debug-only switch that skips automatic deletion after environment start failure, default `0` |
 | `YICLOUD_SANDBOX_RETAIN_AFTER_TRIAL` | Debug-only switch that retains a completed trial Sandbox until platform expiry, default `0` |
-| `YICLOUD_SANDBOX_UPLOAD_BACKEND` | OpenSandbox Agent/task input transport: `http`, strict object-store `s3`, or S3-preferred `auto` with the existing HTTP fallback; default `http`, while selecting an S3 profile implies `auto` unless explicitly set to strict `s3`. In `auto`, users without write credentials can reuse anonymously readable objects and fall back to HTTP when an object is absent |
+| `YICLOUD_SANDBOX_UPLOAD_BACKEND` | OpenSandbox Agent/task input transport: `http`, strict object-store `s3`, or S3-preferred `auto` with the existing HTTP fallback; default `http`, while selecting an S3 profile implies `auto` unless explicitly set to strict `s3`. In `auto`, users without write credentials can reuse anonymously readable objects and fall back to HTTP when an object is absent; every fallback emits a warning naming the attempted backend, fallback backend, artifact kind, phase, and target. A selected verifier runtime bundle requires `s3` or `auto` |
 | `YICLOUD_SANDBOX_S3_PROFILE` | Project-local provider profile under `.s3-profiles/<name>`; selecting one implies the `auto` backend by default and atomically resolves the bucket, anonymous read origin, prefix, and optional sibling write config |
 | `YICLOUD_SANDBOX_S3_CONFIG` | Optional s3cmd write configuration path available only to the Harbor runner; it is consulted when an immutable object is absent, never sent to a Sandbox, and may be omitted by read-only users |
 | `YICLOUD_SANDBOX_S3_BUCKET` | Bucket for immutable Agent and task input objects |

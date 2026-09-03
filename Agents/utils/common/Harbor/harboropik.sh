@@ -636,6 +636,49 @@ verifier_uv_bin_ready() {
     && [[ -x "$VERIFIER_UV_BIN_DIR_SOURCE/curl" ]]
 }
 
+opensandbox_verifier_tool_env_required() {
+  [[ "$HARBOR_ENVIRONMENT_TYPE" == "opensandbox" ]] \
+    && { verifier_uv_bin_ready || verifier_runtime_bundle_required; }
+}
+
+append_opensandbox_verifier_tool_env() {
+  local verifier_path_prefix=""
+  if verifier_uv_bin_ready; then
+    verifier_path_prefix="/root/.local/bin:/home/oai/.local/bin:/home/agent/.local/bin:/home/ubuntu/.local/bin"
+    if [[ -n "${HARBOR_VERIFIER_UV_HOME:-}" ]]; then
+      verifier_path_prefix="$HARBOR_VERIFIER_UV_HOME/.local/bin:$verifier_path_prefix"
+    fi
+    verifier_path_prefix="$verifier_path_prefix:$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH"
+    cmd+=(
+      --ve "HARBOR_VERIFIER_UV_BIN_DIR=$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH"
+    )
+  fi
+
+  if verifier_runtime_bundle_required; then
+    validate_verifier_runtime_bundle_transport || return 1
+    if ! verifier_runtime_bundle_ready; then
+      echo "[ERROR] verifier runtime bundle $VERIFIER_RUNTIME_BUNDLE_ID selected for $HARBOR_OPENSANDBOX_BENCHMARK, but its archive is missing or invalid" >&2
+      return 1
+    fi
+    if [[ -n "$verifier_path_prefix" ]]; then
+      verifier_path_prefix="$VERIFIER_RUNTIME_BUNDLE_ROOT/bin:$verifier_path_prefix"
+    else
+      verifier_path_prefix="$VERIFIER_RUNTIME_BUNDLE_ROOT/bin"
+    fi
+    cmd+=(
+      --ve "HARBOR_VERIFIER_RUNTIME_BUNDLE_ID=$VERIFIER_RUNTIME_BUNDLE_ID"
+      --ve "HARBOR_VERIFIER_RUNTIME_BUNDLE_ARCHIVE=$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_MOUNT_PATH"
+      --ve "HARBOR_VERIFIER_RUNTIME_BUNDLE_ROOT=$VERIFIER_RUNTIME_BUNDLE_ROOT"
+    )
+    echo "[INFO] OpenSandbox verifier runtime bundle: benchmark=$HARBOR_OPENSANDBOX_BENCHMARK bundle=$VERIFIER_RUNTIME_BUNDLE_ID" >&2
+  fi
+  if [[ -n "$verifier_path_prefix" ]]; then
+    cmd+=(
+      --ve "HARBOR_VERIFIER_PATH_PREPEND=$verifier_path_prefix"
+    )
+  fi
+}
+
 configure_e2b_verifier_uv_upload() {
   HARBOR_E2B_VERIFIER_UV_SOURCE=""
   if [[ "$HARBOR_ENVIRONMENT_TYPE" == "e2b" || "$HARBOR_ENVIRONMENT_TYPE" == "qz" ]] \
@@ -886,7 +929,34 @@ run_oracle_task() {
     cmd+=( --path "$DATASET_PATH" )
   fi
   append_environment_backend_args
-  if [[ "$HARBOR_ENVIRONMENT_TYPE" != "e2b" && "$HARBOR_ENVIRONMENT_TYPE" != "qz" ]] \
+  if opensandbox_verifier_tool_env_required; then
+    local verifier_mounts_json
+    local -a verifier_mount_args=()
+    if verifier_uv_bin_ready; then
+      verifier_mount_args+=(
+        --mount "$VERIFIER_UV_BIN_DIR_SOURCE"
+        "$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH" always
+      )
+    fi
+    if verifier_runtime_bundle_required; then
+      if ! verifier_runtime_bundle_ready; then
+        echo "[ERROR] verifier runtime bundle $VERIFIER_RUNTIME_BUNDLE_ID selected for $HARBOR_OPENSANDBOX_BENCHMARK, but its archive is missing" >&2
+        return 1
+      fi
+      verifier_mount_args+=(
+        --mount "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE"
+        "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_MOUNT_PATH" always
+      )
+    fi
+    verifier_mounts_json="$(
+      python3 "$SCRIPT_DIR/harbor_shell_utils.py" readonly-mounts \
+        "${verifier_mount_args[@]}"
+    )"
+    cmd+=(
+      --mounts-json "$verifier_mounts_json"
+    )
+    append_opensandbox_verifier_tool_env
+  elif [[ "$HARBOR_ENVIRONMENT_TYPE" != "e2b" && "$HARBOR_ENVIRONMENT_TYPE" != "qz" ]] \
     && verifier_uv_bin_ready; then
     local verifier_mounts_json verifier_uv_path_prefix
     verifier_mounts_json="$(
@@ -1258,9 +1328,10 @@ run_harbor() {
   if [[ "$mounts_json" != "[]" ]]; then
     cmd+=( --mounts-json "$mounts_json" )
   fi
-  if [[ "$HARBOR_ENVIRONMENT_TYPE" == "docker" || "$HARBOR_ENVIRONMENT_TYPE" == "e2b" \
-    || "$HARBOR_ENVIRONMENT_TYPE" == "opensandbox" || "$HARBOR_ENVIRONMENT_TYPE" == "qz" ]] \
-    && verifier_uv_bin_ready; then
+  if opensandbox_verifier_tool_env_required; then
+    append_opensandbox_verifier_tool_env
+  elif [[ "$HARBOR_ENVIRONMENT_TYPE" == "docker" || "$HARBOR_ENVIRONMENT_TYPE" == "e2b" \
+    || "$HARBOR_ENVIRONMENT_TYPE" == "qz" ]] && verifier_uv_bin_ready; then
     local verifier_uv_path_prefix
     verifier_uv_path_prefix="/root/.local/bin:/home/oai/.local/bin:/home/agent/.local/bin:/home/ubuntu/.local/bin"
     if [[ -n "${HARBOR_VERIFIER_UV_HOME:-}" ]]; then
@@ -1541,9 +1612,10 @@ run_opencode_task() {
     if [[ "$mounts_json" != "[]" ]]; then
       cmd+=( --mounts-json "$mounts_json" )
     fi
-    if [[ "$HARBOR_ENVIRONMENT_TYPE" == "docker" || "$HARBOR_ENVIRONMENT_TYPE" == "e2b" \
-      || "$HARBOR_ENVIRONMENT_TYPE" == "opensandbox" || "$HARBOR_ENVIRONMENT_TYPE" == "qz" ]] \
-      && verifier_uv_bin_ready; then
+    if opensandbox_verifier_tool_env_required; then
+      append_opensandbox_verifier_tool_env
+    elif [[ "$HARBOR_ENVIRONMENT_TYPE" == "docker" || "$HARBOR_ENVIRONMENT_TYPE" == "e2b" \
+      || "$HARBOR_ENVIRONMENT_TYPE" == "qz" ]] && verifier_uv_bin_ready; then
       cmd+=(
         --ve "PATH=/root/.local/bin:/home/oai/.local/bin:/home/agent/.local/bin:/home/ubuntu/.local/bin:$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         --ve "HARBOR_VERIFIER_UV_BIN_DIR=$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH"

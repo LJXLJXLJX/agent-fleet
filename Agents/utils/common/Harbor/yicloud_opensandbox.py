@@ -58,6 +58,10 @@ EXECD_DETACHED_COMMAND_MIN_TIMEOUT_SEC = 300
 EXECD_DETACHED_POLL_INTERVAL_SEC = 5
 DETACHED_PENDING_MARKER = "__HARBOR_YICLOUD_DETACHED_PENDING__"
 S3_HTTP_BOOTSTRAP_PATH = "/tmp/.harbor-s3-http-get-v1.sh"
+VERIFIER_PATH_PREPEND_ENV = "HARBOR_VERIFIER_PATH_PREPEND"
+VERIFIER_RUNTIME_BUNDLE_ID_ENV = "HARBOR_VERIFIER_RUNTIME_BUNDLE_ID"
+VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV = "HARBOR_VERIFIER_RUNTIME_BUNDLE_ARCHIVE"
+VERIFIER_RUNTIME_BUNDLE_ROOT_ENV = "HARBOR_VERIFIER_RUNTIME_BUNDLE_ROOT"
 # Current YiCloud task images are Linux/amd64 glibc images and normally carry
 # curl, wget, or python3. A few minimal images only carry Bash. For those
 # images, upload this small downloader once per Sandbox instead of uploading a
@@ -138,6 +142,107 @@ def _retryable_execd_error(error: requests.RequestException) -> bool:
             requests.exceptions.ChunkedEncodingError,
         ),
     )
+
+
+def _prepare_exec_runtime(
+    command: str,
+    env: dict[str, str] | None,
+) -> tuple[str, dict[str, str] | None]:
+    """Expand verifier-only runtime settings inside the Sandbox shell.
+
+    Execd environment values are literal and cannot express ``prefix:$PATH``
+    without replacing the image's configured PATH. Remove the private control
+    variables from the payload and render the expansion in the command shell
+    instead. A selected runtime bundle is an opaque filesystem bundle: the
+    provider only materializes it, runs its standard self-check entrypoint,
+    and prepends the bundle's ``bin`` directory. Runtime-specific activation
+    belongs in wrappers shipped by the bundle itself.
+    """
+    if env is None:
+        return command, None
+    effective_env = dict(env)
+    path_prepend = effective_env.pop(VERIFIER_PATH_PREPEND_ENV, "").strip()
+    bundle_id = effective_env.pop(VERIFIER_RUNTIME_BUNDLE_ID_ENV, "").strip()
+    bundle_archive = effective_env.pop(
+        VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV, ""
+    ).strip()
+    bundle_root = effective_env.pop(VERIFIER_RUNTIME_BUNDLE_ROOT_ENV, "").strip()
+    bundle_settings = (bundle_id, bundle_archive, bundle_root)
+
+    if any(bundle_settings) and not all(bundle_settings):
+        raise ValueError(
+            "verifier runtime bundle id, archive, and root must be configured "
+            "together"
+        )
+    if bundle_archive and (
+        not Path(bundle_archive).is_absolute()
+        or not Path(bundle_root).is_absolute()
+        or Path(bundle_root) == Path("/")
+    ):
+        raise ValueError("verifier runtime bundle paths must be safe absolute paths")
+    if not path_prepend and not bundle_archive:
+        return command, effective_env
+
+    bootstrap = ["set -e"]
+    if bundle_archive:
+        archive = shlex.quote(bundle_archive)
+        root = shlex.quote(bundle_root)
+        parent = shlex.quote(str(Path(bundle_root).parent))
+        check = f"{root}/bin/harbor-verifier-bundle-check"
+        bootstrap_log = "/logs/verifier/runtime-bootstrap.log"
+        ready_message = shlex.quote(
+            f"verifier runtime bundle ready: {bundle_id}"
+        )
+        bootstrap.extend(
+            [
+                (
+                    "harbor_verifier_runtime_fail() { "
+                    "message=$1; printf '%s\\n' \"$message\" >&2; "
+                    f"printf '%s\\n' \"$message\" > {bootstrap_log} "
+                    "2>/dev/null || true; exit 127; }"
+                ),
+                (
+                    f"[ -f {archive} ] || harbor_verifier_runtime_fail "
+                    "'verifier runtime bundle archive is missing'"
+                ),
+                (
+                    "command -v tar >/dev/null 2>&1 || "
+                    "harbor_verifier_runtime_fail "
+                    "'tar is required to materialize verifier runtime bundle'"
+                ),
+                (
+                    f"rm -rf {root} || harbor_verifier_runtime_fail "
+                    "'failed to clear verifier runtime bundle root'"
+                ),
+                (
+                    f"mkdir -p {parent} || harbor_verifier_runtime_fail "
+                    "'failed to create verifier runtime bundle parent'"
+                ),
+                (
+                    f"tar -xzf {archive} -C {parent} || "
+                    "harbor_verifier_runtime_fail "
+                    "'failed to extract verifier runtime bundle'"
+                ),
+                (
+                    f"[ -x {check} ] || harbor_verifier_runtime_fail "
+                    "'verifier runtime bundle is missing its self-check'"
+                ),
+                (
+                    f"{check} >/dev/null 2>&1 || harbor_verifier_runtime_fail "
+                    "'verifier runtime bundle failed its self-check'"
+                ),
+                (
+                    f"printf '%s\\n' {ready_message} "
+                    f"> {bootstrap_log} 2>/dev/null || true"
+                ),
+            ]
+        )
+    if path_prepend:
+        bootstrap.append(
+            f"export PATH={shlex.quote(path_prepend)}:\"$PATH\""
+        )
+    bootstrap.append("set +e")
+    return "\n".join([*bootstrap, command]), effective_env
 
 
 class ServiceRuntime:
@@ -509,11 +614,18 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             ),
             "YICLOUD_SANDBOX_S3_DOWNLOAD_TIMEOUT_SEC",
         )
-        self._s3_upload_store = (
-            S3UploadStore.from_environment()
-            if self._upload_backend in {"s3", "auto"}
-            else None
-        )
+        self._s3_upload_store: S3UploadStore | None = None
+        self._s3_upload_setup_error: Exception | None = None
+        if self._upload_backend in {"s3", "auto"}:
+            try:
+                self._s3_upload_store = S3UploadStore.from_environment()
+            except ValueError as exc:
+                if self._upload_backend == "s3":
+                    raise
+                # Preserve auto's HTTP fallback even when S3 configuration
+                # cannot be initialized. The first actual upload logs the
+                # same structured fallback warning as runtime S3 failures.
+                self._s3_upload_setup_error = exc
         self._s3_downloader_ready = False
         self._s3_downloader_lock: asyncio.Lock | None = None
         self._base_client: Any | None = None
@@ -2140,7 +2252,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         self,
         command: str,
         cwd: str | None,
-        env: dict[str, str],
+        env: dict[str, str] | None,
         timeout_sec: int | None,
         uid: int | None = None,
     ) -> ExecResult:
@@ -2276,7 +2388,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         self,
         command: str,
         cwd: str | None,
-        env: dict[str, str],
+        env: dict[str, str] | None,
         timeout_sec: int,
         uid: int | None = None,
     ) -> ExecResult:
@@ -2460,7 +2572,7 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         self,
         command: str,
         cwd: str | None,
-        env: dict[str, str],
+        env: dict[str, str] | None,
         timeout_sec: int | None,
         uid: int | None = None,
     ) -> ExecResult:
@@ -2513,11 +2625,15 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
     ) -> ExecResult:
         uid = self._resolve_exec_uid(self._resolve_user(user))
         effective_cwd = cwd or self.task_env_config.workdir
+        command, effective_env = _prepare_exec_runtime(
+            command,
+            self._merge_env(env),
+        )
         result = await asyncio.to_thread(
             self._run_command_sync,
             command,
             effective_cwd,
-            self._merge_env(env),
+            effective_env,
             timeout_sec,
             uid,
         )
@@ -2562,6 +2678,11 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
     def _s3_store(self) -> S3UploadStore:
         store = getattr(self, "_s3_upload_store", None)
         if store is None:
+            setup_error = getattr(self, "_s3_upload_setup_error", None)
+            if setup_error is not None:
+                raise RuntimeError(
+                    f"YiCloud S3 upload backend setup failed: {setup_error}"
+                ) from setup_error
             raise RuntimeError("YiCloud S3 upload backend is not configured")
         return store
 
@@ -2734,17 +2855,21 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
         mode = f"{stat.S_IMODE(source.stat().st_mode):o}"
         if self._uses_s3_upload():
             started = time.monotonic()
+            phase = "stage"
             try:
                 artifact = await asyncio.to_thread(
                     self._s3_store().stage_file, source
                 )
+                phase = "materialize"
                 await self._materialize_s3_file(artifact, target_path, mode)
             except Exception as exc:
                 if not self._allows_http_upload_fallback():
                     raise
                 self.logger.warning(
-                    "YiCloud S3 file transport failed; falling back to HTTP "
-                    "target=%s error=%s",
+                    "YiCloud upload fallback backend=auto "
+                    "attempted_backend=s3 fallback_backend=http kind=file "
+                    "phase=%s target=%s error=%s",
+                    phase,
                     target_path,
                     exc,
                 )
@@ -2835,17 +2960,21 @@ class YiCloudOpenSandboxEnvironment(BaseEnvironment):
             raise RuntimeError(f"upload source is not a directory: {source}")
         if self._uses_s3_upload():
             started = time.monotonic()
+            phase = "stage"
             try:
                 artifact = await asyncio.to_thread(
                     self._s3_store().stage_directory, source
                 )
+                phase = "materialize"
                 await self._materialize_s3_directory(artifact, target_dir)
             except Exception as exc:
                 if not self._allows_http_upload_fallback():
                     raise
                 self.logger.warning(
-                    "YiCloud S3 directory transport failed; falling back to "
-                    "HTTP target=%s error=%s",
+                    "YiCloud upload fallback backend=auto "
+                    "attempted_backend=s3 fallback_backend=http "
+                    "kind=directory phase=%s target=%s error=%s",
+                    phase,
                     target_dir,
                     exc,
                 )

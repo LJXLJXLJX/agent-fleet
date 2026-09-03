@@ -634,6 +634,65 @@ YICLOUD_HARBOR_HOST="${YICLOUD_HARBOR_HOST:-}"
 YICLOUD_HARBOR_PROJECT="${YICLOUD_HARBOR_PROJECT:-}"
 YICLOUD_HARBOR_TLS_VERIFY="${YICLOUD_HARBOR_TLS_VERIFY:-0}"
 HARBOR_OPENSANDBOX_BENCHMARK="${HARBOR_OPENSANDBOX_BENCHMARK:-$DATASET_NAME}"
+
+# Keep benchmark-specific verifier runtime policy in this thin selector. The
+# OpenSandbox provider treats the selected archive as an opaque filesystem
+# bundle and does not know which runtimes it contains.
+select_verifier_runtime_bundle() {
+  if [[ "$HARBOR_ENVIRONMENT_TYPE" != "opensandbox" ]]; then
+    printf '%s\n' "none"
+    return 0
+  fi
+  case "$HARBOR_OPENSANDBOX_BENCHMARK" in
+    agent-fleet-swe-rebench-v2)
+      printf '%s\n' "agent-fleet-swe-rebench-v2-verifier-bundle"
+      ;;
+    *)
+      printf '%s\n' "none"
+      ;;
+  esac
+}
+
+resolve_verifier_runtime_bundle() {
+  VERIFIER_RUNTIME_BUNDLE_ID="$1"
+  VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE=""
+  VERIFIER_RUNTIME_BUNDLE_ARCHIVE_MOUNT_PATH=""
+  VERIFIER_RUNTIME_BUNDLE_ROOT=""
+  VERIFIER_RUNTIME_BUNDLE_PREPARER=""
+  case "$VERIFIER_RUNTIME_BUNDLE_ID" in
+    none)
+      ;;
+    agent-fleet-swe-rebench-v2-verifier-bundle)
+      VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE="$HARBOR_CC_PY_WHEEL_DIR_SOURCE/$VERIFIER_RUNTIME_BUNDLE_ID.tar.gz"
+      VERIFIER_RUNTIME_BUNDLE_ARCHIVE_MOUNT_PATH="$HARBOR_CC_PY_WHEEL_DIR_MOUNT_PATH/$VERIFIER_RUNTIME_BUNDLE_ID.tar.gz"
+      VERIFIER_RUNTIME_BUNDLE_ROOT="/tmp/harbor-verifier-bundles/$VERIFIER_RUNTIME_BUNDLE_ID"
+      VERIFIER_RUNTIME_BUNDLE_PREPARER="$SCRIPT_DIR/verifier_runtime/swe_rebench_v2_bundle_preparer.py"
+      ;;
+    *)
+      echo "[ERROR] unknown verifier runtime bundle: $VERIFIER_RUNTIME_BUNDLE_ID" >&2
+      return 1
+      ;;
+  esac
+}
+
+resolve_verifier_runtime_bundle "$(select_verifier_runtime_bundle)"
+
+verifier_runtime_bundle_required() {
+  [[ "$VERIFIER_RUNTIME_BUNDLE_ID" != "none" ]]
+}
+
+validate_verifier_runtime_bundle_transport() {
+  verifier_runtime_bundle_required || return 0
+  case "$YICLOUD_SANDBOX_UPLOAD_BACKEND" in
+    s3|auto)
+      ;;
+    *)
+      echo "[ERROR] verifier runtime bundle $VERIFIER_RUNTIME_BUNDLE_ID requires YICLOUD_SANDBOX_UPLOAD_BACKEND=s3 or auto" >&2
+      return 1
+      ;;
+  esac
+}
+
 HARBOR_OPENSANDBOX_DOCKER_CONFIG="${HARBOR_OPENSANDBOX_DOCKER_CONFIG:-$HOME/.docker/config.json}"
 HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT="${HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT:-/data/harbor-runs/opensandbox-images}"
 HARBOR_OPENSANDBOX_IMAGE_PLATFORM="${HARBOR_OPENSANDBOX_IMAGE_PLATFORM:-linux/amd64}"
@@ -1352,13 +1411,32 @@ harbor_npm_tarball_version_ready() {
     "$path" "$expected_version" >/dev/null 2>&1
 }
 
+harbor_verifier_bundle_archive_ready() {
+  local path="$1"
+  [[ -f "$path" && -f "$VERIFIER_RUNTIME_BUNDLE_PREPARER" ]] \
+    && python3 "$VERIFIER_RUNTIME_BUNDLE_PREPARER" \
+      check --archive "$path" >/dev/null 2>&1
+}
+
+harbor_python_runtime_archive_ready() {
+  local path="$1"
+  [[ -f "$path" ]] \
+    && python3 "$SCRIPT_DIR/python_runtime.py" \
+      --check "$path" >/dev/null 2>&1
+}
+
+verifier_runtime_bundle_ready() {
+  verifier_runtime_bundle_required \
+    && harbor_verifier_bundle_archive_ready "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE"
+}
+
 harbor_local_cache_ready() {
   [[ -f "$LOCAL_WHEEL_DIR/manifest.txt" ]] \
     && grep -qx 'cache_schema=3' "$LOCAL_WHEEL_DIR/manifest.txt" \
     && [[ "$(find "$LOCAL_WHEEL_DIR" -maxdepth 1 -name 'opik-*.whl' -type f | wc -l | tr -d ' ')" == "1" ]] \
     && [[ -f "$LOCAL_WHEEL_DIR/get-pip.py" ]] \
     && harbor_tar_file_ready "$LOCAL_WHEEL_DIR/node-runtime.tar.xz" \
-    && harbor_gzip_file_ready "$LOCAL_WHEEL_DIR/python3.12-runtime.tar.gz" \
+    && harbor_python_runtime_archive_ready "$LOCAL_WHEEL_DIR/python3.12-runtime.tar.gz" \
     && {
       if harbor_agent_is_opencode; then
         harbor_gzip_file_ready "$LOCAL_WHEEL_DIR/${OPENCODE_TGZ_BASENAME}" \
@@ -1465,6 +1543,20 @@ harbor_apply_effective_wheel_source() {
   fi
 }
 
+harbor_prewarm_s3_upload_sources() {
+  local -a sources=("$@")
+  echo "prewarming immutable OpenSandbox S3 objects..."
+  if python3 "$SCRIPT_DIR/opensandbox_s3_upload.py" preflight \
+    && python3 "$SCRIPT_DIR/opensandbox_s3_upload.py" prewarm "${sources[@]}"; then
+    return 0
+  fi
+  if [[ "$YICLOUD_SANDBOX_UPLOAD_BACKEND" == "auto" ]]; then
+    echo '[WARN] OpenSandbox S3 attempt failed backend=auto phase=prewarm; runtime will retry S3 and warn before any HTTP fallback' >&2
+    return 0
+  fi
+  return 1
+}
+
 harbor_prewarm_s3_upload_cache() {
   if [[ "$HARBOR_ENVIRONMENT_TYPE" != "opensandbox" \
     || ( "$YICLOUD_SANDBOX_UPLOAD_BACKEND" != "s3" \
@@ -1490,20 +1582,41 @@ harbor_prewarm_s3_upload_cache() {
         && sources+=("$TRACE_PLUGIN_OPENCODE_HOOK_SOURCE")
       ;;
   esac
+  if verifier_runtime_bundle_required && verifier_runtime_bundle_ready; then
+    sources+=("$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE")
+  fi
+  harbor_prewarm_s3_upload_sources "${sources[@]}"
+}
 
-  echo "prewarming immutable OpenSandbox S3 objects..."
-  if python3 "$SCRIPT_DIR/opensandbox_s3_upload.py" preflight \
-    && python3 "$SCRIPT_DIR/opensandbox_s3_upload.py" prewarm "${sources[@]}"; then
-    return 0
+harbor_build_verifier_runtime_bundle() {
+  verifier_runtime_bundle_required || return 0
+  validate_verifier_runtime_bundle_transport || return 1
+  verifier_runtime_bundle_ready && return 0
+
+  echo "preparing verifier runtime bundle: $VERIFIER_RUNTIME_BUNDLE_ID"
+  if [[ ! -f "$VERIFIER_RUNTIME_BUNDLE_PREPARER" ]] \
+    || [[ ! -x "$HARBOR_OPIK_PYTHON" ]] \
+    || ! PYTHON_BIN="$HARBOR_OPIK_PYTHON" \
+      "$HARBOR_OPIK_PYTHON" "$VERIFIER_RUNTIME_BUNDLE_PREPARER" build \
+    --cache-dir "$HARBOR_CC_PY_WHEEL_DIR_SOURCE" \
+    --output "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE"; then
+    echo "failed to prepare verifier runtime bundle: $VERIFIER_RUNTIME_BUNDLE_ID" >&2
+    return 1
   fi
-  if [[ "$YICLOUD_SANDBOX_UPLOAD_BACKEND" == "auto" ]]; then
-    echo '[WARN] OpenSandbox S3 prewarm was unavailable; runtime will retry anonymous reads and fall back to HTTP when necessary' >&2
-    return 0
+  if ! verifier_runtime_bundle_ready; then
+    echo "prepared verifier runtime bundle is invalid: $VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE" >&2
+    return 1
   fi
-  return 1
+}
+
+harbor_prepare_verifier_runtime_bundle() {
+  harbor_build_verifier_runtime_bundle || return 1
+  verifier_runtime_bundle_required || return 0
+  harbor_prewarm_s3_upload_sources "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE"
 }
 
 harbor_prepare_or_select_wheels() {
+  validate_verifier_runtime_bundle_transport || return 1
   mkdir -p "$RUNTIME_DIR"
   local status_file="${RUNTIME_DIR}/local-deps-prepare.status"
   rm -f "$WORKERS_READY_FILE" "$WORKERS_FAILED_FILE" "$EFFECTIVE_WHEEL_URL_FILE" "$EFFECTIVE_CLAUDE_TGZ_URL_FILE" "$HARBOR_RUNNER_PREPARE_STATUS_FILE"
@@ -1512,6 +1625,11 @@ harbor_prepare_or_select_wheels() {
 
   if harbor_local_cache_ready; then
     echo "using local wheel cache"
+    harbor_build_verifier_runtime_bundle || {
+      echo "failed" > "$status_file"
+      touch "$WORKERS_FAILED_FILE"
+      return 1
+    }
     harbor_ensure_local_wheels_server
     harbor_write_effective_wheel_source "$HARBOR_LOCAL_WHEEL_SERVER_URL"
     harbor_prewarm_s3_upload_cache || {
@@ -1551,6 +1669,11 @@ harbor_prepare_or_select_wheels() {
     prepare_pi_cache=1
   fi
   if (cd "$SCRIPT_DIR" && WHEEL_DIR="$LOCAL_WHEEL_DIR" CACHE_SCHEMA=3 CLAUDE_CODE_VERSION="$CLAUDE_CODE_VERSION" CLAUDE_CODE_TGZ_BASENAME="$CLAUDE_CODE_TGZ_BASENAME" PREPARE_OPENCODE_CACHE="$prepare_opencode_cache" OPENCODE_VERSION="$OPENCODE_VERSION" OPENCODE_TGZ_BASENAME="$OPENCODE_TGZ_BASENAME" OPENCODE_LINUX_X64_TGZ_BASENAME="$OPENCODE_LINUX_X64_TGZ_BASENAME" PREPARE_PI_CACHE="$prepare_pi_cache" PI_VERSION="$PI_VERSION" PI_TGZ_BASENAME="$PI_TGZ_BASENAME" PI_NODE_RUNTIME_BASENAME="$PI_NODE_RUNTIME_BASENAME" PI_RUNTIME_BASENAME="$PI_RUNTIME_BASENAME" ./prepare_local_deps.sh 2>&1 | tee -a "$LOCAL_DEPS_LOG_FILE"); then
+    harbor_build_verifier_runtime_bundle || {
+      echo "failed" > "$status_file"
+      touch "$WORKERS_FAILED_FILE"
+      return 1
+    }
     harbor_ensure_local_wheels_server
     harbor_write_effective_wheel_source "$HARBOR_LOCAL_WHEEL_SERVER_URL"
     harbor_prewarm_s3_upload_cache || {
@@ -1570,8 +1693,18 @@ harbor_prepare_or_select_wheels() {
 
 harbor_prepare_agent_runtime() {
   if harbor_agent_is_oracle \
-    || [[ "$ROLLOUT" == "1" && "$RL_AGENT" == "oracle" ]] \
-    || [[ "$HARBOR_ENVIRONMENT_TYPE" == "e2b" || "$HARBOR_ENVIRONMENT_TYPE" == "qz" ]]; then
+    || [[ "$ROLLOUT" == "1" && "$RL_AGENT" == "oracle" ]]; then
+    mkdir -p "$RUNTIME_DIR"
+    rm -f "$WORKERS_FAILED_FILE" "$HARBOR_RUNNER_PREPARE_STATUS_FILE"
+    if harbor_prepare_verifier_runtime_bundle && harbor_validate_runner_cli; then
+      touch "$WORKERS_READY_FILE"
+      return 0
+    fi
+    touch "$WORKERS_FAILED_FILE"
+    return 1
+  fi
+
+  if [[ "$HARBOR_ENVIRONMENT_TYPE" == "e2b" || "$HARBOR_ENVIRONMENT_TYPE" == "qz" ]]; then
     mkdir -p "$RUNTIME_DIR"
     rm -f "$WORKERS_FAILED_FILE" "$HARBOR_RUNNER_PREPARE_STATUS_FILE"
     if harbor_validate_runner_cli; then

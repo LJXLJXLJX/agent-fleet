@@ -909,18 +909,27 @@ class RegistryTarget:
         return f"{self.registry}/{self.repository}@{artifact_digest}"
 
 
-def normalize_task_repository(task_identity: str, *, maximum_length: int = 63) -> str:
-    """Make an OCI/Harbor-safe, collision-resistant task repository name."""
-    raw = task_identity.strip()
-    if not raw:
+def check_task_repository(task_identity: str, *, maximum_length: int = 255) -> str:
+    """Validate that a task identity can be used verbatim as its repository."""
+    if not task_identity:
         raise ValueError("task identity must not be empty")
-    normalized = re.sub(r"[^a-z0-9._-]+", "-", raw.lower()).strip("._-")
-    normalized = re.sub(r"[-._]{2,}", "-", normalized) or "task"
-    changed = normalized != raw
-    if changed or len(normalized) > maximum_length:
-        suffix = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
-        normalized = f"{normalized[: maximum_length - len(suffix) - 1].rstrip('._-')}-{suffix}"
-    return normalized[:maximum_length].rstrip("._-")
+    if len(task_identity) > maximum_length:
+        raise ValueError(
+            f"task identity exceeds the {maximum_length}-character repository limit: "
+            f"{task_identity!r}; fix the dataset adapter instead of renaming it during upload"
+        )
+    # OCI/Docker repository path components permit one dot or underscore,
+    # two underscores, or one-or-more dashes between lowercase alphanumeric
+    # runs. In particular, SWE-Rebench's ``owner__repository-issue`` identity
+    # is already valid and must remain unchanged.
+    if not re.fullmatch(
+        r"[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*", task_identity
+    ):
+        raise ValueError(
+            f"task identity is not a valid OCI repository component: {task_identity!r}; "
+            "fix the dataset adapter instead of renaming it during upload"
+        )
+    return task_identity
 
 
 class SkopeoPublisher:
@@ -1312,7 +1321,16 @@ def _compose_runtime(
         entrypoint_source = "image-config.entrypoint" if image_entrypoint else None
 
     command_overridden = service.command_present and service.command is not None
-    if command_overridden:
+    if legacy_dockerfile_keepalive:
+        # Harbor's Docker backend overlays every implicit single-Dockerfile
+        # task with ``command: [sh, -c, sleep infinity]``. Mirror that
+        # contract instead of releasing the image's default Cmd as a service
+        # process: language base images commonly default to an interactive
+        # interpreter (for example ``python3``), which exits immediately when
+        # detached from stdin.
+        effective_command = list(LEGACY_DOCKERFILE_KEEPALIVE)
+        command_source = "adapter.legacy-keepalive"
+    elif command_overridden:
         effective_command = _compose_argv(service.command, label="command")
         command_source = "compose.command"
     elif entrypoint_overridden:
@@ -1327,9 +1345,6 @@ def _compose_runtime(
     start_argv = [*effective_entrypoint, *effective_command]
     sources = [source for source in (entrypoint_source, command_source) if source]
     start_source = "+".join(sources) if sources else None
-    if not start_argv and legacy_dockerfile_keepalive:
-        start_argv = list(LEGACY_DOCKERFILE_KEEPALIVE)
-        start_source = "adapter.legacy-keepalive"
 
     if service.working_dir is not None:
         workdir = service.working_dir
@@ -1962,7 +1977,11 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
     target = RegistryTarget(
         registry=args.registry,
         project=args.project,
-        task_repository=args.task_repository or normalize_task_repository(task_dir.name),
+        task_repository=args.task_repository
+        or check_task_repository(
+            task_dir.name,
+            maximum_length=255 - len(args.project) - 1,
+        ),
     )
     reuse_local_upload = bool(getattr(args, "reuse_local_upload_cache", False))
     skip_hash_verification = bool(getattr(args, "skip_hash_verification", False))

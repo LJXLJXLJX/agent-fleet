@@ -101,10 +101,16 @@ OCI Registry addressing is explicit:
 
 ```text
 Project = benchmark
-Repository = normalized task identity
+Repository = task identity (verbatim)
 tag = <service>-<short-input-hash>
 digest ref = <registry>/<project>/<task>@sha256:<artifact-digest>
 ```
+
+The default repository name must exactly match the task directory name. The
+image manager validates that it is already a legal OCI repository component;
+it does not sanitize, truncate, or append a hash. Invalid task identities must
+be fixed by the dataset adapter so that Registry publication never silently
+changes task identity.
 
 The `input_hash` is a full SHA-256 calculated before build and the Registry
 `artifact_digest` is collected by an independent `skopeo inspect` after copy.
@@ -112,7 +118,7 @@ Normal on-demand preparation keeps the target task repository as cache
 authority. Dataset prebuild additionally enables a persistent local
 uploaded-Bundle index under
 `<HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT>/uploaded-bundles/`. Entries are scoped by
-Registry host, Project, benchmark, platform, and normalized task repository.
+Registry host, Project, benchmark, platform, and verbatim task repository.
 They are written only after every service has resolved successfully through the
 Registry path.
 
