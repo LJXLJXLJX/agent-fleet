@@ -25,6 +25,7 @@ from opensandbox_image_manager import (
     _compose_runtime,
     _service_manifest,
     apt_404_requires_cache_refresh,
+    check_task_repository,
     environment_content_hash,
     github_mirror_config_content,
     mirror_image_ref,
@@ -914,6 +915,28 @@ networks:
             target.digest_ref("sha256:" + "b" * 64),
             "registry.example/seta/973@sha256:" + "b" * 64,
         )
+
+    def test_task_repository_preserves_valid_task_identity_verbatim(self) -> None:
+        self.assertEqual(
+            check_task_repository("aeon-toolkit__aeon-2822"),
+            "aeon-toolkit__aeon-2822",
+        )
+        self.assertEqual(
+            check_task_repository("task_000002_8be5378a"),
+            "task_000002_8be5378a",
+        )
+        long_identity = f"owner__{'repository-' * 10}123"
+        self.assertEqual(check_task_repository(long_identity), long_identity)
+
+    def test_task_repository_rejects_identity_that_requires_renaming(self) -> None:
+        for identity in ("Owner__Repo-1", "owner/repo-1", "owner repo-1"):
+            with self.subTest(identity=identity), self.assertRaisesRegex(
+                ValueError, "fix the dataset adapter"
+            ):
+                check_task_repository(identity)
+
+        with self.assertRaisesRegex(ValueError, "exceeds the 8-character"):
+            check_task_repository("valid-name", maximum_length=8)
 
     def test_skopeo_login_password_uses_subprocess_input_only(self) -> None:
         target = RegistryTarget("registry.example", "seta", "973")

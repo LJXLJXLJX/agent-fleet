@@ -909,18 +909,27 @@ class RegistryTarget:
         return f"{self.registry}/{self.repository}@{artifact_digest}"
 
 
-def normalize_task_repository(task_identity: str, *, maximum_length: int = 63) -> str:
-    """Make an OCI/Harbor-safe, collision-resistant task repository name."""
-    raw = task_identity.strip()
-    if not raw:
+def check_task_repository(task_identity: str, *, maximum_length: int = 255) -> str:
+    """Validate that a task identity can be used verbatim as its repository."""
+    if not task_identity:
         raise ValueError("task identity must not be empty")
-    normalized = re.sub(r"[^a-z0-9._-]+", "-", raw.lower()).strip("._-")
-    normalized = re.sub(r"[-._]{2,}", "-", normalized) or "task"
-    changed = normalized != raw
-    if changed or len(normalized) > maximum_length:
-        suffix = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
-        normalized = f"{normalized[: maximum_length - len(suffix) - 1].rstrip('._-')}-{suffix}"
-    return normalized[:maximum_length].rstrip("._-")
+    if len(task_identity) > maximum_length:
+        raise ValueError(
+            f"task identity exceeds the {maximum_length}-character repository limit: "
+            f"{task_identity!r}; fix the dataset adapter instead of renaming it during upload"
+        )
+    # OCI/Docker repository path components permit one dot or underscore,
+    # two underscores, or one-or-more dashes between lowercase alphanumeric
+    # runs. In particular, SWE-Rebench's ``owner__repository-issue`` identity
+    # is already valid and must remain unchanged.
+    if not re.fullmatch(
+        r"[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*", task_identity
+    ):
+        raise ValueError(
+            f"task identity is not a valid OCI repository component: {task_identity!r}; "
+            "fix the dataset adapter instead of renaming it during upload"
+        )
+    return task_identity
 
 
 class SkopeoPublisher:
@@ -1968,7 +1977,11 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
     target = RegistryTarget(
         registry=args.registry,
         project=args.project,
-        task_repository=args.task_repository or normalize_task_repository(task_dir.name),
+        task_repository=args.task_repository
+        or check_task_repository(
+            task_dir.name,
+            maximum_length=255 - len(args.project) - 1,
+        ),
     )
     reuse_local_upload = bool(getattr(args, "reuse_local_upload_cache", False))
     skip_hash_verification = bool(getattr(args, "skip_hash_verification", False))

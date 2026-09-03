@@ -165,7 +165,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             runtime_root = root / "runtime" / source_root.name
             tools = root / "tools"
             tools.mkdir()
-            for name in ("gzip", "mkdir", "tar"):
+            for name in ("gzip", "mkdir", "rm", "tar"):
                 target = shutil.which(name)
                 self.assertIsNotNone(target)
                 os.symlink(target, tools / name)
@@ -204,25 +204,40 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             [str(runtime_root / "bin" / "python3"), "portable-python"],
         )
 
-    def test_verifier_runtime_reuses_materialized_portable_python(self) -> None:
+    def test_verifier_runtime_replaces_agent_writable_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            source_root = root / "source" / "python3.12-runtime"
+            source_bin = source_root / "bin"
+            source_bin.mkdir(parents=True)
+            python = source_bin / "python3.12"
+            python.write_text("#!/bin/sh\nprintf 'portable-python\\n'\n")
+            python.chmod(0o755)
+            (source_bin / "python3").symlink_to("python3.12")
+            (source_bin / "python").symlink_to("python3.12")
+            check = source_bin / "harbor-verifier-bundle-check"
+            check.write_text('#!/bin/sh\nexec "${0%/*}/python3" >/dev/null\n')
+            check.chmod(0o755)
+            archive = root / "python3.12-runtime.tar.gz"
+            with tarfile.open(archive, "w:gz") as bundle:
+                bundle.add(source_root, arcname=source_root.name)
+
             runtime_root = root / "runtime" / "python3.12-runtime"
             runtime_bin = runtime_root / "bin"
             runtime_bin.mkdir(parents=True)
             python = runtime_bin / "python3.12"
-            python.write_text("#!/bin/sh\nprintf 'reused-python\\n'\n")
+            python.write_text("#!/bin/sh\nprintf 'agent-python\\n'\n")
             python.chmod(0o755)
             (runtime_bin / "python3").symlink_to("python3.12")
             (runtime_bin / "python").symlink_to("python3.12")
             check = runtime_bin / "harbor-verifier-bundle-check"
-            check.write_text('#!/bin/sh\nexec "${0%/*}/python3" >/dev/null\n')
+            check.write_text("#!/bin/sh\nexit 0\n")
             check.chmod(0o755)
             (runtime_root / ".harbor-verifier-bundle-materialized-v1").touch()
 
             tools = root / "tools"
             tools.mkdir()
-            for name in ("touch",):
+            for name in ("gzip", "mkdir", "rm", "tar"):
                 target = shutil.which(name)
                 self.assertIsNotNone(target)
                 os.symlink(target, tools / name)
@@ -237,7 +252,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
                         "test-python-verifier-bundle"
                     ),
                     yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV: str(
-                        root / "already-consumed.tar.gz"
+                        archive
                     ),
                     yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ROOT_ENV: str(
                         runtime_root
@@ -251,9 +266,13 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
                 check=False,
                 env={"PATH": str(tools), **(env or {})},
             )
+            legacy_marker_exists = (
+                runtime_root / ".harbor-verifier-bundle-materialized-v1"
+            ).exists()
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), "reused-python")
+        self.assertEqual(completed.stdout.strip(), "portable-python")
+        self.assertFalse(legacy_marker_exists)
 
     def test_verifier_runtime_bundle_settings_must_be_complete(self) -> None:
         with self.assertRaisesRegex(ValueError, "must be configured together"):

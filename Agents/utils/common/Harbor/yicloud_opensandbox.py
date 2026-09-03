@@ -189,7 +189,6 @@ def _prepare_exec_runtime(
         root = shlex.quote(bundle_root)
         parent = shlex.quote(str(Path(bundle_root).parent))
         check = f"{root}/bin/harbor-verifier-bundle-check"
-        marker = f"{root}/.harbor-verifier-bundle-materialized-v1"
         bootstrap_log = "/logs/verifier/runtime-bootstrap.log"
         ready_message = shlex.quote(
             f"verifier runtime bundle ready: {bundle_id}"
@@ -202,23 +201,28 @@ def _prepare_exec_runtime(
                     f"printf '%s\\n' \"$message\" > {bootstrap_log} "
                     "2>/dev/null || true; exit 127; }"
                 ),
-                f"if [ ! -f {marker} ]; then",
                 (
-                    f"    [ -f {archive} ] || harbor_verifier_runtime_fail "
+                    f"[ -f {archive} ] || harbor_verifier_runtime_fail "
                     "'verifier runtime bundle archive is missing'"
                 ),
                 (
-                    "    command -v tar >/dev/null 2>&1 || "
+                    "command -v tar >/dev/null 2>&1 || "
                     "harbor_verifier_runtime_fail "
                     "'tar is required to materialize verifier runtime bundle'"
                 ),
-                f"    mkdir -p {parent}",
                 (
-                    f"    tar -xzf {archive} -C {parent} || "
+                    f"rm -rf {root} || harbor_verifier_runtime_fail "
+                    "'failed to clear verifier runtime bundle root'"
+                ),
+                (
+                    f"mkdir -p {parent} || harbor_verifier_runtime_fail "
+                    "'failed to create verifier runtime bundle parent'"
+                ),
+                (
+                    f"tar -xzf {archive} -C {parent} || "
                     "harbor_verifier_runtime_fail "
                     "'failed to extract verifier runtime bundle'"
                 ),
-                "fi",
                 (
                     f"[ -x {check} ] || harbor_verifier_runtime_fail "
                     "'verifier runtime bundle is missing its self-check'"
@@ -227,7 +231,6 @@ def _prepare_exec_runtime(
                     f"{check} >/dev/null 2>&1 || harbor_verifier_runtime_fail "
                     "'verifier runtime bundle failed its self-check'"
                 ),
-                f": > {marker}",
                 (
                     f"printf '%s\\n' {ready_message} "
                     f"> {bootstrap_log} 2>/dev/null || true"
