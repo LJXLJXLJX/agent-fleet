@@ -179,6 +179,14 @@ if grep -F -- 'FAKE_HARBOR_ARG=PATH=' <<< "$rebench" >/dev/null; then
   exit 1
 fi
 
+rebench_agent="$(run_dry \
+  'test-project/manual:immutable' "$tmp/does-not-exist.py" '{}' \
+  agent-fleet-swe-rebench-v2 opensandbox 0 claude-code)"
+grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_ARCHIVE=/opt/tb-opik/python-wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz' \
+  <<< "$rebench_agent" >/dev/null
+grep -F -- "\"source\":\"$tmp/deps/wheels\",\"target\":\"/opt/tb-opik/python-wheels\",\"read_only\":true" \
+  <<< "$rebench_agent" >/dev/null
+
 set +e
 http_rebench="$(RUN_DRY_UPLOAD_BACKEND=http run_dry \
   'test-project/manual:immutable' "$tmp/does-not-exist.py" '{}' \
