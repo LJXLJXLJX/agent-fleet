@@ -1,4 +1,6 @@
 import io
+import os
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -62,6 +64,60 @@ class SweRebenchV2BundlePreparerTest(unittest.TestCase):
         swe_rebench_v2_bundle_preparer.prepare(cache_dir, output)
 
         self.assertTrue(swe_rebench_v2_bundle_preparer.archive_ready(output))
+
+    def test_shell_builder_uses_configured_runner_python(self):
+        env_sh = Path(__file__).parents[1] / "env.sh"
+        runner_python = self.root / "runner-python"
+        invocation_log = self.root / "runner-invocation.txt"
+        preparer = self.root / "preparer.py"
+        preparer.touch()
+        runner_python.write_text(
+            "#!/bin/sh\n"
+            'printf "%s\\n" "$PYTHON_BIN" "$@" > "$INVOCATION_LOG"\n'
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        runner_python.chmod(0o755)
+        script = r'''
+set -euo pipefail
+eval "$(sed -n '/^harbor_build_verifier_runtime_bundle()/,/^}/p' "$1")"
+verifier_runtime_bundle_required() { return 0; }
+validate_verifier_runtime_bundle_transport() { return 0; }
+verifier_runtime_bundle_ready() { return 1; }
+HARBOR_OPIK_PYTHON="$2"
+VERIFIER_RUNTIME_BUNDLE_PREPARER="$3"
+VERIFIER_RUNTIME_BUNDLE_ID=test-bundle
+HARBOR_CC_PY_WHEEL_DIR_SOURCE="$4"
+VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE="$4/bundle.tar.gz"
+if harbor_build_verifier_runtime_bundle; then
+  exit 90
+fi
+'''
+        environment = os.environ.copy()
+        environment["INVOCATION_LOG"] = str(invocation_log)
+
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                script,
+                "bash",
+                str(env_sh),
+                str(runner_python),
+                str(preparer),
+                str(self.root),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        invocation = invocation_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(invocation[0], str(runner_python))
+        self.assertEqual(invocation[1:3], [str(preparer), "build"])
+        self.assertNotIn("python3.12", invocation)
 
     def test_rejects_invalid_runtime_primitive(self):
         invalid = self.root / "invalid.tar.gz"

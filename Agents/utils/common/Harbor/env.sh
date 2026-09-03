@@ -1595,7 +1595,9 @@ harbor_build_verifier_runtime_bundle() {
 
   echo "preparing verifier runtime bundle: $VERIFIER_RUNTIME_BUNDLE_ID"
   if [[ ! -f "$VERIFIER_RUNTIME_BUNDLE_PREPARER" ]] \
-    || ! python3 "$VERIFIER_RUNTIME_BUNDLE_PREPARER" build \
+    || [[ ! -x "$HARBOR_OPIK_PYTHON" ]] \
+    || ! PYTHON_BIN="$HARBOR_OPIK_PYTHON" \
+      "$HARBOR_OPIK_PYTHON" "$VERIFIER_RUNTIME_BUNDLE_PREPARER" build \
     --cache-dir "$HARBOR_CC_PY_WHEEL_DIR_SOURCE" \
     --output "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE"; then
     echo "failed to prepare verifier runtime bundle: $VERIFIER_RUNTIME_BUNDLE_ID" >&2

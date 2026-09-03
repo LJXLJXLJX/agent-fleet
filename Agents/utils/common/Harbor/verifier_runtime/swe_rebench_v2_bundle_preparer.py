@@ -121,7 +121,7 @@ def build(python_runtime_archive: Path, output: Path) -> None:
 def prepare(cache_dir: Path, output: Path) -> None:
     python_runtime_archive = cache_dir / "python3.12-runtime.tar.gz"
     if not python_runtime.archive_ready(python_runtime_archive):
-        python_bin = os.environ.get("PYTHON_BIN") or "python3.12"
+        python_bin = os.environ.get("PYTHON_BIN") or sys.executable
         subprocess.run(
             [
                 python_bin,
