@@ -62,6 +62,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -153,6 +154,8 @@ OPENSANDBOX_ADAPTER_METADATA: dict[str, dict[str, dict[str, dict[str, object]]]]
 }
 LEGACY_DOCKERFILE_KEEPALIVE = ["sh", "-c", "while :; do sleep 60; done"]
 LOCAL_UPLOAD_INDEX_VERSION = 1
+SKOPEO_COPY_ATTEMPTS = 3
+SKOPEO_COPY_RETRY_DELAY_SECONDS = 3
 
 
 def log(message: str) -> None:
@@ -1078,7 +1081,26 @@ class SkopeoPublisher:
         with tempfile.NamedTemporaryFile(prefix="skopeo-digest-", delete=False) as handle:
             digest_path = Path(handle.name)
         try:
-            self._run([*command, "--digestfile", str(digest_path), source_ref, self._image_url(destination)])
+            copy_command = [
+                *command,
+                "--digestfile",
+                str(digest_path),
+                source_ref,
+                self._image_url(destination),
+            ]
+            for attempt in range(1, SKOPEO_COPY_ATTEMPTS + 1):
+                try:
+                    self._run(copy_command)
+                    break
+                except RuntimeError as exc:
+                    if attempt == SKOPEO_COPY_ATTEMPTS:
+                        raise
+                    log(
+                        "warning: skopeo copy failed "
+                        f"(attempt {attempt}/{SKOPEO_COPY_ATTEMPTS}); "
+                        f"retrying in {SKOPEO_COPY_RETRY_DELAY_SECONDS}s: {exc}"
+                    )
+                    time.sleep(SKOPEO_COPY_RETRY_DELAY_SECONDS)
             copied_digest = digest_path.read_text(encoding="utf-8").strip()
         finally:
             digest_path.unlink(missing_ok=True)
