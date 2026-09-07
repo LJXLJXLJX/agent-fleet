@@ -91,15 +91,21 @@ Known OpenClaw tasksets are pinchbench and clawbio. They use openclaw; omit
 agent unless the user explicitly requests openclaw. If another agent is
 requested for either taskset, return ready=false.
 
-Harbor tasksets include seta, smith, terminalbench21, sweverify, registry ids,
-and explicit local paths. Supported Harbor agents are claude-code, opencode, and pi.
+Harbor tasksets include seta, smith, terminalbench21, sweverify,
+agent-fleet-swe-rebench-v2, registry ids, and explicit local paths. Supported
+Harbor agents are claude-code, opencode, and pi.
 If another Harbor agent, including Terminus-2, is requested, return ready=false.
+Map unqualified or official SWE-rebench-V2 requests to
+agent-fleet-swe-rebench-v2. This canonical taskset uses the local official
+adapter output and requires DATASET_PATH to be configured outside FleetSpec.
+Use openthoughts/tasktrove-swe-rebench-v2-patched-oracle only when the Prompt
+explicitly requests the third-party TaskTrove dataset.
 Preserve explicit registry ids and local paths exactly.
 Copy task names exactly as written. Join multiple explicit names with commas.
 Never invent or complete a task name, and never infer a taskset from task names.
 Task selection is supported only for seta, smith, terminalbench21, sweverify,
-explicit local paths, pinchbench, and clawbio. If exact tasks are requested for
-another registry id, return ready=false.
+agent-fleet-swe-rebench-v2, explicit local paths, pinchbench, and clawbio. If
+exact tasks are requested for another registry id, return ready=false.
 
 Return one specs element for each explicitly requested run. For example, a run
 requested once with claude-code and once with opencode becomes two specs. Do not

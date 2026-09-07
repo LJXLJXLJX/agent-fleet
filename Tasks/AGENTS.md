@@ -12,7 +12,9 @@ fleet from `Agents/Openclaw/` (see
 | Path | Role |
 | --- | --- |
 | `SETA/`, `SWE-smith/`, `SWE-verify/`, `Terminal-bench-2/` | Harbor task lists |
-| `SWE-rebench-v2/`, `TMax/` | Harbor registry dataset entrypoints and adaptation docs |
+| `SWE-rebench-v2/` | Official SWE-rebench-V2 native Harbor task generator |
+| `SWE-rebench-v2-TaskTrove/` | Third-party TaskTrove Harbor registry integration |
+| `TMax/` | Harbor registry dataset entrypoint |
 | `WebResearchAdapter/` | BrowseComp and DeepSearchQA native Harbor task generator |
 | `Pinchbench/` | PinchBench runner for the OpenClaw fleet |
 | `clawBio/` | ClawBio bioinformatics benchmark for the OpenClaw fleet |
@@ -33,12 +35,27 @@ overrides the built-in selection for local runs. Task lists are owned here —
 don't duplicate them under `Agents/`.
 
 Other registry datasets use their full IDs, including
-`openthoughts/tasktrove-swe-rebench-v2-patched-oracle` and
 `tmax/TMax-15K-Harbor`. The unified launcher accepts these via
 `./scripts/run_fleet.sh --taskset <registry-id>`, or an explicit local dataset
-path. See [SWE-rebench-v2/README.md](SWE-rebench-v2/README.md) for qz
-final-image adaptation; task identity, repository, and revision must agree
-before an image can replace the task's setup instructions.
+path.
+
+## SWE-rebench-V2 Adapter (`SWE-rebench-v2/`)
+
+Generates native Harbor tasks from the official 32,079-row SWE-rebench-V2
+Parquet dataset. Environment setup belongs in the generated Dockerfile and
+must never be added to the agent instruction. The top-level upstream final
+image is metadata only; environments are rebuilt from the record's builder
+base image, repository, base commit, and install commands.
+
+Keep generated tasks outside the repository. Use
+`agent-fleet-swe-rebench-v2` as the local taskset and verifier benchmark name
+so the existing portable runtime bundle is selected on every supported
+backend. Conversion,
+prebuild, and run commands are in
+[SWE-rebench-v2/README.md](SWE-rebench-v2/README.md). The previous TaskTrove
+registry integration remains documented under
+[SWE-rebench-v2-TaskTrove/](SWE-rebench-v2-TaskTrove/) as an explicitly
+third-party option.
 
 ## Web Research Adapter (`WebResearchAdapter/`)
 
@@ -133,8 +150,10 @@ Run from the repo root:
 python3 -m unittest discover -s Tasks/Pinchbench/tests
 python3 -m unittest discover -s Tasks/clawBio/tests
 uv run --project Tasks/WebResearchAdapter python -m unittest discover -s Tasks/WebResearchAdapter/tests -v
+uv run --project Tasks/SWE-rebench-v2 pytest Tasks/SWE-rebench-v2/tests -q
 ```
 
 The web research adapter requires Python 3.11 or newer and its own project
-dependencies. Task-selection changes also affect the shared Harbor suite
-listed in [Agents/AGENTS.md](../Agents/AGENTS.md#development).
+dependencies. The SWE-rebench-V2 adapter requires Python 3.12 or newer and
+its own project dependencies. Task-selection changes also affect the shared
+Harbor suite listed in [Agents/AGENTS.md](../Agents/AGENTS.md#development).

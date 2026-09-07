@@ -168,7 +168,7 @@ Docker containers are checked by their own deployment/runtime paths.
 
 | Option | Description |
 | --- | --- |
-| `-t, --taskset <value>` | Built-in alias (`seta`, `smith`, `terminalbench21`, `sweverify`), registry ID, explicit local path, `pinchbench`, or `clawbio` |
+| `-t, --taskset <value>` | Built-in alias (`seta`, `smith`, `terminalbench21`, `sweverify`, `agent-fleet-swe-rebench-v2`), registry ID, explicit local path, `pinchbench`, or `clawbio` |
 | `--task <name>[,name...]` | Run exact task names only; repeat the flag to append more names, or use `--task=<name>` when an ID begins with `-` |
 | `-a, --agent <name>` | Optional Harbor agent override; `openclaw` is accepted for consistent OpenClaw commands |
 | `-n, --workers <n>` | Harbor workers or OpenClaw fleet instances |
@@ -177,6 +177,11 @@ Docker containers are checked by their own deployment/runtime paths.
 | `-p, --prompt <text>` | Translate, validate, and run a natural-language benchmark request (one or more runs, up to 16) |
 | `-o, --output <file>` | Atomically save the validated FleetSpec object or flattened array before running |
 | `--dry-run` | Print the downstream command and environment without running it |
+
+`agent-fleet-swe-rebench-v2` identifies canonical local output from the
+official adapter. Configure `DATASET_PATH` before using this alias. Prompt mode
+maps unqualified or official SWE-rebench-V2 requests to this alias; it selects
+the third-party TaskTrove registry dataset only when explicitly requested.
 
 Repeated `--task` values are appended, split on commas, trimmed, emptied
 segments removed, and deduplicated in first-seen order. Matching is exact.
@@ -205,6 +210,9 @@ Examples:
   --agent claude-code --workers 10 --detach
 ./scripts/run_fleet.sh --taskset terminalbench21 \
   --task fix-git,break-filter-js-from-html --workers 2
+DATASET_PATH=/absolute/path/to/generated-swe-rebench-v2 \
+  ./scripts/run_fleet.sh --taskset agent-fleet-swe-rebench-v2 \
+  --task owner__repository-123 --workers 1
 ./scripts/run_fleet.sh --taskset ./my-taskset --agent opencode --workers 2
 ./scripts/run_fleet.sh --taskset pinchbench --task task_sanity --workers 1
 ./scripts/run_fleet.sh --taskset clawbio --task rnaseq-de-demo --workers 1
@@ -239,7 +247,7 @@ Create `fleet-spec.json` with any text editor, for example
 | Field | Required | Value |
 | --- | --- | --- |
 | `schema_version` | Yes | Must be `1` |
-| `taskset` | Yes | Built-in alias (`seta`, `smith`, `terminalbench21`, `sweverify`), registry ID, explicit local path, `pinchbench`, or `clawbio` |
+| `taskset` | Yes | Built-in alias (`seta`, `smith`, `terminalbench21`, `sweverify`, `agent-fleet-swe-rebench-v2`), registry ID, explicit local path, `pinchbench`, or `clawbio` |
 | `task` | No | Exact task names in one comma-separated string |
 | `agent` | No | Agent passed to the selected runner |
 | `workers` | No | Integer from 1 to 4096 |

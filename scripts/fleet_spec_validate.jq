@@ -13,6 +13,7 @@ def fleet_taskset_supports_task_v1:
   . == "smith" or
   . == "terminalbench21" or
   . == "sweverify" or
+  . == "agent-fleet-swe-rebench-v2" or
   . == "pinchbench" or
   . == "clawbio" or
   . == "." or

@@ -51,16 +51,13 @@ YICLOUD_HARBOR_HOST="${YICLOUD_HARBOR_HOST:-}"
 YICLOUD_HARBOR_PROJECT="${YICLOUD_HARBOR_PROJECT:-}"
 YICLOUD_HARBOR_TLS_VERIFY="${YICLOUD_HARBOR_TLS_VERIFY:-0}"
 HARBOR_OPENSANDBOX_BENCHMARK="${HARBOR_OPENSANDBOX_BENCHMARK:-$DATASET_NAME}"
+HARBOR_VERIFIER_BENCHMARK="${HARBOR_VERIFIER_BENCHMARK:-$DATASET_NAME}"
 
 # Keep benchmark-specific verifier runtime policy in this thin selector. The
-# OpenSandbox provider treats the selected archive as an opaque filesystem
-# bundle and does not know which runtimes it contains.
+# environment providers treat the selected archive as an opaque filesystem
+# bundle and do not know which runtimes it contains.
 select_verifier_runtime_bundle() {
-  if [[ "$HARBOR_ENVIRONMENT_TYPE" != "opensandbox" ]]; then
-    printf '%s\n' "none"
-    return 0
-  fi
-  case "$HARBOR_OPENSANDBOX_BENCHMARK" in
+  case "$HARBOR_VERIFIER_BENCHMARK" in
     agent-fleet-swe-rebench-v2)
       printf '%s\n' "agent-fleet-swe-rebench-v2-verifier-bundle"
       ;;
@@ -72,6 +69,7 @@ select_verifier_runtime_bundle() {
 
 resolve_verifier_runtime_bundle() {
   VERIFIER_RUNTIME_BUNDLE_ID="$1"
+  VERIFIER_RUNTIME_BUNDLE_CACHE_DIR=""
   VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE=""
   VERIFIER_RUNTIME_BUNDLE_ARCHIVE_MOUNT_PATH=""
   VERIFIER_RUNTIME_BUNDLE_ROOT=""
@@ -80,8 +78,11 @@ resolve_verifier_runtime_bundle() {
     none)
       ;;
     agent-fleet-swe-rebench-v2-verifier-bundle)
-      VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE="$HARBOR_CC_PY_WHEEL_DIR_SOURCE/$VERIFIER_RUNTIME_BUNDLE_ID.tar.gz"
-      VERIFIER_RUNTIME_BUNDLE_ARCHIVE_MOUNT_PATH="$HARBOR_CC_PY_WHEEL_DIR_MOUNT_PATH/$VERIFIER_RUNTIME_BUNDLE_ID.tar.gz"
+      # Keep trusted verifier artifacts outside the Agent dependency cache so
+      # creating a bundle cannot make a partial local wheel cache look usable.
+      VERIFIER_RUNTIME_BUNDLE_CACHE_DIR="$AGENT_FLEET_CACHE_DIR/verifier-runtimes"
+      VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE="$VERIFIER_RUNTIME_BUNDLE_CACHE_DIR/$VERIFIER_RUNTIME_BUNDLE_ID.tar.gz"
+      VERIFIER_RUNTIME_BUNDLE_ARCHIVE_MOUNT_PATH="/opt/agent-fleet/verifier-runtimes/$VERIFIER_RUNTIME_BUNDLE_ID.tar.gz"
       VERIFIER_RUNTIME_BUNDLE_ROOT="/tmp/harbor-verifier-bundles/$VERIFIER_RUNTIME_BUNDLE_ID"
       VERIFIER_RUNTIME_BUNDLE_PREPARER="$SCRIPT_DIR/verifier_runtime/swe_rebench_v2_bundle_preparer.py"
       ;;
@@ -100,6 +101,7 @@ verifier_runtime_bundle_required() {
 
 validate_verifier_runtime_bundle_transport() {
   verifier_runtime_bundle_required || return 0
+  [[ "$HARBOR_ENVIRONMENT_TYPE" == "opensandbox" ]] || return 0
   case "$YICLOUD_SANDBOX_UPLOAD_BACKEND" in
     s3|auto)
       ;;

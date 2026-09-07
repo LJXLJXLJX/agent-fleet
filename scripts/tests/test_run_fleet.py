@@ -138,6 +138,35 @@ exit "${STUB_EXIT:-0}"
         self.assertIn("DATASET_NAME=auto", result.stdout)
         self.assertIn(f"DATASET_PATH={self.root}/./tasks", result.stdout)
 
+    def test_swe_rebench_v2_alias_supports_exact_task_selection(self):
+        output = self.root / "swe-rebench-v2.json"
+        result = self.run_fleet(
+            "--taskset",
+            "agent-fleet-swe-rebench-v2",
+            "--task",
+            "owner__repository-123",
+            "--workers",
+            "1",
+            "--output",
+            str(output),
+            extra_env={"DATASET_PATH": "/datasets/swe-rebench-v2"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("runner=harbor", result.stdout)
+        self.assertIn("DATASET_NAME=agent-fleet-swe-rebench-v2", result.stdout)
+        self.assertIn("DATASET_PATH=/datasets/swe-rebench-v2", result.stdout)
+        self.assertIn("FLEET_TASKS=owner__repository-123", result.stdout)
+        self.assertIn("TOTAL_WORKERS=1", result.stdout)
+        self.assertEqual(
+            json.loads(output.read_text(encoding="utf-8")),
+            {
+                "schema_version": 1,
+                "taskset": "agent-fleet-swe-rebench-v2",
+                "task": "owner__repository-123",
+                "workers": 1,
+            },
+        )
+
     def test_qz_opencode_config_reaches_harbor_entrypoint(self):
         (self.repo / "config.local.env").write_text(
             "BASE_URL=https://gateway.example.invalid\n"

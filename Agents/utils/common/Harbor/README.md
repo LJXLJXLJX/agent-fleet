@@ -121,10 +121,13 @@ Use these values in `env.sh`:
 | SWE-Smith | `smith` | `/workspace/harbor/datasets/swesmith` | `80` |
 | Terminal-Bench 2.1 | `terminalbench21` | `/workspace/terminal-bench-2-1/tasks` | `20` |
 | SWE-bench Verified | `sweverify` | `/workspace/swebench-verified` | `20` |
+| Official SWE-rebench-V2 | `agent-fleet-swe-rebench-v2` | materialized adapter output | start with `1` |
 
 `seta`, `terminalbench21`, and `sweverify` download from the Harbor registry
-by default. `smith` remains local. For an offline or local checkout of any
-dataset, use `auto` with its path:
+by default. `smith` and `agent-fleet-swe-rebench-v2` remain local. The Rebench
+alias requires `DATASET_PATH` to point at output materialized by
+[`Tasks/SWE-rebench-v2`](../../../../Tasks/SWE-rebench-v2/). For an offline or
+local checkout of any other dataset, use `auto` with its path:
 
 ```bash
 DATASET_NAME=auto \
@@ -136,12 +139,15 @@ For any Harbor registry dataset, pass the dataset id directly and use the normal
 zellij entrypoint:
 
 ```bash
-DATASET_NAME=openthoughts/tasktrove-swe-rebench-v2-patched-oracle \
+DATASET_NAME=tmax/TMax-15K-Harbor \
 bash Agents/utils/common/Harbor/start.sh --detach
 ```
 
 Registry runs pass `--dataset "$DATASET_NAME"` to Harbor instead of preparing a
 local task file from `DATASET_PATH`.
+
+The previous TaskTrove SWE-rebench-V2 registry dataset is retained as an
+explicitly [third-party integration](../../../../Tasks/SWE-rebench-v2-TaskTrove/).
 
 ## RL Rollout Mode
 

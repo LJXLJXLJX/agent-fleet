@@ -641,6 +641,21 @@ opensandbox_verifier_tool_env_required() {
     && { verifier_uv_bin_ready || verifier_runtime_bundle_required; }
 }
 
+append_verifier_runtime_bundle_env() {
+  verifier_runtime_bundle_required || return 0
+  validate_verifier_runtime_bundle_transport || return 1
+  if ! verifier_runtime_bundle_ready; then
+    echo "[ERROR] verifier runtime bundle $VERIFIER_RUNTIME_BUNDLE_ID selected for $HARBOR_VERIFIER_BENCHMARK, but its archive is missing or invalid" >&2
+    return 1
+  fi
+  cmd+=(
+    --ve "HARBOR_VERIFIER_RUNTIME_BUNDLE_ID=$VERIFIER_RUNTIME_BUNDLE_ID"
+    --ve "HARBOR_VERIFIER_RUNTIME_BUNDLE_ARCHIVE=$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_MOUNT_PATH"
+    --ve "HARBOR_VERIFIER_RUNTIME_BUNDLE_ROOT=$VERIFIER_RUNTIME_BUNDLE_ROOT"
+    --ve "HARBOR_VERIFIER_PYTHON=$VERIFIER_RUNTIME_BUNDLE_ROOT/bin/python"
+  )
+}
+
 append_opensandbox_verifier_tool_env() {
   local verifier_path_prefix=""
   if verifier_uv_bin_ready; then
@@ -655,22 +670,8 @@ append_opensandbox_verifier_tool_env() {
   fi
 
   if verifier_runtime_bundle_required; then
-    validate_verifier_runtime_bundle_transport || return 1
-    if ! verifier_runtime_bundle_ready; then
-      echo "[ERROR] verifier runtime bundle $VERIFIER_RUNTIME_BUNDLE_ID selected for $HARBOR_OPENSANDBOX_BENCHMARK, but its archive is missing or invalid" >&2
-      return 1
-    fi
-    if [[ -n "$verifier_path_prefix" ]]; then
-      verifier_path_prefix="$VERIFIER_RUNTIME_BUNDLE_ROOT/bin:$verifier_path_prefix"
-    else
-      verifier_path_prefix="$VERIFIER_RUNTIME_BUNDLE_ROOT/bin"
-    fi
-    cmd+=(
-      --ve "HARBOR_VERIFIER_RUNTIME_BUNDLE_ID=$VERIFIER_RUNTIME_BUNDLE_ID"
-      --ve "HARBOR_VERIFIER_RUNTIME_BUNDLE_ARCHIVE=$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_MOUNT_PATH"
-      --ve "HARBOR_VERIFIER_RUNTIME_BUNDLE_ROOT=$VERIFIER_RUNTIME_BUNDLE_ROOT"
-    )
-    echo "[INFO] OpenSandbox verifier runtime bundle: benchmark=$HARBOR_OPENSANDBOX_BENCHMARK bundle=$VERIFIER_RUNTIME_BUNDLE_ID" >&2
+    append_verifier_runtime_bundle_env || return 1
+    echo "[INFO] OpenSandbox verifier runtime bundle: benchmark=$HARBOR_VERIFIER_BENCHMARK bundle=$VERIFIER_RUNTIME_BUNDLE_ID" >&2
   fi
   if [[ -n "$verifier_path_prefix" ]]; then
     cmd+=(
@@ -679,8 +680,11 @@ append_opensandbox_verifier_tool_env() {
   fi
 }
 
-configure_e2b_verifier_uv_upload() {
+configure_e2b_verifier_tool_upload() {
   HARBOR_E2B_VERIFIER_UV_SOURCE=""
+  HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_SOURCE=""
+  HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_TARGET=""
+  HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_ROOT=""
   if [[ "$HARBOR_ENVIRONMENT_TYPE" == "e2b" || "$HARBOR_ENVIRONMENT_TYPE" == "qz" ]] \
     && verifier_uv_bin_ready; then
     HARBOR_E2B_VERIFIER_UV_SOURCE="$VERIFIER_UV_BIN_DIR_SOURCE"
@@ -690,7 +694,21 @@ configure_e2b_verifier_uv_upload() {
       echo "[INFO] qz verifier uv tools will be uploaded after sandbox start"
     fi
   fi
+  if [[ "$HARBOR_ENVIRONMENT_TYPE" == "e2b" || "$HARBOR_ENVIRONMENT_TYPE" == "qz" ]] \
+    && verifier_runtime_bundle_required; then
+    if ! verifier_runtime_bundle_ready; then
+      echo "[ERROR] verifier runtime bundle $VERIFIER_RUNTIME_BUNDLE_ID selected for $HARBOR_VERIFIER_BENCHMARK, but its archive is missing or invalid" >&2
+      return 1
+    fi
+    HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_SOURCE="$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE"
+    HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_TARGET="$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_MOUNT_PATH"
+    HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_ROOT="$VERIFIER_RUNTIME_BUNDLE_ROOT"
+    echo "[INFO] $HARBOR_ENVIRONMENT_TYPE verifier runtime bundle will be uploaded after sandbox start"
+  fi
   export HARBOR_E2B_VERIFIER_UV_SOURCE
+  export HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_SOURCE
+  export HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_TARGET
+  export HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_ROOT
 }
 
 task_is_included() {
@@ -903,7 +921,7 @@ run_oracle_task() {
   else
     echo "[WARN] failed to create verifier uv backup dir; verifier will use its normal uv install path" >&2
   fi
-  configure_e2b_verifier_uv_upload
+  configure_e2b_verifier_tool_upload
 
   if [[ "$HARBOR_DRY_RUN" != "1" ]]; then
     harbor_validate_runner_cli
@@ -940,7 +958,7 @@ run_oracle_task() {
     fi
     if verifier_runtime_bundle_required; then
       if ! verifier_runtime_bundle_ready; then
-        echo "[ERROR] verifier runtime bundle $VERIFIER_RUNTIME_BUNDLE_ID selected for $HARBOR_OPENSANDBOX_BENCHMARK, but its archive is missing" >&2
+        echo "[ERROR] verifier runtime bundle $VERIFIER_RUNTIME_BUNDLE_ID selected for $HARBOR_VERIFIER_BENCHMARK, but its archive is missing" >&2
         return 1
       fi
       verifier_mount_args+=(
@@ -957,22 +975,36 @@ run_oracle_task() {
     )
     append_opensandbox_verifier_tool_env
   elif [[ "$HARBOR_ENVIRONMENT_TYPE" != "e2b" && "$HARBOR_ENVIRONMENT_TYPE" != "qz" ]] \
-    && verifier_uv_bin_ready; then
+    && { verifier_uv_bin_ready || verifier_runtime_bundle_required; }; then
     local verifier_mounts_json verifier_uv_path_prefix
+    local -a verifier_mount_args=()
+    if verifier_uv_bin_ready; then
+      verifier_mount_args+=(
+        --mount "$VERIFIER_UV_BIN_DIR_SOURCE"
+        "$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH" always
+      )
+    fi
+    if verifier_runtime_bundle_required; then
+      verifier_mount_args+=(
+        --mount "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE"
+        "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_MOUNT_PATH" always
+      )
+    fi
     verifier_mounts_json="$(
       python3 "$SCRIPT_DIR/harbor_shell_utils.py" readonly-mounts \
-        --mount "$VERIFIER_UV_BIN_DIR_SOURCE" \
-        "$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH" always
+        "${verifier_mount_args[@]}"
     )"
-    verifier_uv_path_prefix="/root/.local/bin:/home/oai/.local/bin:/home/agent/.local/bin:/home/ubuntu/.local/bin"
-    if [[ -n "${HARBOR_VERIFIER_UV_HOME:-}" ]]; then
-      verifier_uv_path_prefix="$HARBOR_VERIFIER_UV_HOME/.local/bin:$verifier_uv_path_prefix"
+    cmd+=( --mounts-json "$verifier_mounts_json" )
+    if verifier_uv_bin_ready; then
+      verifier_uv_path_prefix="/root/.local/bin:/home/oai/.local/bin:/home/agent/.local/bin:/home/ubuntu/.local/bin"
+      if [[ -n "${HARBOR_VERIFIER_UV_HOME:-}" ]]; then
+        verifier_uv_path_prefix="$HARBOR_VERIFIER_UV_HOME/.local/bin:$verifier_uv_path_prefix"
+      fi
+      cmd+=(
+        --ve "PATH=$verifier_uv_path_prefix:$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        --ve "HARBOR_VERIFIER_UV_BIN_DIR=$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH"
+      )
     fi
-    cmd+=(
-      --mounts-json "$verifier_mounts_json"
-      --ve "PATH=$verifier_uv_path_prefix:$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-      --ve "HARBOR_VERIFIER_UV_BIN_DIR=$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH"
-    )
   fi
   if [[ "$HARBOR_ENVIRONMENT_TYPE" == "e2b" || "$HARBOR_ENVIRONMENT_TYPE" == "qz" ]] \
     && verifier_uv_bin_ready; then
@@ -985,6 +1017,10 @@ run_oracle_task() {
       --ve "PATH=$verifier_uv_path_prefix:$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
       --ve "HARBOR_VERIFIER_UV_BIN_DIR=$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH"
     )
+  fi
+  if [[ "$HARBOR_ENVIRONMENT_TYPE" != "opensandbox" ]] \
+    && verifier_runtime_bundle_required; then
+    append_verifier_runtime_bundle_env
   fi
   if [[ -n "${PIP_INDEX_URL:-}" ]]; then
     cmd+=( --ve "PIP_INDEX_URL=$PIP_INDEX_URL" )
@@ -1107,7 +1143,7 @@ run_harbor() {
       echo "[WARN] failed to create verifier uv backup dir; verifier will use its normal uv install path" >&2
     fi
   fi
-  configure_e2b_verifier_uv_upload
+  configure_e2b_verifier_tool_upload
 
   local effective_harbor_task_id include_task
   effective_harbor_task_id="${HARBOR_TASK_ID:-}"
@@ -1320,6 +1356,12 @@ run_harbor() {
     if [[ -n "$HARBOR_CC_PY_WHEEL_DIR_SOURCE" ]]; then
       mount_args+=( --mount "$HARBOR_CC_PY_WHEEL_DIR_SOURCE" "$HARBOR_CC_PY_WHEEL_DIR_MOUNT_PATH" exists )
     fi
+    if verifier_runtime_bundle_required; then
+      mount_args+=(
+        --mount "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE"
+        "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_MOUNT_PATH" always
+      )
+    fi
     if harbor_agent_is_claude_code && [[ -n "$HARBOR_CC_WEB_MCP_SOURCE" ]]; then
       mount_args+=( --mount "$HARBOR_CC_WEB_MCP_SOURCE" "$HARBOR_CC_WEB_MCP_MOUNT_PATH" always )
     fi
@@ -1357,6 +1399,10 @@ run_harbor() {
       --ve "PATH=$verifier_uv_path_prefix:$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
       --ve "HARBOR_VERIFIER_UV_BIN_DIR=$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH"
     )
+  fi
+  if [[ "$HARBOR_ENVIRONMENT_TYPE" != "opensandbox" ]] \
+    && verifier_runtime_bundle_required; then
+    append_verifier_runtime_bundle_env
   fi
 
   append_package_environment_args
@@ -1490,7 +1536,7 @@ run_opencode_task() {
   else
     echo "[WARN] failed to create verifier uv backup dir; verifier will use its normal uv install path" >&2
   fi
-  configure_e2b_verifier_uv_upload
+  configure_e2b_verifier_tool_upload
   if harbor_trace_to_opik_enabled; then
     normalize_opik_url_override
   fi
@@ -1616,6 +1662,12 @@ run_opencode_task() {
       if [[ -n "$HARBOR_CC_PY_WHEEL_DIR_SOURCE" ]]; then
         mount_args+=( --mount "$HARBOR_CC_PY_WHEEL_DIR_SOURCE" "$HARBOR_CC_PY_WHEEL_DIR_MOUNT_PATH" exists )
       fi
+      if verifier_runtime_bundle_required; then
+        mount_args+=(
+          --mount "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE"
+          "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_MOUNT_PATH" always
+        )
+      fi
       if [[ -n "$VERIFIER_UV_BIN_DIR_SOURCE" ]]; then
         mount_args+=( --mount "$VERIFIER_UV_BIN_DIR_SOURCE" "$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH" uv-bin )
       fi
@@ -1635,6 +1687,10 @@ run_opencode_task() {
         --ve "PATH=/root/.local/bin:/home/oai/.local/bin:/home/agent/.local/bin:/home/ubuntu/.local/bin:$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         --ve "HARBOR_VERIFIER_UV_BIN_DIR=$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH"
       )
+    fi
+    if [[ "$HARBOR_ENVIRONMENT_TYPE" != "opensandbox" ]] \
+      && verifier_runtime_bundle_required; then
+      append_verifier_runtime_bundle_env
     fi
 
     for env_name in OC_OPIK_DEBUG OC_OPIK_DRY_RUN OC_OPIK_MAX_TEXT_CHARS OC_OPIK_FLUSH_INTERVAL_S; do

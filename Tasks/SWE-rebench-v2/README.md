@@ -1,53 +1,145 @@
-# SWE-Rebench-V2
+# SWE-rebench-V2 Harbor Adapter
 
-Harbor support for SWE-Rebench-V2 uses the published Harbor Hub dataset.
+This directory contains Agent Fleet's canonical converter for the official
+SWE-rebench-V2 dataset. Repository checkout and `install_config.install` run
+while the task image is built; `instruction.md` contains only the requested
+software change. The dataset's top-level prebuilt `image_name` is retained as
+verifier metadata but is never a runtime dependency.
 
-Default source:
+The previous TaskTrove-based integration remains available as a
+[third-party alternative](../SWE-rebench-v2-TaskTrove/README.md). It is not the
+canonical source for this adapter because it contains only a subset of the
+official records and places repository setup in agent instructions.
 
-- Harbor Hub: https://hub.harborframework.com/datasets/openthoughts/tasktrove-swe-rebench-v2-patched-oracle
+## Attribution
 
-The default is the oracle subset. The underlying Harbor CLI invocation uses
-`--dataset openthoughts/tasktrove-swe-rebench-v2-patched-oracle`.
+The adapter code is adapted from the official
+[SWE-rebench-V2 builder](https://github.com/SWE-rebench/SWE-rebench-V2),
+pinned at commit `c71902a8cf8d2b725f63d51f199f4d3e56f68d2d`. In particular,
+the environment template, test execution and evaluation semantics, log
+parsers, and test status constants follow the corresponding upstream builder
+files. The input records come from the
+[Nebius SWE-rebench-V2 dataset](https://huggingface.co/datasets/nebius/SWE-rebench-V2).
 
-## Unified Entry
+## Pinned inputs
 
-Run through the normal Harbor zellij entrypoint:
+The adapter was developed and validated against:
+
+- SWE-rebench-V2 builder commit
+  `c71902a8cf8d2b725f63d51f199f4d3e56f68d2d`
+- Official dataset snapshot with 32,079 rows
+- Parquet SHA-256
+  `0e0bf9355f892ad74ae98d4e1c404f39fd6654a8e351ee3e6ab162e4a64cd3ad`
+- Harbor 0.18.0 task contract
+
+The converter revision is the Agent Fleet commit used to generate the task
+directories. Record that commit together with the dataset snapshot and the
+base-image mapping for every materialization.
+
+## Prepare dependencies
+
+Keep the virtual environment and uv cache outside the source checkout. On
+YiCloud, route Python dependencies through the platform-provided artifact
+cache gateway:
 
 ```bash
-DATASET_NAME=openthoughts/tasktrove-swe-rebench-v2-patched-oracle \
-bash Agents/utils/common/Harbor/start.sh --detach
+: "${ARTIFACT_CACHE_GATEWAY_URL:?ARTIFACT_CACHE_GATEWAY_URL is required}"
+export UV_PROJECT_ENVIRONMENT=/data/harbor-envs/swe-rebench-v2-adapter
+export UV_CACHE_DIR=/data/harbor-caches/uv
+export UV_DEFAULT_INDEX="${ARTIFACT_CACHE_GATEWAY_URL}/pypi-simple"
+uv sync --project Tasks/SWE-rebench-v2
 ```
 
-## QZ final-image adaptation
+## Generate tasks
 
-The registry task archive asks the agent to clone, checkout, and install the
-repository. A QZ run backed by the original final task images must not expose
-that setup block to the agent again. Use the generic repository-image producer
-with a local materialization of the selected Harbor tasks and an explicit image
-catalog exported from the benchmark metadata:
+Generate one task first:
 
 ```bash
-cd Agents/utils/common/Harbor
-
-python qz_repository_environment_plan.py \
-  --dataset-root /path/to/materialized/swe-rebench-v2/tasks \
-  --task-list /path/to/selected-tasks.txt \
-  --image-catalog /path/to/swe-rebench-v2-images.jsonl \
-  --output /tmp/swe-rebench-v2-environment-plan.json
-
-python qz_template_mapping.py \
-  --dataset-root /path/to/materialized/swe-rebench-v2/tasks \
-  --benchmark swe-rebench-v2 \
-  --task-list /path/to/selected-tasks.txt \
-  --environment-plan-file /tmp/swe-rebench-v2-environment-plan.json \
-  --output /tmp/swe-rebench-v2-qz-templates.json
+uv run --project Tasks/SWE-rebench-v2 swe-rebench-v2 \
+  --dataset-path <official-dataset-directory> \
+  --instance-id unidata__netcdf-c-1692 \
+  --output-dir <generated-harbor-dataset> \
+  --dataset-source nebius/SWE-rebench-V2@<dataset-revision> \
+  --base-image-registry <internal-base-image-project>
 ```
 
-The catalog defaults to the benchmark's `instance_id`, `repo`, `base_commit`,
-and `image_name` fields. The task ID selects one record; repository and commit
-are then checked against the setup block, so shared base commits cannot select
-the wrong image. This adapter is not keyed to the dataset name: another
-repository benchmark with the same strict setup block can use it directly or
-select other catalog field names. The setup block's absolute `cd` target is
-preserved as the QZ task workdir. Inventory is read-only; Template
-materialization remains an explicit, separate operation.
+Use `--task-ids` for an explicit sample. Full conversion requires `--all`:
+
+```bash
+uv run --project Tasks/SWE-rebench-v2 swe-rebench-v2 \
+  --dataset-path <official-dataset-directory> \
+  --all \
+  --output-dir <generated-harbor-dataset> \
+  --summary-json <conversion-summary.json> \
+  --dataset-source nebius/SWE-rebench-V2@<dataset-revision> \
+  --base-image-registry <internal-base-image-project>
+```
+
+The summary reports converted and failed tasks plus resolved base-image names.
+Generated task directories are runtime data and must not be committed here.
+
+The published dataset contains records with an empty
+`install_config.install`; those records preserve the official empty-loop
+behavior. Records with a null `problem_statement` use the non-answer-bearing
+`pr_description` as their instruction.
+
+## Prebuild and run
+
+Prebuild through the existing OpenSandbox image pipeline:
+
+```bash
+bash Agents/utils/common/Harbor/prebuild_opensandbox_dataset.sh \
+  <generated-harbor-dataset> agent-fleet-swe-rebench-v2
+```
+
+Run the local dataset with the benchmark alias. The alias selects the portable
+Python verifier bundle required by base images that do not provide Python:
+
+```bash
+DATASET_PATH=<generated-harbor-dataset> \
+HARBOR_ENVIRONMENT_TYPE=opensandbox \
+./scripts/run_fleet.sh \
+  --taskset agent-fleet-swe-rebench-v2 \
+  --agent claude-code \
+  --workers 1
+```
+
+The harness provides this verifier-only runtime on Docker, E2B, qz, and
+OpenSandbox without changing the generated environment image. Docker mounts
+the bundle read-only; managed Sandbox backends upload it after Sandbox
+creation. Updating the verifier runtime therefore does not require rebuilding
+or republishing task images.
+
+Use `--task <instance-id>` for an exact local task selection. Remote rollout
+deployments can register the same directory with:
+
+```bash
+export RL_DATASET_ROOTS="agent-fleet-swe-rebench-v2=<generated-harbor-dataset>"
+```
+
+## Generated layout and security boundary
+
+Each generated task contains `task.toml`, `instruction.md`, an environment
+Dockerfile, verifier files under `tests/`, and an optional Oracle solution.
+`tests/config.json` intentionally preserves answer-bearing fields such as the
+gold patch and expected tests. Harbor mounts verifier files after the agent
+run; these fields must never be copied into the agent-visible image.
+
+The bundled log parsers come from the pinned SWE-rebench-V2 builder. The
+wrapper selects the record's exact parser and compares the parsed PASSED set
+with `FAIL_TO_PASS + PASS_TO_PASS`, matching the builder evaluator.
+
+## Known limitations
+
+SWE-rebench-V2 contains upstream environment and verifier defects. They are
+audited task by task and are not silently rewritten as part of general
+conversion. The adapter contains only narrow, documented build compatibility
+mappings for cases whose original environment cannot otherwise be
+materialized. Benchmark-level fixes require separate evidence and validation.
+
+## Tests
+
+```bash
+uv run --project Tasks/SWE-rebench-v2 pytest \
+  Tasks/SWE-rebench-v2/tests -q
+```

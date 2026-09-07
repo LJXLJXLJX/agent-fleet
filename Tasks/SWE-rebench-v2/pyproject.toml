@@ -1,0 +1,39 @@
+[project]
+name = "harbor-swe-rebench-v2-adapter"
+version = "0.1.0"
+description = "Convert local SWE-rebench-V2 data into Harbor task directories"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=3.0.0",
+    "jinja2>=3.1.0",
+]
+
+[project.scripts]
+swe-rebench-v2 = "swe_rebench_v2.main:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "harbor==0.18.0",
+    "pytest>=8.4.2",
+    "ruff>=0.15.17",
+    "toml>=0.10.2",
+    "ty>=0.0.49",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["swe_rebench_v2", "swe_rebench_v2.*"]
+
+[tool.setuptools.package-data]
+swe_rebench_v2 = ["task-template/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+extend-exclude = ["src/swe_rebench_v2/task-template/tests/log_parsers.py"]

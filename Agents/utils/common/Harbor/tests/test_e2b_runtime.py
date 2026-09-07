@@ -34,7 +34,9 @@ class FakeLogger:
         pass
 
 
-def fake_runtime_modules(environment_cls, template_cls, sandbox_cls=None):
+def fake_runtime_modules(
+    environment_cls, template_cls, sandbox_cls=None, trial_cls=None
+):
     e2b_module = types.ModuleType("e2b")
     e2b_module.AsyncTemplate = template_cls
     e2b_module.AsyncSandbox = sandbox_cls or type("FakeAsyncSandbox", (), {})
@@ -46,12 +48,21 @@ def fake_runtime_modules(environment_cls, template_cls, sandbox_cls=None):
     harbor_module.environments = environments_module
     environments_module.e2b = harbor_e2b_module
 
-    return {
+    modules = {
         "e2b": e2b_module,
         "harbor": harbor_module,
         "harbor.environments": environments_module,
         "harbor.environments.e2b": harbor_e2b_module,
     }
+    if trial_cls is not None:
+        trial_module = types.ModuleType("harbor.trial")
+        harbor_trial_module = types.ModuleType("harbor.trial.trial")
+        harbor_trial_module.Trial = trial_cls
+        harbor_module.trial = trial_module
+        trial_module.trial = harbor_trial_module
+        modules["harbor.trial"] = trial_module
+        modules["harbor.trial.trial"] = harbor_trial_module
+    return modules
 
 
 def base_template_class():
@@ -355,6 +366,96 @@ class E2BRuntimeTest(unittest.TestCase):
                 os.environ, {**common_env, "HARBOR_ENVIRONMENT_TYPE": "docker"}
             ):
                 self.assertFalse(MODULE.patch_e2b_verifier_tools_from_env())
+
+    def test_materializes_verifier_runtime_once_for_each_environment_mode(self) -> None:
+        events: list[object] = []
+
+        class FakeE2BEnvironment:
+            def __init__(self, session_id: str) -> None:
+                self.session_id = session_id
+
+            async def start(self, force_build: bool):
+                events.append(("start", self.session_id, force_build))
+                return "started"
+
+            async def exec(self, command: str, user: str):
+                events.append(("exec", command, user))
+                return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+            async def upload_file(self, source: Path, target: str):
+                events.append(("upload-file", source, target))
+
+        class FakeTrial:
+            def __init__(self, environment) -> None:
+                self.agent_environment = environment
+
+            async def _run_shared_verifier(self, *args, **kwargs):
+                events.append(("verify", args, kwargs))
+                return "verified"
+
+        modules = fake_runtime_modules(
+            FakeE2BEnvironment,
+            type("FakeTemplate", (), {}),
+            trial_cls=FakeTrial,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bundle = Path(temp_dir) / "bundle.tar.gz"
+            bundle.write_bytes(b"runtime")
+            with patch.dict(sys.modules, modules), patch.dict(
+                os.environ,
+                {
+                    "HARBOR_ENVIRONMENT_TYPE": "e2b",
+                    "HARBOR_E2B_VERIFIER_UV_SOURCE": "",
+                    "HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_SOURCE": str(bundle),
+                    "HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_TARGET": (
+                        "/opt/test-runtime/bundle.tar.gz"
+                    ),
+                    "HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_ROOT": "/tmp/test-bundle",
+                },
+            ):
+                self.assertTrue(MODULE.patch_e2b_verifier_tools_from_env())
+                environment = FakeE2BEnvironment("task__trial__env")
+                result = asyncio.run(environment.start(False))
+                events.append(("agent-tampered-runtime",))
+                verifier_result = asyncio.run(
+                    FakeTrial(environment)._run_shared_verifier(timeout_sec=30)
+                )
+                separate_result = asyncio.run(
+                    FakeE2BEnvironment("task__trial__verifier__env").start(False)
+                )
+
+        self.assertEqual(result, "started")
+        self.assertEqual(verifier_result, "verified")
+        self.assertEqual(separate_result, "started")
+        self.assertEqual(events[0], ("start", "task__trial__env", False))
+        self.assertEqual(events[1], ("agent-tampered-runtime",))
+        self.assertEqual(
+            events[2],
+            ("exec", "mkdir -p -- /opt/test-runtime /tmp", "root"),
+        )
+        self.assertEqual(
+            events[3],
+            ("upload-file", bundle, "/opt/test-runtime/bundle.tar.gz"),
+        )
+        self.assertEqual(events[4][0], "exec")
+        self.assertIn("tar -xzf /opt/test-runtime/bundle.tar.gz", events[4][1])
+        self.assertIn(
+            "/tmp/test-bundle/bin/harbor-verifier-bundle-check", events[4][1]
+        )
+        self.assertEqual(events[5], ("verify", (), {"timeout_sec": 30}))
+        self.assertEqual(
+            events[6], ("start", "task__trial__verifier__env", False)
+        )
+        self.assertEqual(
+            events[7],
+            ("exec", "mkdir -p -- /opt/test-runtime /tmp", "root"),
+        )
+        self.assertEqual(
+            events[8],
+            ("upload-file", bundle, "/opt/test-runtime/bundle.tar.gz"),
+        )
+        self.assertEqual(events[9][0], "exec")
+        self.assertEqual(len(events), 10)
 
 if __name__ == "__main__":
     unittest.main()

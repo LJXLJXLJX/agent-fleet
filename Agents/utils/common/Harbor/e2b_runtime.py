@@ -306,9 +306,9 @@ def patch_e2b_verifier_tools_from_env() -> bool:
 
     E2B has no host bind mounts. The runner therefore prepares the same
     ``uv``/``uvx`` binaries and narrow uv-installer curl shim used by the
-    Docker and OpenSandbox backends, then this patch copies them through
-    Harbor's E2B file API once the sandbox exists. This keeps task Dockerfiles
-    and E2B template construction unchanged.
+    Docker and OpenSandbox backends, plus any selected verifier runtime bundle.
+    This patch copies them through Harbor's E2B file API once the sandbox
+    exists. This keeps task Dockerfiles and E2B template construction unchanged.
     """
 
     environment_type = os.environ.get("HARBOR_ENVIRONMENT_TYPE", "docker").strip().lower()
@@ -316,23 +316,55 @@ def patch_e2b_verifier_tools_from_env() -> bool:
         return False
 
     raw_source = os.environ.get("HARBOR_E2B_VERIFIER_UV_SOURCE", "").strip()
-    if not raw_source:
+    raw_bundle_source = os.environ.get(
+        "HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_SOURCE", ""
+    ).strip()
+    if not raw_source and not raw_bundle_source:
         return False
-    source = Path(raw_source)
-    missing = [name for name in _VERIFIER_TOOL_NAMES if not (source / name).is_file()]
-    if missing:
-        raise RuntimeError(
-            "HARBOR_E2B_VERIFIER_UV_SOURCE is missing required files: "
-            + ", ".join(missing)
-        )
+    source = Path(raw_source) if raw_source else None
+    if source is not None:
+        missing = [
+            name for name in _VERIFIER_TOOL_NAMES if not (source / name).is_file()
+        ]
+        if missing:
+            raise RuntimeError(
+                "HARBOR_E2B_VERIFIER_UV_SOURCE is missing required files: "
+                + ", ".join(missing)
+            )
 
     target = os.environ.get(
         "HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH", "/opt/tb-uv-backup/bin"
     ).strip()
-    if not target.startswith("/"):
+    if source is not None and not target.startswith("/"):
         raise RuntimeError("HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH must be absolute")
 
+    bundle_source = Path(raw_bundle_source) if raw_bundle_source else None
+    bundle_target = os.environ.get(
+        "HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_TARGET", ""
+    ).strip()
+    bundle_root = os.environ.get(
+        "HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_ROOT", ""
+    ).strip()
+    if bundle_source is not None:
+        if not bundle_source.is_file():
+            raise RuntimeError(
+                "HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_SOURCE is not a file: "
+                f"{bundle_source}"
+            )
+        if not bundle_target.startswith("/"):
+            raise RuntimeError(
+                "HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_TARGET must be absolute"
+            )
+        if not bundle_root.startswith("/") or bundle_root == "/":
+            raise RuntimeError(
+                "HARBOR_E2B_VERIFIER_RUNTIME_BUNDLE_ROOT must be a safe absolute path"
+            )
+
     from harbor.environments.e2b import E2BEnvironment
+
+    Trial = None
+    if bundle_source is not None:
+        from harbor.trial.trial import Trial
 
     if getattr(E2BEnvironment, "_fleet_verifier_tools_patch_applied", False):
         return False
@@ -343,33 +375,94 @@ def patch_e2b_verifier_tools_from_env() -> bool:
         shlex.quote(f"{target.rstrip('/')}/{name}") for name in _VERIFIER_TOOL_NAMES
     )
 
-    async def start_with_verifier_tools(self, force_build: bool):  # type: ignore[no-untyped-def]
-        result = await original_start(self, force_build)
+    async def materialize_verifier_runtime(environment):  # type: ignore[no-untyped-def]
+        if bundle_source is None:
+            return
 
-        mkdir_result = await self.exec(
-            f"mkdir -p -- {quoted_target}",
+        quoted_bundle_target = shlex.quote(bundle_target)
+        quoted_bundle_parent = shlex.quote(str(Path(bundle_target).parent))
+        quoted_bundle_root = shlex.quote(bundle_root)
+        quoted_bundle_root_parent = shlex.quote(str(Path(bundle_root).parent))
+        quoted_bundle_check = shlex.quote(
+            f"{bundle_root.rstrip('/')}/bin/harbor-verifier-bundle-check"
+        )
+        mkdir_result = await environment.exec(
+            f"mkdir -p -- {quoted_bundle_parent} {quoted_bundle_root_parent}",
             user="root",
         )
         if mkdir_result.return_code != 0:
             raise RuntimeError(
-                "failed to create E2B verifier tool directory: "
+                "failed to create E2B verifier runtime directories: "
                 f"{mkdir_result.stderr or mkdir_result.stdout}"
             )
-
-        await self.upload_dir(source, target)
-        chmod_result = await self.exec(
-            f"chmod 0755 -- {quoted_tools}",
+        await environment.upload_file(bundle_source, bundle_target)
+        extract_result = await environment.exec(
+            "set -e; "
+            f"rm -rf -- {quoted_bundle_root}; "
+            f"tar -xzf {quoted_bundle_target} -C {quoted_bundle_root_parent}; "
+            f"test -x {quoted_bundle_check}; "
+            f"{quoted_bundle_check}",
             user="root",
         )
-        if chmod_result.return_code != 0:
+        if extract_result.return_code != 0:
             raise RuntimeError(
-                "failed to make uploaded E2B verifier tools executable: "
-                f"{chmod_result.stderr or chmod_result.stdout}"
+                "failed to materialize E2B verifier runtime bundle: "
+                f"{extract_result.stderr or extract_result.stdout}"
             )
+
+    async def start_with_verifier_tools(self, force_build: bool):  # type: ignore[no-untyped-def]
+        result = await original_start(self, force_build)
+
+        if source is not None:
+            mkdir_result = await self.exec(
+                f"mkdir -p -- {quoted_target}",
+                user="root",
+            )
+            if mkdir_result.return_code != 0:
+                raise RuntimeError(
+                    "failed to create E2B verifier tool directory: "
+                    f"{mkdir_result.stderr or mkdir_result.stdout}"
+                )
+
+            await self.upload_dir(source, target)
+            chmod_result = await self.exec(
+                f"chmod 0755 -- {quoted_tools}",
+                user="root",
+            )
+            if chmod_result.return_code != 0:
+                raise RuntimeError(
+                    "failed to make uploaded E2B verifier tools executable: "
+                    f"{chmod_result.stderr or chmod_result.stdout}"
+                )
+
+        # Shared agent environments restore the bundle immediately before grading.
+        # Separate verifier environments must prepare it during their own startup.
+        if bundle_source is not None and (
+            "__verifier__" in self.session_id
+            or not self.session_id.endswith("__env")
+        ):
+            await materialize_verifier_runtime(self)
         return result
 
     E2BEnvironment.start = start_with_verifier_tools
     E2BEnvironment._fleet_verifier_tools_patch_applied = True
+
+    if Trial is not None and not getattr(
+        Trial, "_fleet_verifier_runtime_refresh_patch_applied", False
+    ):
+        original_run_shared_verifier = Trial._run_shared_verifier
+
+        async def run_shared_verifier_with_fresh_runtime(
+            self, *args: Any, **kwargs: Any
+        ):
+            # The agent can run as root in the shared E2B/qz sandbox. Restore
+            # the host-owned archive and extracted runtime after the agent
+            # phase so grading never trusts agent-writable verifier code.
+            await materialize_verifier_runtime(self.agent_environment)
+            return await original_run_shared_verifier(self, *args, **kwargs)
+
+        Trial._run_shared_verifier = run_shared_verifier_with_fresh_runtime
+        Trial._fleet_verifier_runtime_refresh_patch_applied = True
     return True
 
 

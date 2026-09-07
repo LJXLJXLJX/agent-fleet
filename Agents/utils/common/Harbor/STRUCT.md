@@ -141,6 +141,13 @@ including external commands required to complete them:
 The Python command surfaces are internal implementation boundaries; operators
 continue to use the shell entry points documented in the README files.
 
+## Verifier Isolation
+
+TODO: Execute verification in a Sandbox isolated from the agent's Sandbox.
+The current shared-Sandbox model allows an agent to tamper with verifier
+dependencies or runtime state and therefore cannot provide a security boundary
+against intentional grading manipulation.
+
 ## Path Resolution
 
 `env.sh` computes paths relative to this file:
@@ -167,6 +174,14 @@ continue to use the shell entry points documented in the README files.
 entrypoint as a single-pane wrapper around `harboropik.sh`; the local
 multi-worker queue mode still expects a materialized `TASK_FILE`.
 
+`agent-fleet-swe-rebench-v2` is the canonical local alias for output from the
+official adapter under `Tasks/SWE-rebench-v2`. It intentionally has no built-in
+task list and requires an explicit `DATASET_PATH`. The alias also selects the
+portable verifier runtime bundle on every supported backend. The runner stores
+that trusted bundle under `AGENT_FLEET_CACHE_DIR/verifier-runtimes`, separately
+from `LOCAL_WHEEL_DIR`, so verifier preparation does not change the selected
+Agent dependency source.
+
 Typical dataset paths:
 
 | Dataset | `DATASET_NAME` | `DATASET_PATH` | Metric | Suggested workers |
@@ -175,6 +190,7 @@ Typical dataset paths:
 | SWE-Smith | `smith` | `/workspace/harbor/datasets/swesmith` | reward | `80` |
 | Terminal-Bench 2.1 | `terminalbench21` | `/workspace/terminal-bench-2-1/tasks` | success rate | `20` |
 | SWE-bench Verified | `sweverify` | `/workspace/swebench-verified` | success rate | `20` |
+| Official SWE-rebench-V2 | `agent-fleet-swe-rebench-v2` | materialized adapter output | reward | start with `1` |
 | Harbor registry dataset | `owner/name` or `owner/name@version` | unset | set `METRIC_MODE` if needed | runner concurrency |
 
 ## Main Variables
@@ -188,7 +204,7 @@ Typical dataset paths:
 | `HARBOR_TEMPERATURE` | OpenCode sampling temperature for fixed benchmark runs; unset by default |
 | `HARBOR_TOP_P` | OpenCode nucleus-sampling value for fixed benchmark runs; unset by default |
 | `HARBOR_MAX_TOKENS` | Maximum output tokens for OpenCode, Claude Code, or Pi fixed benchmark runs; defaults to existing agent limits when unset |
-| `DATASET_NAME` | Built-in local dataset selector, or Harbor registry dataset id |
+| `DATASET_NAME` | Built-in selector, canonical local alias, or Harbor registry dataset id |
 | `DATASET_PATH` | Local dataset directory |
 | `TASK_SOURCE_FILE` | Explicit task list path |
 | `FLEET_TASKS` | Internal normalized exact task selection from `run_fleet.sh`; unsupported with `ROLLOUT=1` |
@@ -237,7 +253,8 @@ configuration to `OPIK_URL`. An empty `OPIK_URL` still disables tracing.
 | `HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER` | Agent setup timeout multiplier |
 | `HARBOR_OPENSANDBOX_IMAGE_REF` | Legacy explicit single-image override; it must be fully qualified under `YICLOUD_HARBOR_HOST` |
 | `HARBOR_OPENSANDBOX_BUNDLE_MANIFEST` | Optional versioned service Bundle Manifest; every service image must be fully qualified under `YICLOUD_HARBOR_HOST` |
-| `HARBOR_OPENSANDBOX_BENCHMARK` | Benchmark identifier recorded in generated Bundles and consumed by the thin verifier-runtime bundle selector |
+| `HARBOR_OPENSANDBOX_BENCHMARK` | Benchmark identifier recorded in generated OpenSandbox Bundles and used for image/cache identity |
+| `HARBOR_VERIFIER_BENCHMARK` | Dataset identity used only to select a verifier runtime bundle; rollout workers set it per request without replacing the OpenSandbox image/cache identity |
 | `HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT` | H-local Registry records, image locks, build logs, and immutable Bundle cache root |
 | `HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE` | Dataset prebuild local uploaded-Bundle index switch; defaults to `1` and avoids Registry lookup after a content-hash match |
 | `HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION` | Trust a matching target/task entry in the local uploaded-Bundle index without parsing or hashing task content; defaults to `0` |

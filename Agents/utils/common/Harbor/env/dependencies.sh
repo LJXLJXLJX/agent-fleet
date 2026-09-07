@@ -297,7 +297,7 @@ harbor_build_verifier_runtime_bundle() {
     || [[ ! -x "$HARBOR_OPIK_PYTHON" ]] \
     || ! PYTHON_BIN="$HARBOR_OPIK_PYTHON" \
       "$HARBOR_OPIK_PYTHON" "$VERIFIER_RUNTIME_BUNDLE_PREPARER" build \
-    --cache-dir "$HARBOR_CC_PY_WHEEL_DIR_SOURCE" \
+    --cache-dir "$VERIFIER_RUNTIME_BUNDLE_CACHE_DIR" \
     --output "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE"; then
     echo "failed to prepare verifier runtime bundle: $VERIFIER_RUNTIME_BUNDLE_ID" >&2
     return 1
@@ -311,7 +311,9 @@ harbor_build_verifier_runtime_bundle() {
 harbor_prepare_verifier_runtime_bundle() {
   harbor_build_verifier_runtime_bundle || return 1
   verifier_runtime_bundle_required || return 0
-  harbor_prewarm_s3_upload_sources "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE"
+  if [[ "$HARBOR_ENVIRONMENT_TYPE" == "opensandbox" ]]; then
+    harbor_prewarm_s3_upload_sources "$VERIFIER_RUNTIME_BUNDLE_ARCHIVE_SOURCE"
+  fi
 }
 
 harbor_prepare_or_select_wheels() {
@@ -352,6 +354,11 @@ harbor_prepare_or_select_wheels() {
       touch "$WORKERS_FAILED_FILE"
       return 1
     fi
+    harbor_build_verifier_runtime_bundle || {
+      echo "failed" > "$status_file"
+      touch "$WORKERS_FAILED_FILE"
+      return 1
+    }
     echo "using remote wheel cache: $remote_url"
     harbor_write_effective_wheel_source "$remote_url"
     echo "remote" > "$status_file"
@@ -406,7 +413,7 @@ harbor_prepare_agent_runtime() {
   if [[ "$HARBOR_ENVIRONMENT_TYPE" == "e2b" || "$HARBOR_ENVIRONMENT_TYPE" == "qz" ]]; then
     mkdir -p "$RUNTIME_DIR"
     rm -f "$WORKERS_FAILED_FILE" "$HARBOR_RUNNER_PREPARE_STATUS_FILE"
-    if harbor_validate_runner_cli; then
+    if harbor_build_verifier_runtime_bundle && harbor_validate_runner_cli; then
       touch "$WORKERS_READY_FILE"
       return 0
     fi

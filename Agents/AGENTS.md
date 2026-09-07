@@ -55,12 +55,15 @@ restarting.
 | SWE-Smith | `smith` | `/workspace/harbor/datasets/swesmith` | 80 |
 | Terminal-Bench 2.1 | `terminalbench21` | `/workspace/terminal-bench-2-1/tasks` | 20 |
 | SWE-bench Verified | `sweverify` | `/workspace/swebench-verified` | 20 |
+| Official SWE-rebench-V2 | `agent-fleet-swe-rebench-v2` | materialized adapter output | start with 1 |
 
 `seta`, `terminalbench21`, and `sweverify` resolve to registry datasets by
-default; `smith` stays local. Registry IDs such as `tmax/TMax-15K-Harbor`
-also work. Registry runs bypass local task lists. Use `DATASET_NAME=auto`
-with `DATASET_PATH` for local data; `TASK_SOURCE_FILE=<path>` overrides the
-local task list under `Tasks/`. See [Tasks/AGENTS.md](../Tasks/AGENTS.md).
+default; `smith` and `agent-fleet-swe-rebench-v2` stay local. The Rebench
+alias requires `DATASET_PATH` to point at output materialized by the official
+adapter. Registry IDs such as `tmax/TMax-15K-Harbor` also work. Registry runs
+bypass local task lists. Use `DATASET_NAME=auto` with `DATASET_PATH` for other
+local data; `TASK_SOURCE_FILE=<path>` overrides the local task list under
+`Tasks/`. See [Tasks/AGENTS.md](../Tasks/AGENTS.md).
 
 ### Sandbox Backends
 

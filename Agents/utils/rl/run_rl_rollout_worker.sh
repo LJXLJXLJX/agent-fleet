@@ -6,7 +6,6 @@ HARBOR_SCRIPT_DIR="${HARBOR_SCRIPT_DIR:-$(cd "$RL_SCRIPT_DIR/../common/Harbor" &
 . "$HARBOR_SCRIPT_DIR/env.sh"
 
 WORKER_ID="${1:?worker id required}"
-WORKER_STARTUP_ENVIRONMENT_TYPE="$HARBOR_ENVIRONMENT_TYPE"
 PENDING_DIR="$RL_QUEUE_DIR/pending"
 ACTIVE_QUEUE_DIR="$RL_QUEUE_DIR/active"
 RESULTS_DIR="$RL_QUEUE_DIR/results"
@@ -60,10 +59,8 @@ json_build_result() {
 }
 
 prepare_request_verifier_runtime_bundle() {
-  if [[ "$HARBOR_ENVIRONMENT_TYPE" != "opensandbox" \
-    || "$WORKER_STARTUP_ENVIRONMENT_TYPE" == "opensandbox" ]]; then
-    return 0
-  fi
+  local dataset_name="${1:?request dataset name required}"
+  export HARBOR_VERIFIER_BENCHMARK="$dataset_name"
   resolve_verifier_runtime_bundle "$(select_verifier_runtime_bundle)"
   harbor_prepare_verifier_runtime_bundle
 }
@@ -196,6 +193,7 @@ while true; do
   request_file_id="${request_file_id:-$request_id}"
   task_name="$(json_get "$request_file" task_id)"
   dataset_root="$(json_get "$request_file" dataset_root)"
+  dataset_name="$(json_get "$request_file" dataset_name)"
   model_name="$(json_get "$request_file" model_name)"
   api_base="$(json_get_first "$request_file" api_base trial_config.agent.kwargs.api_base)"
   api_key="${RL_API_KEY:-${API_KEY:-}}"
@@ -294,7 +292,7 @@ while true; do
       # environment import path.
       export HARBOR_ENVIRONMENT_SPEC="$environment_type"
     fi
-    if ! prepare_request_verifier_runtime_bundle; then
+    if ! prepare_request_verifier_runtime_bundle "$dataset_name"; then
       echo "[ERROR] failed to prepare verifier runtime bundle for request backend: $environment_type" >&2
       exit 1
     fi

@@ -71,6 +71,7 @@ exit "$(cat "$stub_dir/pi-exit.txt")"
             """#!/usr/bin/env bash
 printf 'runner=harbor\\n'
 printf 'DATASET_NAME=%s\\n' "${DATASET_NAME-}"
+printf 'DATASET_PATH=%s\\n' "${DATASET_PATH-}"
 printf 'AGENT=%s\\n' "${AGENT-}"
 printf 'TOTAL_WORKERS=%s\\n' "${TOTAL_WORKERS-}"
 printf 'FLEET_TASKS=%s\\n' "${FLEET_TASKS-}"
@@ -236,6 +237,25 @@ exit "${STUB_EXIT:-0}"
         self.assertIn("AGENT=pi", result.stdout)
         self.assertIn("TOTAL_WORKERS=3", result.stdout)
 
+    def test_prompt_routes_official_swe_rebench_exact_task(self):
+        result = self.run_goal(
+            "--prompt",
+            "Run official SWE-rebench-V2 task owner__repository-123",
+            response=self.response(
+                spec={
+                    "schema_version": 1,
+                    "taskset": "agent-fleet-swe-rebench-v2",
+                    "task": "owner__repository-123",
+                }
+            ),
+            extra_env={"DATASET_PATH": "/datasets/swe-rebench-v2"},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DATASET_NAME=agent-fleet-swe-rebench-v2", result.stdout)
+        self.assertIn("DATASET_PATH=/datasets/swe-rebench-v2", result.stdout)
+        self.assertIn("FLEET_TASKS=owner__repository-123", result.stdout)
+
     def test_prompt_preserves_and_normalizes_explicit_task_names(self):
         output = self.root / "fleet-spec.json"
         result = self.run_goal(
@@ -367,6 +387,8 @@ exec {shlex.quote(str(self.bin_dir / "pi"))} "$@"
         self.assertIn("return ready=false", captured)
         self.assertIn("never infer a taskset", captured)
         self.assertIn("another registry id", captured)
+        self.assertIn("Map unqualified or official SWE-rebench-V2", captured)
+        self.assertIn("third-party TaskTrove dataset", captured)
         self.assertIn('"specs"', captured)
         self.assertIn('"maxItems": 16', captured)
 

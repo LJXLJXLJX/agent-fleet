@@ -177,6 +177,35 @@ class HarborTaskSelectionTest(unittest.TestCase):
             )
             self.assertIn("set DATASET_PATH", result.stderr)
 
+    def test_swe_rebench_alias_requires_explicit_dataset_path(self) -> None:
+        result = self.run_env(
+            "harbor_ensure_dataset",
+            DATASET_NAME="agent-fleet-swe-rebench-v2",
+            DATASET_PATH="",
+            OPIK_URL="",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "DATASET_PATH is required for taskset agent-fleet-swe-rebench-v2",
+            result.stderr,
+        )
+        self.assertIn("Tasks/SWE-rebench-v2", result.stderr)
+
+        exact_selection = self.run_env(
+            "harbor_validate_task_selection",
+            DATASET_NAME="agent-fleet-swe-rebench-v2",
+            DATASET_PATH="",
+            FLEET_TASKS="owner__repository-123",
+            OPIK_URL="",
+        )
+
+        self.assertEqual(exact_selection.returncode, 2)
+        self.assertIn(
+            "DATASET_PATH is required for taskset agent-fleet-swe-rebench-v2",
+            exact_selection.stderr,
+        )
+
     def test_reset_removes_generated_benchmark_and_fixer_summaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output, common = self.local_fixture(Path(tmp), "task-a")

@@ -24,8 +24,9 @@ PI_PROVIDER="${PI_PROVIDER:-}"
 HARBOR_ROOT="${HARBOR_ROOT:-/workspace/harbor}"
 # Dataset selection:
 #   DATASET_NAME: auto, seta, smith, terminalbench21, sweverify,
-#     or a Harbor registry dataset id such as owner/name or owner/name@version.
-#     seta, terminalbench21, and sweverify are registry aliases. smith is local.
+#     agent-fleet-swe-rebench-v2, or a Harbor registry dataset id such as
+#     owner/name or owner/name@version. seta, terminalbench21, and sweverify
+#     are registry aliases. smith and agent-fleet-swe-rebench-v2 are local.
 #     For a local/offline checkout, use auto so the dataset is inferred from
 #     DATASET_PATH.
 #   DATASET_PATH examples:

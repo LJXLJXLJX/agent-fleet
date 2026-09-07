@@ -10,6 +10,7 @@ mkdir -p \
   "$tmp/bin" \
   "$tmp/dataset/0/environment" \
   "$tmp/dataset/1/environment" \
+  "$tmp/cache/verifier-runtimes" \
   "$tmp/deps/wheels" \
   "$tmp/home"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$tmp/bin/uv"
@@ -60,7 +61,7 @@ chmod +x \
   "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/harbor-verifier-bundle-check"
 ln -s python3.12 "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python3"
 ln -s python3.12 "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python"
-tar -czf "$tmp/deps/wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" \
+tar -czf "$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" \
   -C "$tmp/verifier-bundle" agent-fleet-swe-rebench-v2-verifier-bundle
 printf '# fake Exa MCP\n' > "$tmp/deps/exa_web_mcp.py"
 
@@ -90,6 +91,7 @@ run_dry() {
   env -i \
     PATH="$tmp/bin:/usr/bin:/bin" \
     HOME="$tmp/home" \
+    AGENT_FLEET_CACHE_DIR="$tmp/cache" \
     AGENT="$agent" \
     DATASET_NAME="$dataset_name" \
     DATASET_PATH="$tmp/dataset" \
@@ -161,7 +163,7 @@ rebench="$(run_dry \
   agent-fleet-swe-rebench-v2)"
 grep -F -- '[INFO] OpenSandbox verifier runtime bundle: benchmark=agent-fleet-swe-rebench-v2 bundle=agent-fleet-swe-rebench-v2-verifier-bundle' \
   <<< "$rebench" >/dev/null
-grep -F -- 'HARBOR_VERIFIER_PATH_PREPEND=/tmp/harbor-verifier-bundles/agent-fleet-swe-rebench-v2-verifier-bundle/bin:' \
+grep -F -- 'HARBOR_VERIFIER_PATH_PREPEND=/root/.local/bin:' \
   <<< "$rebench" >/dev/null
 grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_ID=agent-fleet-swe-rebench-v2-verifier-bundle' \
   <<< "$rebench" >/dev/null
@@ -169,25 +171,37 @@ if grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_KIND=' <<< "$rebench" >/dev/null; 
   echo 'Rebench verifier runtime bundle unexpectedly exposes a kind' >&2
   exit 1
 fi
-grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_ARCHIVE=/opt/tb-opik/python-wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz' \
+grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_ARCHIVE=/opt/agent-fleet/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz' \
   <<< "$rebench" >/dev/null
 grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_ROOT=/tmp/harbor-verifier-bundles/agent-fleet-swe-rebench-v2-verifier-bundle' \
   <<< "$rebench" >/dev/null
-grep -F -- "$tmp/deps/wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" \
+grep -F -- 'HARBOR_VERIFIER_PYTHON=/tmp/harbor-verifier-bundles/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python' \
   <<< "$rebench" >/dev/null
-grep -F -- '/opt/tb-opik/python-wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz' \
+grep -F -- "$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" \
+  <<< "$rebench" >/dev/null
+grep -F -- '/opt/agent-fleet/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz' \
   <<< "$rebench" >/dev/null
 if grep -F -- 'FAKE_HARBOR_ARG=PATH=' <<< "$rebench" >/dev/null; then
   echo 'Rebench OpenSandbox verifier unexpectedly replaces the task image PATH' >&2
   exit 1
 fi
+if grep -F -- 'HARBOR_VERIFIER_PATH_PREPEND=/tmp/harbor-verifier-bundles/' \
+  <<< "$rebench" >/dev/null; then
+  echo 'Rebench parser runtime unexpectedly overrides the task test PATH' >&2
+  exit 1
+fi
 
 rebench_agent="$(run_dry \
   'test-project/manual:immutable' "$tmp/does-not-exist.py" '{}' \
-  agent-fleet-swe-rebench-v2 opensandbox 0 claude-code)"
-grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_ARCHIVE=/opt/tb-opik/python-wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz' \
+  agent-fleet-swe-rebench-v2 opensandbox 0 claude-code 0)"
+grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_ARCHIVE=/opt/agent-fleet/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz' \
   <<< "$rebench_agent" >/dev/null
-grep -F -- "\"source\":\"$tmp/deps/wheels\",\"target\":\"/opt/tb-opik/python-wheels\",\"read_only\":true" \
+grep -F -- "\"source\": \"$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz\"" \
+  <<< "$rebench_agent" >/dev/null
+grep -F -- '"target": "/opt/agent-fleet/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz"' \
+  <<< "$rebench_agent" >/dev/null
+grep -F -- "\"source\": \"$tmp/deps/wheels\"" <<< "$rebench_agent" >/dev/null
+grep -F -- '"target": "/opt/tb-opik/python-wheels"' \
   <<< "$rebench_agent" >/dev/null
 
 set +e
@@ -212,16 +226,16 @@ if grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_' \
   exit 1
 fi
 
-mv "$tmp/deps/wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" \
-  "$tmp/deps/wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz.saved"
+mv "$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" \
+  "$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz.saved"
 set +e
 missing_rebench_runtime="$(run_dry \
   'test-project/manual:immutable' "$tmp/does-not-exist.py" '{}' \
   agent-fleet-swe-rebench-v2)"
 missing_rebench_status="$?"
 set -e
-mv "$tmp/deps/wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz.saved" \
-  "$tmp/deps/wheels/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz"
+mv "$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz.saved" \
+  "$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz"
 if [[ "$missing_rebench_status" == "0" ]]; then
   echo 'Rebench OpenSandbox verifier unexpectedly accepted a missing runtime' >&2
   exit 1
@@ -301,6 +315,32 @@ if grep -F -- '--ek image_ref=' <<< "$docker_run" >/dev/null; then
   echo 'Docker command unexpectedly contains OpenSandbox image arguments' >&2
   exit 1
 fi
+
+docker_rebench="$(run_dry \
+  '' "$tmp/does-not-exist.py" '{}' agent-fleet-swe-rebench-v2 docker)"
+grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_ARCHIVE=/opt/agent-fleet/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz' \
+  <<< "$docker_rebench" >/dev/null
+grep -F -- 'HARBOR_VERIFIER_PYTHON=/tmp/harbor-verifier-bundles/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python' \
+  <<< "$docker_rebench" >/dev/null
+grep -F -- "$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" \
+  <<< "$docker_rebench" >/dev/null
+
+docker_rebench_opencode="$(run_dry \
+  '' "$tmp/does-not-exist.py" '{}' agent-fleet-swe-rebench-v2 docker 0 \
+  opencode)"
+grep -F -- "\"source\":\"$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz\"" \
+  <<< "$docker_rebench_opencode" >/dev/null
+grep -F -- '"target":"/opt/agent-fleet/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz"' \
+  <<< "$docker_rebench_opencode" >/dev/null
+
+e2b_rebench="$(run_dry \
+  '' "$tmp/does-not-exist.py" '{}' agent-fleet-swe-rebench-v2 e2b)"
+grep -F -- '[INFO] e2b verifier runtime bundle will be uploaded after sandbox start' \
+  <<< "$e2b_rebench" >/dev/null
+grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_ARCHIVE=/opt/agent-fleet/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz' \
+  <<< "$e2b_rebench" >/dev/null
+grep -F -- 'HARBOR_VERIFIER_PYTHON=/tmp/harbor-verifier-bundles/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python' \
+  <<< "$e2b_rebench" >/dev/null
 
 automatic_seta="$(run_dry '' "$HARBOR_DIR/opensandbox_image_manager.py" '{}' seta)"
 grep -E -- '--ek image_ref=harbor\.example\.internal/test-project/0@sha256:[0-9a-f]{64}' \

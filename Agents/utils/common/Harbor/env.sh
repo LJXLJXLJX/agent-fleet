@@ -13,6 +13,8 @@ API_KEY="${API_KEY:-xxx}"
 # Registry: seta, terminalbench21, sweverify, or owner/name[@version].
 # Local data: DATASET_NAME=auto and DATASET_PATH pointing to the task directory.
 DATASET_NAME="${DATASET_NAME:-auto}"
+_HARBOR_DATASET_PATH_CONFIGURED=0
+[[ -z "${DATASET_PATH:-}" ]] || _HARBOR_DATASET_PATH_CONFIGURED=1
 DATASET_PATH="${DATASET_PATH:-/workspace/seta-env/Harbor-Dataset}"
 TOTAL_WORKERS="${TOTAL_WORKERS:-10}"
 # Optional: one-task canary and Opik tracing (empty URL disables upload).

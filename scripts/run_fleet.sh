@@ -32,8 +32,9 @@ Usage:
 Short flags: -t --taskset, -a --agent, -n --workers, -s --spec, -p --prompt,
              -o --output, -d --detach; --task has no short form
 
-Tasksets: seta, smith, terminalbench21, sweverify, a registry id, a local
-          path (./dir), or the OpenClaw tasksets: pinchbench, clawbio
+Tasksets: seta, smith, terminalbench21, sweverify,
+          agent-fleet-swe-rebench-v2, a registry id, a local path (./dir),
+          or the OpenClaw tasksets: pinchbench, clawbio
 Agents:   claude-code, opencode, pi; openclaw for OpenClaw tasksets
 Use --task=<name> when a task ID begins with a dash.
 
@@ -140,7 +141,7 @@ fi
 [[ -n "$TASKSET" ]] || { usage >&2; exit 2; }
 if [[ -n "$FLEET_TASK" ]]; then
   case "$TASKSET" in
-    seta|smith|terminalbench21|sweverify|pinchbench|clawbio|/*|./*|../*|.|..|\~/*) ;;
+    seta|smith|terminalbench21|sweverify|agent-fleet-swe-rebench-v2|pinchbench|clawbio|/*|./*|../*|.|..|\~/*) ;;
     *)
       printf '[ERROR] --task is unsupported for Harbor registry taskset: %s\n' "$TASKSET" >&2
       exit 2

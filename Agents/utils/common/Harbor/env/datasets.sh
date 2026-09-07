@@ -4,8 +4,19 @@ set -euo pipefail
 # Dataset resolution, task selection, and queue claims.
 # Sourced by ../env.sh; SCRIPT_DIR remains the Harbor directory.
 
+harbor_validate_dataset_path_configuration() {
+  if [[ "$DATASET_NAME" == "agent-fleet-swe-rebench-v2" ]] &&
+     [[ "$_HARBOR_DATASET_PATH_CONFIGURED" != "1" ]]; then
+    printf '%s\n' \
+      "[ERROR] DATASET_PATH is required for taskset agent-fleet-swe-rebench-v2" \
+      "[ERROR] point DATASET_PATH at materialized output from Tasks/SWE-rebench-v2" >&2
+    return 1
+  fi
+}
+
 harbor_generate_task_file() {
   local destination="${1:-$TASK_FILE}" source_file=""
+  harbor_validate_dataset_path_configuration || return 1
   # Explicit local paths must be validated against the checkout the user
   # selected, not a similarly named repository manifest.
   if [[ -n "$TASK_SOURCE_FILE" || -z "$FLEET_TASKS" || "$DATASET_NAME" != "auto" ]]; then
@@ -226,6 +237,7 @@ harbor_task_count() {
 
 harbor_ensure_dataset() {
   local dataset_kind
+  harbor_validate_dataset_path_configuration || return 1
   dataset_kind="$(harbor_dataset_kind)"
 
   if harbor_uses_registry_dataset; then
