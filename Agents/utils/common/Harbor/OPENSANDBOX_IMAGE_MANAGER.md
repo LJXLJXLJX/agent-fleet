@@ -164,6 +164,13 @@ also not persisted. Credentials come from the ignored
 Docker config fallback and are never written to Bundle files. Sandbox tokens
 and model credentials are outside this layer.
 
+The optional `HARBOR_OPENSANDBOX_PUB_HOSTED_URL` and
+`HARBOR_OPENSANDBOX_JULIA_PKG_SERVER` settings accept any build-reachable,
+query-free HTTP(S) package service. They are injected as the ecosystem-native
+`PUB_HOSTED_URL` and `JULIA_PKG_SERVER` build arguments, respectively. This is
+provider-neutral: either setting may point to a trusted third-party mirror or a
+cache gateway. Leaving it empty preserves the ecosystem's own default.
+
 When `HARBOR_OPENSANDBOX_GITHUB_MIRROR_URL` names a GitHub Smart HTTP mirror
 prefix, the manager injects transient Git
 `url.*.insteadOf` entries through a BuildKit secret mounted as `/etc/gitconfig`

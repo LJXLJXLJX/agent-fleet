@@ -35,6 +35,7 @@ from opensandbox_image_manager import (
     normalize_oci_image_config,
     oci_archive_image_config,
     package_source_build_args,
+    package_source_hosts,
     parse_apt_source_overrides,
     parse_args,
     prepare,
@@ -142,6 +143,38 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
         self.assertEqual(
             args.cargo_registry_url,
             "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/",
+        )
+        self.assertEqual(args.pub_hosted_url, "")
+        self.assertEqual(args.julia_pkg_server, "")
+
+    def test_cli_reads_dart_and_julia_sources_from_environment(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HARBOR_OPENSANDBOX_PUB_HOSTED_URL": (
+                    "https://third-party.example/dart/pub"
+                ),
+                "HARBOR_OPENSANDBOX_JULIA_PKG_SERVER": (
+                    "https://third-party.example/julia/pkg"
+                ),
+            },
+            clear=True,
+        ):
+            args = parse_args(
+                [
+                    "--task-dir",
+                    "/tmp/example-task",
+                    "--project",
+                    "test-project",
+                    "--dry-run",
+                ]
+            )
+
+        self.assertEqual(
+            args.pub_hosted_url, "https://third-party.example/dart/pub"
+        )
+        self.assertEqual(
+            args.julia_pkg_server, "https://third-party.example/julia/pkg"
         )
 
     def test_prepare_requires_registry_from_cli_or_environment(self) -> None:
@@ -503,6 +536,63 @@ networks:
 
         self.assertEqual(http_args["PIP_TRUSTED_HOST"], "packages.internal")
         self.assertNotIn("PIP_TRUSTED_HOST", https_args)
+
+    def test_dart_and_julia_sources_accept_provider_neutral_urls(self) -> None:
+        build_args = package_source_build_args(
+            Namespace(
+                pub_hosted_url="https://third-party.example/dart/pub",
+                julia_pkg_server="http://cache.internal:8080/julia/pkg",
+            ),
+            "host",
+        )
+        rendered = render_build_dockerfile(
+            "FROM dart:stable\nRUN dart pub get\n"
+            "FROM julia:1\nRUN julia -e 'using Pkg; Pkg.instantiate()'\n",
+            dockerhub_mirror_prefix="m.daocloud.io/docker.io",
+            apt_mirror="https://mirrors.tuna.tsinghua.edu.cn",
+            package_build_args=build_args,
+        )
+
+        self.assertEqual(
+            build_args["PUB_HOSTED_URL"],
+            "https://third-party.example/dart/pub",
+        )
+        self.assertEqual(
+            build_args["JULIA_PKG_SERVER"],
+            "http://cache.internal:8080/julia/pkg",
+        )
+        self.assertEqual(rendered.count("ARG PUB_HOSTED_URL"), 2)
+        self.assertEqual(rendered.count("ARG JULIA_PKG_SERVER"), 2)
+        self.assertNotIn("ENV PUB_HOSTED_URL", rendered)
+        self.assertNotIn("ENV JULIA_PKG_SERVER", rendered)
+        self.assertEqual(
+            package_source_hosts(build_args),
+            {
+                "cache.internal",
+                "goproxy.cn",
+                "mirrors.tuna.tsinghua.edu.cn",
+                "pypi.tuna.tsinghua.edu.cn",
+                "registry.npmmirror.com",
+                "sum.golang.google.cn",
+                "third-party.example",
+            },
+        )
+
+    def test_dart_and_julia_sources_are_omitted_when_unconfigured(self) -> None:
+        build_args = package_source_build_args(Namespace(), "host")
+
+        self.assertNotIn("PUB_HOSTED_URL", build_args)
+        self.assertNotIn("JULIA_PKG_SERVER", build_args)
+
+    def test_dart_and_julia_sources_reject_embedded_credentials(self) -> None:
+        for field, value in (
+            ("pub_hosted_url", "https://user:secret@packages.example/dart"),
+            ("julia_pkg_server", "https://user:secret@packages.example/julia"),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, "without credentials"
+            ):
+                package_source_build_args(Namespace(**{field: value}), "host")
 
     def test_github_mirror_uses_transient_secret_mount_for_submodules(self) -> None:
         mirror = validate_github_mirror_url(

@@ -210,8 +210,13 @@ claim that historical OCI layers are byte-for-byte free of build mirror
 strings. Unconfigured third-party URLs remain task-authored and are not
 rewritten.
 
-Other package sources such as pip, npm, Go, Cargo, and Rustup retain their
-existing Docker build-argument behavior and are not part of the APT cleanup.
+Other package sources such as pip, npm, Go, Cargo, Rustup, Dart Pub, and Julia
+retain their Docker build-argument behavior and are not part of the APT cleanup.
+`HARBOR_OPENSANDBOX_PUB_HOSTED_URL` and
+`HARBOR_OPENSANDBOX_JULIA_PKG_SERVER` are optional provider-neutral URLs. When
+configured, the manager passes them to Dockerfile `RUN` instructions as
+`PUB_HOSTED_URL` and `JULIA_PKG_SERVER`; they may name a trusted third-party
+service or a cache gateway and are not persisted in the published image.
 
 Prebuild performs a bounded BuildKit cache prune before starting and every 30
 minutes while it runs. Defaults are `max-used-space=500GB`,

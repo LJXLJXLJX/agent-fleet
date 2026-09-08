@@ -1045,6 +1045,16 @@ def package_source_build_args(
         "rustup update root",
         build_network,
     )
+    pub_hosted_url = getattr(args, "pub_hosted_url", "").strip()
+    if pub_hosted_url:
+        pub_hosted_url = _validate_source_url(
+            pub_hosted_url, "Dart Pub hosted source", build_network
+        )
+    julia_pkg_server = getattr(args, "julia_pkg_server", "").strip()
+    if julia_pkg_server:
+        julia_pkg_server = _validate_source_url(
+            julia_pkg_server, "Julia package server", build_network
+        )
 
     goproxy = getattr(args, "goproxy", DEFAULT_GOPROXY).strip()
     if not goproxy:
@@ -1082,6 +1092,10 @@ def package_source_build_args(
         "RUSTUP_DIST_SERVER": rustup_dist,
         "RUSTUP_UPDATE_ROOT": rustup_update,
     }
+    if pub_hosted_url:
+        build_args["PUB_HOSTED_URL"] = pub_hosted_url
+    if julia_pkg_server:
+        build_args["JULIA_PKG_SERVER"] = julia_pkg_server
     parsed_pip_index = urlparse(pip_index)
     if parsed_pip_index.scheme == "http":
         build_args["PIP_TRUSTED_HOST"] = parsed_pip_index.hostname or ""
@@ -3011,6 +3025,22 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=os.environ.get(
             "HARBOR_OPENSANDBOX_RUSTUP_UPDATE_ROOT",
             DEFAULT_RUSTUP_UPDATE_ROOT,
+        ),
+    )
+    parser.add_argument(
+        "--pub-hosted-url",
+        default=os.environ.get("HARBOR_OPENSANDBOX_PUB_HOSTED_URL", ""),
+        help=(
+            "optional build-only Dart Pub hosted source; accepts any "
+            "build-reachable HTTP(S) package service"
+        ),
+    )
+    parser.add_argument(
+        "--julia-pkg-server",
+        default=os.environ.get("HARBOR_OPENSANDBOX_JULIA_PKG_SERVER", ""),
+        help=(
+            "optional build-only Julia package server; accepts any "
+            "build-reachable HTTP(S) package service"
         ),
     )
     parser.add_argument(
