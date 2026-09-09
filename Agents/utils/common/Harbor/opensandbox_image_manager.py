@@ -159,7 +159,7 @@ SHELL_WRAPPED_COMMAND = re.compile(
     r"(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S+|command|exec|sudo|env)\s+)*"
     r"(?:[^\s;&|]+/)?(?:sh|bash)\s+"
     r"-[A-Za-z]*c[A-Za-z]*\s+"
-    r"(?P<command>'[^']*'|\"[^\"]*\")",
+    r"(?P<command>'[^']*'|\"(?:\\.|[^\"\\])*\")",
     re.IGNORECASE | re.DOTALL,
 )
 APT_SOURCE_FILE_REFERENCE = re.compile(
@@ -217,9 +217,9 @@ APT_COMMAND = re.compile(
     r"(?:"
     r"(?:^|[;&|])\s*(?:RUN\s+)?"
     r"(?:(?:--mount=\S+|[A-Za-z_][A-Za-z0-9_]*=\S+|"
-    r"if|then|do|command|exec|sudo|env)\s+)*"
-    r"(?:[^\s;&|]+/)?apt(?:-get)?(?=\s|$)"
-    r'|^\s*RUN\s+\[\s*"(?:[^"]*/)?apt(?:-get)?"\s*[,\]]'
+    r"if|then|do|command|exec|sudo|env)\s+|\((?!\()\s*)*"
+    r"(?P<shell_apt>(?:[^\s;&|]+/)?apt(?:-get)?)(?=\s|$)"
+    r'|^\s*RUN\s+\[\s*"(?P<exec_apt>(?:[^"]*/)?apt(?:-get)?)"\s*[,\]]'
     r")",
     re.IGNORECASE,
 )
@@ -409,10 +409,112 @@ def run_heredoc_specs(
     return specs
 
 
+def shell_offset_is_executable(source: str, offset: int) -> bool:
+    """Return whether an offset is executable shell text, not data or a comment."""
+    quote: str | None = None
+    substitutions: list[tuple[str, str | None, int]] = []
+    comment = False
+    at_word_start = True
+    index = 0
+    while index < offset:
+        character = source[index]
+        if comment:
+            if character == "\n":
+                comment = False
+                at_word_start = True
+            index += 1
+            continue
+        if quote == "'":
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if source.startswith("$(", index):
+                substitutions.append(("paren", quote, 1))
+                quote = None
+                at_word_start = True
+                index += 2
+                continue
+            if character == "`":
+                substitutions.append(("backtick", quote, 0))
+                quote = None
+                at_word_start = True
+                index += 1
+                continue
+            if character == "\\" and index + 1 < offset:
+                index += 2
+                continue
+            if character == '"':
+                quote = None
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            at_word_start = False
+            index += 1
+            continue
+        if source.startswith("$(", index):
+            substitutions.append(("paren", quote, 1))
+            at_word_start = True
+            index += 2
+            continue
+        if character == "\\":
+            if index + 1 >= offset:
+                return False
+            at_word_start = False
+            index += 2
+            continue
+        if character == "`":
+            if substitutions and substitutions[-1][0] == "backtick":
+                _kind, resume_quote, _depth = substitutions.pop()
+                quote = resume_quote
+                at_word_start = False
+            else:
+                substitutions.append(("backtick", quote, 0))
+                at_word_start = True
+            index += 1
+            continue
+        if character == "#" and at_word_start:
+            comment = True
+            index += 1
+            continue
+        if substitutions and substitutions[-1][0] == "paren" and character == "(":
+            kind, resume_quote, depth = substitutions[-1]
+            substitutions[-1] = (kind, resume_quote, depth + 1)
+            at_word_start = True
+            index += 1
+            continue
+        if substitutions and substitutions[-1][0] == "paren" and character == ")":
+            kind, resume_quote, depth = substitutions[-1]
+            if depth == 1:
+                substitutions.pop()
+                quote = resume_quote
+                at_word_start = False
+            else:
+                substitutions[-1] = (kind, resume_quote, depth - 1)
+                at_word_start = True
+            index += 1
+            continue
+        at_word_start = character.isspace() or character in ";&|()<>"
+        index += 1
+    return not comment and quote is None
+
+
+def apt_command_search(source: str) -> bool:
+    """Return whether source contains an unquoted shell or exec-form APT call."""
+    for match in APT_COMMAND.finditer(source):
+        if match.group("exec_apt") is not None:
+            return True
+        if shell_offset_is_executable(source, match.start("shell_apt")):
+            return True
+    return False
+
+
 def run_invokes_apt(source: str) -> bool:
     """Recognize direct and statically visible shell-wrapped APT commands."""
     source = re.sub(r"\\\r?\n", " ", source)
-    if APT_COMMAND.search(source):
+    if apt_command_search(source):
         return True
 
     exec_form = RUN_EXEC_FORM.match(source)
@@ -433,10 +535,11 @@ def run_invokes_apt(source: str) -> bool:
                     and "c" in argument[1:]
                     and index + 1 < len(argv)
                 ):
-                    return APT_COMMAND.search(argv[index + 1]) is not None
+                    return apt_command_search(argv[index + 1])
 
     return any(
-        APT_COMMAND.search(match.group("command")[1:-1]) is not None
+        shell_offset_is_executable(source, match.start())
+        and apt_command_search(match.group("command")[1:-1])
         for match in SHELL_WRAPPED_COMMAND.finditer(source)
     )
 

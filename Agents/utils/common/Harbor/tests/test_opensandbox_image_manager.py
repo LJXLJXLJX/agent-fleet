@@ -783,6 +783,95 @@ networks:
             rendered.index(injected[1][0]), rendered.index("apt-get update")
         )
 
+    def test_render_detects_parenthesized_apt_run(self) -> None:
+        task_run = "RUN ( apt-get update -qq ) || true"
+        rendered = render_build_dockerfile(
+            f"FROM ubuntu:24.04\n{task_run}\n",
+            dockerhub_mirror_prefix="registry.internal/public-mirror",
+            apt_mirror="http://apt-mirror.internal/repos",
+        )
+
+        injected = injected_shell_runs(rendered)
+        self.assertEqual(len(injected), 2)
+        task_run_offset = rendered.index(task_run)
+        self.assertLess(rendered.index(injected[0][0]), task_run_offset)
+        self.assertGreater(rendered.index(injected[1][0]), task_run_offset)
+
+    def test_render_detects_parenthesized_apt_after_control_keywords(self) -> None:
+        for task_run in (
+            "RUN if test -f /marker; then ( apt-get update ); fi",
+            "RUN while test -f /marker; do ( apt-get update ); done",
+        ):
+            with self.subTest(task_run=task_run):
+                rendered = render_build_dockerfile(
+                    f"FROM ubuntu:24.04\n{task_run}\n",
+                    dockerhub_mirror_prefix="registry.internal/public-mirror",
+                    apt_mirror="http://apt-mirror.internal/repos",
+                )
+
+                injected = injected_shell_runs(rendered)
+                self.assertEqual(len(injected), 2)
+                task_run_offset = rendered.index(task_run)
+                self.assertLess(rendered.index(injected[0][0]), task_run_offset)
+                self.assertGreater(
+                    rendered.index(injected[1][0]), task_run_offset
+                )
+
+    def test_render_ignores_bash_arithmetic_containing_apt_text(self) -> None:
+        rendered = render_build_dockerfile(
+            (
+                "FROM ubuntu:24.04\n"
+                'SHELL ["/bin/bash", "-c"]\n'
+                "RUN (( apt-get ))\n"
+            ),
+            dockerhub_mirror_prefix="registry.internal/public-mirror",
+            apt_mirror="http://apt-mirror.internal/repos",
+        )
+
+        self.assertEqual(injected_shell_runs(rendered), [])
+
+    def test_render_ignores_parenthesized_apt_text_inside_quotes(self) -> None:
+        for task_run in (
+            "RUN printf '%s\\n' '; ( apt-get update' > /tmp/example",
+            "RUN EXAMPLE='( apt-get update' printf ok",
+        ):
+            with self.subTest(task_run=task_run):
+                rendered = render_build_dockerfile(
+                    f"FROM ubuntu:24.04\n{task_run}\n",
+                    dockerhub_mirror_prefix="registry.internal/public-mirror",
+                    apt_mirror="http://apt-mirror.internal/repos",
+                )
+
+                self.assertEqual(injected_shell_runs(rendered), [])
+
+    def test_render_ignores_parenthesized_apt_text_inside_comments(self) -> None:
+        for task_run in (
+            "RUN echo ok; # disabled: ( apt-get update )",
+            "RUN echo ok # disabled; ( apt-get update )",
+        ):
+            with self.subTest(task_run=task_run):
+                rendered = render_build_dockerfile(
+                    f"FROM ubuntu:24.04\n{task_run}\n",
+                    dockerhub_mirror_prefix="registry.internal/public-mirror",
+                    apt_mirror="http://apt-mirror.internal/repos",
+                )
+
+                self.assertEqual(injected_shell_runs(rendered), [])
+
+    def test_render_detects_apt_after_escaped_whitespace_before_hash(self) -> None:
+        task_run = r"RUN echo foo\ #literal; apt-get update"
+        rendered = render_build_dockerfile(
+            f"FROM ubuntu:24.04\n{task_run}\n",
+            dockerhub_mirror_prefix="registry.internal/public-mirror",
+            apt_mirror="http://apt-mirror.internal/repos",
+        )
+
+        injected = injected_shell_runs(rendered)
+        self.assertEqual(len(injected), 2)
+        task_run_offset = rendered.index(task_run)
+        self.assertLess(rendered.index(injected[0][0]), task_run_offset)
+        self.assertGreater(rendered.index(injected[1][0]), task_run_offset)
+
     def test_render_detects_exec_form_apt_run(self) -> None:
         rendered = render_build_dockerfile(
             'FROM ubuntu:24.04\nRUN ["apt-get", "update"]\n',
@@ -799,6 +888,7 @@ networks:
     def test_render_detects_shell_wrapped_apt_runs(self) -> None:
         for task_run in (
             "RUN sh -c 'apt-get update'",
+            'RUN sh -c "echo \\"starting\\"; apt-get update"',
             'RUN ["/bin/bash", "-lc", "apt-get update"]',
         ):
             with self.subTest(task_run=task_run):
@@ -813,6 +903,34 @@ networks:
                 task_run_offset = rendered.index(task_run)
                 self.assertLess(rendered.index(injected[0][0]), task_run_offset)
                 self.assertGreater(rendered.index(injected[1][0]), task_run_offset)
+
+    def test_render_detects_apt_inside_quoted_command_substitution(self) -> None:
+        task_run = 'RUN output="$(echo starting; apt-get update)"'
+        rendered = render_build_dockerfile(
+            f"FROM ubuntu:24.04\n{task_run}\n",
+            dockerhub_mirror_prefix="registry.internal/public-mirror",
+            apt_mirror="http://apt-mirror.internal/repos",
+        )
+
+        injected = injected_shell_runs(rendered)
+        self.assertEqual(len(injected), 2)
+        task_run_offset = rendered.index(task_run)
+        self.assertLess(rendered.index(injected[0][0]), task_run_offset)
+        self.assertGreater(rendered.index(injected[1][0]), task_run_offset)
+
+    def test_render_detects_apt_inside_quoted_backtick_substitution(self) -> None:
+        task_run = 'RUN output="`echo starting; apt-get update`"'
+        rendered = render_build_dockerfile(
+            f"FROM ubuntu:24.04\n{task_run}\n",
+            dockerhub_mirror_prefix="registry.internal/public-mirror",
+            apt_mirror="http://apt-mirror.internal/repos",
+        )
+
+        injected = injected_shell_runs(rendered)
+        self.assertEqual(len(injected), 2)
+        task_run_offset = rendered.index(task_run)
+        self.assertLess(rendered.index(injected[0][0]), task_run_offset)
+        self.assertGreater(rendered.index(injected[1][0]), task_run_offset)
 
     def test_render_refreshes_apt_sources_copied_after_stage_setup(self) -> None:
         rendered = render_build_dockerfile(
