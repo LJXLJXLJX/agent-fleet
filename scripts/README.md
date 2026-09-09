@@ -125,6 +125,20 @@ normally. If Ruff reports errors (or cannot run), the hook asks whether to
 continue; only `y` or `Y` permits the commit, so the check remains advisory
 without silently ignoring failures.
 
+### OpenSandbox frontend build tools
+
+For an OpenSandbox backend, setup prepares the pinned Go toolchain used by cold
+frontend builds. `HARBOR_OPENSANDBOX_BUILD_TOOLS_SETUP=1` enables this explicitly;
+`0` skips it; the default `auto` follows the selected backend. Setup reuses a
+matching compiler or downloads and verifies the Linux amd64 toolchain through
+the first HTTP(S) entry in `HARBOR_OPENSANDBOX_GOPROXY`. Other platforms must
+provide the pinned version. A valid frontend cache does not require Go.
+
+```bash
+HARBOR_OPENSANDBOX_GOPROXY='https://goproxy.cn,direct' \
+  HARBOR_OPENSANDBOX_BUILD_TOOLS_SETUP=1 bash scripts/setup.sh
+```
+
 ### Prerequisite paths
 
 The same path initialization is used by setup, `run_fleet.sh`, direct Harbor

@@ -85,10 +85,14 @@ fallback that could silently diverge after a Harbor runner upgrade.
 Task-declared Compose build arguments and Dockerfile defaults are already part
 of the static environment content. Runtime build-argument overrides, package
 mirrors, APT mirrors, base-image transport mirrors, proxies, fallback choices,
-build-network settings, and target platform do not participate in image
-identity. The implementation uses the Harbor benchmark framework's complete
-SHA-256 result rather than
-a provider-specific display truncation.
+build-network settings, target platform, renderer version, and APT runtime asset
+digest do not participate in image identity. The implementation uses the Harbor
+benchmark framework's complete SHA-256 result rather than a provider-specific
+display truncation.
+
+**P0 invariant:** image identity must come only from the original static task
+environment. Treat any dependency on rendering, rewriting, mounts, mirrors,
+runtime assets, resolved artifacts, or other build-time mutation as a P0 bug.
 
 For an `image:` service, the original image reference declared by the task is
 used only as the Harbor benchmark framework's empty-environment fallback seed.
@@ -178,6 +182,58 @@ for Dockerfile `RUN` commands. They apply to ordinary clone/fetch and recursive
 GitHub submodules, including HTTPS, SCP-like SSH, `ssh://`, and `git://` URLs.
 The mount exists only while each `RUN` executes, so it is not written into an
 image layer, image environment, or global `.gitconfig`.
+
+## APT build-runtime interception
+
+After official Dockerfile lowering, the OpenSandbox frontend adds the same
+BuildKit-only runtime inputs to every `RUN`:
+
+```text
+/run/opensandbox-apt/bin/apt
+/run/opensandbox-apt/bin/apt-get
+PATH=/run/opensandbox-apt/bin:$PATH
+```
+
+The [instrumentation frontend](opensandbox_buildkit_frontend/README.md) applies
+these options after upstream has handled shell and JSON forms, heredocs, custom
+shells, and `RUN` options. Wrapper assets and the source map are
+content-addressed secrets; the shadow tree is tmpfs. The PATH change and mounts
+do not persist in the stage environment or final image.
+
+On each intercepted invocation, the wrapper copies the current
+`/etc/apt/sources.list`, `*.list`, and `*.sources` into the shadow tree, rewrites
+active URIs, and invokes the current rootfs `/usr/bin/apt` or
+`/usr/bin/apt-get` with that temporary source view. The authored source files
+are never changed.
+
+After a successful `apt update` or `apt-get update`, the same invocation asks
+APT for rewritten-source and original-source index targets with `apt-get
+indextargets`. It joins targets by their stable source-entry and target metadata,
+then copies package and release metadata to the filenames derived from the
+original URI. Failure emits `event=index-reconciliation-failed` and fails the
+invocation. No stage analysis or cleanup `RUN` is required.
+
+The mapping combines the configured distro mirror with
+`HARBOR_OPENSANDBOX_APT_SOURCE_OVERRIDES_JSON`. Repository matches use the
+longest prefix, retain the suffix, and require an exact match or `/` boundary.
+An unmatched active HTTP(S) URI remains unchanged, but the wrapper emits a
+structured warning before real APT starts. The reported `source=` value strips
+any userinfo, query, and fragment so embedded credentials never reach build
+logs; matching, rewriting, and downloads keep using the original URI:
+
+```text
+[opensandbox apt] WARNING event=unmapped-source source=<uri> file=<source-file>
+```
+
+Non-HTTP(S) sources remain unchanged without warning. Normal PATH lookup is
+covered across `RUN` forms and inherited subprocesses. Absolute paths, PATH
+resets, `env -i`, custom libapt frontends, and explicit custom APT layouts can
+bypass interception.
+
+The frontend is verified and built in a source-addressed local OCI cache. Its
+digest and runtime asset IDs invalidate BuildKit `RUN` cache when a build occurs;
+they do not change the static task-image identity. Frontend preparation failure
+returns exit code 78 and stops new task dispatch for that batch.
 
 `SkopeoPublisher` removes ambient HTTP(S) proxy variables for login, copy, and
 inspect. TLS verification is controlled by `YICLOUD_HARBOR_TLS_VERIFY`; the
