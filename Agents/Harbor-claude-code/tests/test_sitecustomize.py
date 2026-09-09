@@ -207,6 +207,7 @@ class ClaudeCommandPatchTest(unittest.TestCase):
         self.assertIn('> "$HOME/.claude/web-mcp.json"', captured[0])
         self.assertIn('"command": "python3"', captured[0])
         self.assertIn('"args": ["/opt/agent-fleet/exa_web_mcp.py"]', captured[0])
+        self.assertIn('"WEB_MCP_INSTRUCTION": "task"', captured[0])
         argv = shlex.split(captured[0].split("; ")[-1])
         self.assertIn("--strict-mcp-config", argv)
         self.assertEqual(argv[argv.index("--mcp-config") + 1], "$HOME/.claude/web-mcp.json")
@@ -214,6 +215,15 @@ class ClaudeCommandPatchTest(unittest.TestCase):
             argv[argv.index("--allowedTools") + 1],
             "mcp__web__web_search,mcp__web__web_fetch",
         )
+
+
+    def test_web_mcp_instruction_is_task_scoped(self):
+        module = load_module()
+        for question in ("Task one with 'quotes'\n\nand lines", "A different task"):
+            configured = json.loads(module._build_web_mcp_config("/mcp.pyz", question))
+            self.assertEqual(configured["mcpServers"]["web"]["env"], {
+                "WEB_MCP_INSTRUCTION": question,
+            })
 
 
 class ClaudeInstallCommandTest(unittest.TestCase):

@@ -59,6 +59,51 @@ class HarborEnvAliasTests(unittest.TestCase):
         self.assertEqual(env["RL_ENVIRONMENT_TYPE"], "qz")
         self.assertEqual(env["HARBOR_ENVIRONMENT_TYPE"], "qz")
 
+    def test_web_mcp_rejects_managed_backends_with_cold_or_warm_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for cached in (False, True):
+                if cached:
+                    subprocess.run(
+                        ["python3", str(HARBOR_DIR.parent / "mcp/build.py"), tmp],
+                        check=True,
+                        capture_output=True,
+                    )
+                for backend in ("e2b", "qz"):
+                    for setting in ("HARBOR_ENVIRONMENT_TYPE", "RL_ENVIRONMENT_TYPE"):
+                        with self.subTest(cached=cached, backend=backend, setting=setting):
+                            with self.assertRaises(subprocess.CalledProcessError) as error:
+                                self.load_env(
+                                    HARBOR_CC_WEB_MCP_ENABLED="1",
+                                    LOCAL_WHEEL_DIR=tmp,
+                                    **{setting: backend},
+                                )
+                            self.assertIn(
+                                f"Web MCP is not supported on {backend}",
+                                error.exception.stderr,
+                            )
+
+    def test_web_mcp_backend_guard_preserves_supported_and_disabled_modes(self) -> None:
+        for backend in ("docker", "opensandbox", "e2b", "qz"):
+            modes = ("0", "1") if backend in ("docker", "opensandbox") else ("0",)
+            for enabled in modes:
+                with self.subTest(backend=backend, enabled=enabled):
+                    env = self.load_env(
+                        HARBOR_ENVIRONMENT_TYPE=backend,
+                        HARBOR_CC_WEB_MCP_ENABLED=enabled,
+                        HARBOR_CC_WEB_MCP_SOURCE="/ignored/stale-mcp.pyz",
+                    )
+                    self.assertEqual(bool(env["HARBOR_CC_WEB_MCP_SOURCE"]), enabled == "1")
+
+    def test_web_mcp_guard_checks_backend_from_custom_rollout_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout_env = Path(tmp) / "rollout.env"
+            rollout_env.write_text("declare -x RL_ENVIRONMENT_TYPE=qz\n")
+            with self.assertRaises(subprocess.CalledProcessError) as error:
+                self.load_env(
+                    ROLLOUT="1", RL_ENV_FILE=str(rollout_env), HARBOR_CC_WEB_MCP_ENABLED="1"
+                )
+            self.assertIn("Web MCP is not supported on qz", error.exception.stderr)
+
     def test_legacy_inputs_resolve_to_canonical_settings(self) -> None:
         for old, new, value in (
             ("N_ATTEMPTS", "HARBOR_N_ATTEMPTS", "3"),

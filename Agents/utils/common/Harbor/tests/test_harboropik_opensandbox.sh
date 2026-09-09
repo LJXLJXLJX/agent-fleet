@@ -63,7 +63,7 @@ ln -s python3.12 "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundl
 ln -s python3.12 "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python"
 tar -czf "$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" \
   -C "$tmp/verifier-bundle" agent-fleet-swe-rebench-v2-verifier-bundle
-printf '# fake Exa MCP\n' > "$tmp/deps/exa_web_mcp.py"
+bundled_web_mcp="$(python3 "$HARBOR_DIR/../mcp/build.py" "$tmp/deps/wheels")"
 printf 'fake python runtime\n' > "$tmp/deps/wheels/dsh-sdk-minimal-python3.12-runtime.tar.gz"
 printf 'fake sdk minimal runtime\n' > "$tmp/deps/wheels/dsh-sdk-minimal-runtime-dsh-v0.1.3-alpha.1.tar.gz"
 printf 'fake sdk minimal dsh runtime\n' > "$tmp/deps/wheels/dsh-sdk-minimal-cli-runtime-0.1.3-alpha.1.tar.gz"
@@ -123,7 +123,8 @@ run_dry() {
     HARBOR_LLM_KWARGS='{"temperature":1.0}' \
     HARBOR_CC_CLAUDE_TGZ_SOURCE="$tmp/deps/claude.tgz" \
     HARBOR_CC_PY_WHEEL_DIR_SOURCE="$tmp/deps/wheels" \
-    HARBOR_CC_WEB_MCP_SOURCE="${RUN_DRY_WEB_MCP_SOURCE:-}" \
+    HARBOR_CC_WEB_MCP_ENABLED="${RUN_DRY_WEB_MCP_ENABLED:-0}" \
+    LOCAL_WHEEL_DIR="$tmp/deps/wheels" \
     EXA_API_KEY="${RUN_DRY_EXA_API_KEY:-}" \
     HARBOR_ENVIRONMENT_TYPE="$environment_type" \
     YICLOUD_SANDBOX_UPLOAD_BACKEND="${RUN_DRY_UPLOAD_BACKEND:-auto}" \
@@ -437,7 +438,7 @@ grep -F -- 'FAKE_HARBOR_ARG=HARBOR_VERIFIER_UV_BIN_DIR=/opt/tb-uv-backup/bin' \
   <<< "$claude_opensandbox" >/dev/null
 
 claude_opensandbox_web_mcp="$(
-  RUN_DRY_WEB_MCP_SOURCE="$tmp/deps/exa_web_mcp.py" \
+  RUN_DRY_WEB_MCP_ENABLED=1 \
   RUN_DRY_EXA_API_KEY='fake-exa-key' \
     run_dry 'test-project/manual:immutable' "$tmp/does-not-exist.py" \
       '{}' auto opensandbox 0 claude-code 0
@@ -446,7 +447,7 @@ grep -F -- 'FAKE_HARBOR_ARG=CC_WEB_MCP_PATH=/opt/agent-fleet/exa_web_mcp.py' \
   <<< "$claude_opensandbox_web_mcp" >/dev/null
 grep -F -- 'FAKE_HARBOR_ARG=EXA_API_KEY=fake-exa-key' \
   <<< "$claude_opensandbox_web_mcp" >/dev/null
-grep -F -- "\"source\": \"$tmp/deps/exa_web_mcp.py\"" \
+grep -F -- "\"source\": \"$bundled_web_mcp\"" \
   <<< "$claude_opensandbox_web_mcp" >/dev/null
 grep -F -- '"target": "/opt/agent-fleet/exa_web_mcp.py"' \
   <<< "$claude_opensandbox_web_mcp" >/dev/null

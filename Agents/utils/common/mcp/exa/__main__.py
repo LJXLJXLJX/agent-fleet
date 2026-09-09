@@ -3,7 +3,8 @@ import os
 import sys
 import urllib.request
 
-from config import ANONYMOUS_KEY, API_KEY_HEADER, MCP_URL
+from blocking import GUIDANCE, LeakPolicy
+from config import ANONYMOUS_KEY, API_KEY_HEADER, LEAK_PROFILE, MCP_URL
 
 LOCAL_TO_REMOTE = {
     "web_search": "web_search_exa",
@@ -48,37 +49,57 @@ def _request(message: dict) -> dict:
         return _decode(response.read().decode(), message.get("id")) if "id" in message else {}
 
 
-def _forward(message: dict) -> dict:
+def _forward(message: dict, policy: LeakPolicy) -> dict:
+    if message.get("method") not in {
+        "initialize", "ping", "notifications/initialized", "notifications/cancelled",
+        "tools/list", "tools/call",
+    }:
+        return {"jsonrpc": "2.0", "id": message.get("id"),
+                "error": {"code": -32601, "message": "Method unavailable under the research policy"}}
     outgoing = dict(message)
     if message.get("method") == "tools/call":
         outgoing["params"] = dict(message.get("params") or {})
         name = outgoing["params"].get("name")
         outgoing["params"]["name"] = LOCAL_TO_REMOTE.get(name, name)
+        if (
+            outgoing["params"]["name"] not in REMOTE_TO_LOCAL
+            or policy.blocked_request(outgoing["params"].get("arguments", {}))
+        ):
+            return policy.response(message)
     result = _request(outgoing)
+    if message.get("method") == "tools/call":
+        arguments = outgoing["params"].get("arguments", {})
+        query = arguments.get("query", "") if outgoing["params"]["name"] == "web_search_exa" else ""
+        if policy.blocked_response(result, query):
+            return policy.response(message)
     if message.get("method") == "tools/list":
+        result["result"]["tools"] = [
+            tool for tool in result["result"]["tools"] if tool.get("name") in REMOTE_TO_LOCAL
+        ]
         for tool in result.get("result", {}).get("tools", []):
             tool["name"] = REMOTE_TO_LOCAL.get(tool.get("name"), tool.get("name"))
             tool["description"] = tool.get("description", "").replace("_exa", "")
+            tool["description"] += GUIDANCE
     return result
 
 
 def main() -> None:
+    policy = LeakPolicy(LEAK_PROFILE, os.environ.get("WEB_MCP_INSTRUCTION", ""))
     for line in sys.stdin:
         message = {}
         try:
             message = json.loads(line)
-            if "id" not in message:
-                _request(message)
-                continue
-            response = _forward(message)
+            response = _forward(message, policy)
         except Exception as exc:  # noqa: BLE001 - keep serving after a bad request.
             if "id" not in message:
                 continue
             response = {
                 "jsonrpc": "2.0",
                 "id": message.get("id") if isinstance(message, dict) else None,
-                "error": {"code": -32000, "message": str(exc)},
+                "error": {"code": -32000, "message": type(exc).__name__},
             }
+        if "id" not in message:
+            continue
         print(json.dumps(response, separators=(",", ":")), flush=True)
 
 

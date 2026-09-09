@@ -318,9 +318,15 @@ harbor_prepare_verifier_runtime_bundle() {
   fi
 }
 
+harbor_prepare_web_mcp() {
+  [[ "$HARBOR_CC_WEB_MCP_ENABLED" == "1" ]] || return 0
+  HARBOR_CC_WEB_MCP_SOURCE="$(python3 "$REPO_ROOT/Agents/utils/common/mcp/build.py" "$LOCAL_WHEEL_DIR")"
+}
+
 harbor_prepare_or_select_wheels() {
   validate_verifier_runtime_bundle_transport || return 1
   mkdir -p "$RUNTIME_DIR"
+  harbor_prepare_web_mcp || return 1
   local status_file="${RUNTIME_DIR}/local-deps-prepare.status"
   rm -f "$WORKERS_READY_FILE" "$WORKERS_FAILED_FILE" "$EFFECTIVE_WHEEL_URL_FILE" "$EFFECTIVE_CLAUDE_TGZ_URL_FILE" "$HARBOR_RUNNER_PREPARE_STATUS_FILE"
   : > "$LOCAL_DEPS_LOG_FILE"

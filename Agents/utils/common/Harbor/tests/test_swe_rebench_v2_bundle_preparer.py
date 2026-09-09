@@ -136,6 +136,7 @@ harbor_manifest_url_ready() { return 0; }
 harbor_url_is_reachable() { return 0; }
 validate_verifier_runtime_bundle_transport() { return 0; }
 harbor_local_cache_ready() { return 1; }
+harbor_prepare_web_mcp() { return 0; }
 harbor_build_verifier_runtime_bundle() { printf '%s\n' bundle >> "$EVENT_LOG"; }
 harbor_write_effective_wheel_source() { printf 'remote=%s\n' "$1" >> "$EVENT_LOG"; }
 harbor_mark_workers_ready() { printf '%s\n' ready >> "$EVENT_LOG"; }

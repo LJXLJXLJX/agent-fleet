@@ -143,7 +143,7 @@ def _hook_mount_path(extra_env: dict[str, str] | None) -> str:
     )
 
 
-def _build_web_mcp_config(server_path: str) -> str:
+def _build_web_mcp_config(server_path: str, instruction: str = "") -> str:
     return json.dumps(
         {
             "mcpServers": {
@@ -151,6 +151,7 @@ def _build_web_mcp_config(server_path: str) -> str:
                     "type": "stdio",
                     "command": "python3",
                     "args": [server_path],
+                    "env": {"WEB_MCP_INSTRUCTION": instruction},
                 }
             }
         },
@@ -607,7 +608,9 @@ def _patch_claude_code_realtime_hooks() -> None:
                 web_mcp_path = (extra_env or {}).get("CC_WEB_MCP_PATH", "").strip()
                 prefix = 'export PATH="$HOME/.local/bin:$PATH"; '
                 if web_mcp_path:
-                    config_json = shlex.quote(_build_web_mcp_config(web_mcp_path))
+                    config_json = shlex.quote(_build_web_mcp_config(
+                        web_mcp_path, instruction
+                    ))
                     config_path = "$HOME/.claude/web-mcp.json"
                     prefix = (
                         "mkdir -p \"$HOME/.claude\"; "
