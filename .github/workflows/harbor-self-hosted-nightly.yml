@@ -100,6 +100,7 @@ jobs:
           printf 'Selected %s tasks from %s: %s\n' "$task_count" "$benchmark" "$tasks"
 
       - name: Run Harbor benchmark
+        id: harbor
         env:
           BASE_URL_RAW: ${{ vars.LLM_REVIEW_BASE_URL }}
           API_KEY: ${{ secrets.LLM_REVIEW_API_KEY }}
@@ -135,6 +136,8 @@ jobs:
           export BASE_URL="${BASE_URL_RAW%/chat/completions}"
           export OPIK_PROJECT_NAME="$(date -u +'%Y-%m-%d-%H')-harbor-self-hosted-nightly"
           export HARBOR_OPENSANDBOX_BENCHMARK="$BENCHMARK"
+          # Keep Analyzer artifacts and detached Pi homes inside this run.
+          export HARBOR_ANALYZER_OUTPUT_DIR="$OUTPUT_PATH/analyzer"
 
           status=0
           timeout --signal=TERM --kill-after=5m 450m \
@@ -143,11 +146,31 @@ jobs:
               /dev/null || status=$?
           if (( status == 124 || status == 137 )); then
             echo "::error::Harbor exceeded its 450-minute budget" >&2
+            zellij kill-session "$ZELLIJ_SESSION_NAME" >/dev/null 2>&1 || true
           fi
+          printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"
           exit "$status"
 
-      - name: Verify sampled tasks completed
+      - name: Clean up
+        id: cleanup
+        if: ${{ always() && steps.params.outputs.run_id != '' }}
         env:
+          ZELLIJ_SESSION_NAME: ${{ steps.params.outputs.run_id }}
+          RUN_ID: ${{ steps.params.outputs.run_id }}
+          OUTPUT_PATH: ${{ steps.params.outputs.output_path }}
+        run: |
+          set -euo pipefail
+          zellij kill-session "$ZELLIJ_SESSION_NAME" >/dev/null 2>&1 || true
+          zellij delete-session "$ZELLIJ_SESSION_NAME" >/dev/null 2>&1 || true
+          python3 .github/scripts/harbor_nightly_cleanup.py \
+            --run-dir "$OUTPUT_PATH" --run-id "$RUN_ID"
+
+      - name: Verify sampled tasks completed
+        id: health
+        if: ${{ !cancelled() && steps.harbor.outcome != 'skipped' && steps.cleanup.outcome == 'success' }}
+        env:
+          HARBOR_STATUS: ${{ steps.harbor.outputs.status }}
+          HEALTH_SUMMARY: ${{ runner.temp }}/harbor-self-hosted-health-${{ github.run_id }}-${{ github.run_attempt }}.md
           BENCHMARK: ${{ steps.params.outputs.benchmark }}
           EXPECTED_TASKS: ${{ steps.params.outputs.task_count }}
           OUTPUT_PATH: ${{ steps.params.outputs.output_path }}
@@ -155,17 +178,20 @@ jobs:
           set -euo pipefail
           if [[ "$BENCHMARK" != "smith" ]]; then
             python3 .github/scripts/e2e_harbor_gate.py \
+              --step-summary "$HEALTH_SUMMARY" \
               --output-path "$OUTPUT_PATH" \
-              --harbor-status 0 \
+              --harbor-status "${HARBOR_STATUS:-1}" \
               --expected-trials "$EXPECTED_TASKS" \
               --max-harness-failure-ratio 0.10
             exit 0
           fi
 
+          printf '### Smith sampled task validation\n\n' > "$HEALTH_SUMMARY"
           shopt -s nullglob
           done_files=("$OUTPUT_PATH"/queue/*/done.txt)
           if (( ${#done_files[@]} != 1 )); then
             echo "::error::expected one Smith completion queue" >&2
+            printf 'FAIL: expected one Smith completion queue.\n' >> "$HEALTH_SUMMARY"
             exit 1
           fi
           queue_dir="${done_files[0]%/done.txt}"
@@ -174,20 +200,101 @@ jobs:
           exception_count="$(awk -F '\t' '$4 != "" { count++ } END { print count + 0 }' "${done_files[0]}")"
           accounted=$((done_count + failed_count))
           errors=$((exception_count + failed_count))
+          {
+            printf '| Metric | Value |\n| --- | --- |\n'
+            printf '| Expected tasks | %s |\n' "$EXPECTED_TASKS"
+            printf '| Completed queue entries | %s |\n' "$done_count"
+            printf '| Failed queue entries | %s |\n' "$failed_count"
+            printf '| Harness failures | %s |\n' "$errors"
+            printf '| Benchmark shell exit status | %s |\n\n' "${HARBOR_STATUS:-1}"
+          } >> "$HEALTH_SUMMARY"
           if (( accounted != EXPECTED_TASKS )); then
             echo "::error::Smith accounted for $accounted of $EXPECTED_TASKS sampled tasks" >&2
+            printf 'FAIL: Smith accounted for %s of %s sampled tasks.\n' "$accounted" "$EXPECTED_TASKS" >> "$HEALTH_SUMMARY"
             exit 1
           fi
           if (( errors * 100 > EXPECTED_TASKS * 10 )); then
             echo "::error::Smith had $errors harness failures across $EXPECTED_TASKS tasks" >&2
+            printf 'FAIL: Smith had %s harness failures across %s tasks.\n' "$errors" "$EXPECTED_TASKS" >> "$HEALTH_SUMMARY"
             exit 1
           fi
+          if (( ${HARBOR_STATUS:-1} != 0 )); then
+            printf 'FAIL: benchmark shell exited with status %s.\n' "${HARBOR_STATUS:-1}" >> "$HEALTH_SUMMARY"
+            exit 1
+          fi
+          printf 'PASS: sampled tasks completed within the harness failure allowance.\n' >> "$HEALTH_SUMMARY"
 
-      - name: Clean up
-        if: always()
+      - name: Stage and redact artifacts
+        id: stage
+        if: ${{ !cancelled() && steps.harbor.outcome != 'skipped' && steps.cleanup.outcome == 'success' }}
         env:
-          ZELLIJ_SESSION_NAME: ${{ steps.params.outputs.run_id }}
+          API_KEY: ${{ secrets.LLM_REVIEW_API_KEY }}
+          OPIK_API_KEY: ${{ secrets.OPIK_API_KEY }}
+          OUTPUT_PATH: ${{ steps.params.outputs.output_path }}
         run: |
           set -euo pipefail
-          zellij kill-session "$ZELLIJ_SESSION_NAME" >/dev/null 2>&1 || true
-          zellij delete-session "$ZELLIJ_SESSION_NAME" >/dev/null 2>&1 || true
+          if [[ -z "$API_KEY" ]]; then
+            # An empty needle would make replace() and grep -F match everything.
+            echo "::error::API_KEY is empty; refusing to stage artifacts unredacted" >&2
+            exit 1
+          fi
+          source scripts/config_loader.sh
+          agent_fleet_load_config "$GITHUB_WORKSPACE"
+          staged="$(mktemp -d "${RUNNER_TEMP}/harbor-self-hosted-artifacts.XXXXXX")"
+          cp -R "$OUTPUT_PATH/." "$staged/"
+          python3 .github/scripts/redact_harbor_artifacts.py "$staged"
+          printf 'staged=%s\n' "$staged" >> "$GITHUB_ENV"
+
+      - name: Upload run artifacts
+        id: artifacts
+        if: ${{ !cancelled() && steps.stage.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.params.outputs.run_id }}
+          path: ${{ env.staged }}
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Publish run summary
+        if: always()
+        env:
+          HEALTH_SUMMARY: ${{ runner.temp }}/harbor-self-hosted-health-${{ github.run_id }}-${{ github.run_attempt }}.md
+          JOB_STATUS: ${{ job.status }}
+          GATE_OUTCOME: ${{ steps.health.outcome }}
+          STAGING_OUTCOME: ${{ steps.stage.outcome }}
+          STAGED_ARTIFACTS: ${{ env.staged }}
+          ARTIFACT_OUTCOME: ${{ steps.artifacts.outcome }}
+          ARTIFACT_URL: ${{ steps.artifacts.outputs.artifact-url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'Workflow status: **%s**\n\n' "$JOB_STATUS"
+            printf '[Run logs](%s)\n\n' "$RUN_URL"
+            if [[ -n "$ARTIFACT_URL" ]]; then
+              printf '[Download run artifacts](%s) (retained for 14 days)\n\n' "$ARTIFACT_URL"
+            else
+              printf 'Run artifacts: unavailable (upload step: %s).\n\n' "$ARTIFACT_OUTCOME"
+            fi
+
+            has_joint=0
+            if [[ "$STAGING_OUTCOME" == "success" && -s "$STAGED_ARTIFACTS/summary.md" ]]; then
+              if python3 .github/scripts/e2e_harbor_summary.py "$STAGED_ARTIFACTS/summary.md" \
+                --artifact-url "$ARTIFACT_URL"; then
+                has_joint=1
+                printf '\n\n<details>\n<summary>CI pipeline validation: %s</summary>\n\n' "$GATE_OUTCOME"
+              else
+                printf 'Joint summary.md could not be rendered; showing pipeline validation below.\n\n'
+              fi
+            else
+              printf 'Joint summary.md unavailable; showing pipeline validation below.\n\n'
+            fi
+            if [[ "$GATE_OUTCOME" != "skipped" && -s "$HEALTH_SUMMARY" ]]; then
+              cat "$HEALTH_SUMMARY"
+            else
+              printf 'Pipeline validation report unavailable. Check the failed or cancelled steps in the run logs.\n'
+            fi
+            if (( has_joint )); then
+              printf '\n</details>\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
