@@ -38,9 +38,18 @@ cp "$component/instrumentation.go" "$FRONTEND_WORK_DIR/upstream/frontend/dockerf
         -o "$FRONTEND_WORK_DIR/image/dockerfile-frontend" \
         ./frontend/dockerfile/cmd/dockerfile-frontend
 )
-cp "$component/Dockerfile" "$component/.dockerignore" "$FRONTEND_WORK_DIR/image/"
+binary_digest=$(sha256sum "$FRONTEND_WORK_DIR/image/dockerfile-frontend" | awk '{print $1}')
+binary_name="dockerfile-frontend-${binary_digest}"
+mv "$FRONTEND_WORK_DIR/image/dockerfile-frontend" \
+    "$FRONTEND_WORK_DIR/image/${binary_name}"
+sed "s|COPY dockerfile-frontend /bin/dockerfile-frontend|COPY ${binary_name} /bin/dockerfile-frontend|" \
+    "$component/Dockerfile" > "$FRONTEND_WORK_DIR/image/Dockerfile"
+grep -F "COPY ${binary_name} /bin/dockerfile-frontend" \
+    "$FRONTEND_WORK_DIR/image/Dockerfile" >/dev/null
+printf '*\n!Dockerfile\n!%s\n' "$binary_name" \
+    > "$FRONTEND_WORK_DIR/image/.dockerignore"
 source_epoch=$(git -C "$FRONTEND_WORK_DIR/upstream" show -s --format=%ct "${upstream[1]}")
-touch -d "@$source_epoch" "$FRONTEND_WORK_DIR/image/dockerfile-frontend"
+touch -d "@$source_epoch" "$FRONTEND_WORK_DIR/image/${binary_name}"
 timeout 180 docker buildx build --no-cache --network=none --provenance=false \
     --output "type=oci,dest=$FRONTEND_WORK_DIR/layout,tar=false,rewrite-timestamp=true" \
     --build-arg "SOURCE_DATE_EPOCH=$source_epoch" \

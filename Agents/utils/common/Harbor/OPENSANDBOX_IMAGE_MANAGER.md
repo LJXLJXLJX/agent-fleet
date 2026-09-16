@@ -196,7 +196,7 @@ PATH=/run/opensandbox-apt/bin:$PATH
 
 The [instrumentation frontend](opensandbox_buildkit_frontend/README.md) applies
 these options after upstream has handled shell and JSON forms, heredocs, custom
-shells, and `RUN` options. Wrapper assets and the source map are
+shells, and `RUN` options. Wrapper assets and the Gateway root are
 content-addressed secrets; the shadow tree is tmpfs. The PATH change and mounts
 do not persist in the stage environment or final image.
 
@@ -213,22 +213,65 @@ then copies package and release metadata to the filenames derived from the
 original URI. Failure emits `event=index-reconciliation-failed` and fails the
 invocation. No stage analysis or cleanup `RUN` is required.
 
-The mapping combines the configured distro mirror with
-`HARBOR_OPENSANDBOX_APT_SOURCE_OVERRIDES_JSON`. Repository matches use the
-longest prefix, retain the suffix, and require an exact match or `/` boundary.
-An unmatched active HTTP(S) URI remains unchanged, but the wrapper emits a
-structured warning before real APT starts. The reported `source=` value strips
-any userinfo, query, and fragment so embedded credentials never reach build
-logs; matching, rewriting, and downloads keep using the original URI:
+When `HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL` is configured, every
+credential-free HTTP(S) APT repository URI is converted directly from its own
+scheme, authority, and base path into the reversible route
+`<root>/apt/v1/<scheme>/<hex-authority>/base/<hex-base-path>`. APT appends
+`dists/...`, `pool/...`, and other repository paths to that route, and the
+Gateway reconstructs the original upstream URL. There is no JSON override,
+source map, per-repository registration, or built-in Ubuntu/Debian branch.
+Previously unseen repository names therefore work without distributing local
+configuration.
+
+When the Gateway root is unset, APT sources keep their authored URLs
+unchanged; there is no APT mirror option. Configure
+`HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL` to route APT downloads through the
+cache Gateway. If a source contains credentials or a query that
+cannot be represented without changing its meaning, the active URI remains
+unchanged and the wrapper emits a structured bypass warning before real APT
+starts. The reported `source=` value strips userinfo, query, and fragment so
+embedded credentials never reach build logs; APT still receives the original
+URI:
 
 ```text
-[opensandbox apt] WARNING event=unmapped-source source=<uri> file=<source-file>
+[opensandbox apt] WARNING event=source-bypass source=<uri> file=<source-file>
 ```
 
 Non-HTTP(S) sources remain unchanged without warning. Normal PATH lookup is
 covered across `RUN` forms and inherited subprocesses. Absolute paths, PATH
 resets, `env -i`, custom libapt frontends, and explicit custom APT layouts can
 bypass interception.
+
+The same `HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL` also controls explicit
+Dockerfile downloads. Once configured, the frontend mounts
+content-addressed `curl` and `wget` wrappers ahead of the image PATH for every
+RUN. They encode each explicit HTTP(S) URL at execution time into the versioned,
+reversible route `<root>/download/v1/<scheme>/<hex-authority>/{root|object/<hex-path>}`;
+there is no per-object mapping input and origin/path identities cannot collide.
+This also covers scripts created or downloaded by an
+earlier command and executed in a later RUN, including shell-expanded URLs. The
+root is an opaque cache-service URL, and the manager does not load a
+service-specific plan. The Gateway accepts previously unseen origins and paths
+on demand. Only explicitly recognized invocation shapes are rewritten
+(`curl` with quiet/fail/show-error/location short flags and an optional
+output file, plus `wget -q... -O FILE`); the wrapper is a strict whitelist
+classifier, not a curl/wget parser. Only public DNS names are cache targets:
+IP literals, loopback aliases, single-label build-local names, and internal
+domains keep their authored URL, as do URLs carrying a query or fragment and
+curl-style `[]`/`{}` URL-glob forms. Any other invocation — unknown options,
+unknown clusters, request bodies, headers, credentials, indirect
+configuration, proxy behavior, or output behavior the classifier cannot
+preserve — bypasses the cache and executes the real tool unchanged; they are
+not rejected as a security decision. As with the APT wrapper, absolute
+executable paths, PATH resets, `env -i`, and replacement binaries bypass the
+adapter.
+
+> **Internal prebuild adapter — no manual use.** Task authors write ordinary
+> `curl`/`wget` commands and must not construct Gateway routes. Operators
+> must not expose the dynamic download endpoint to users or ordinary Sandboxes.
+> The wrapper and source mount exist only during prebuild `RUN` execution and
+> do not persist in the image. A later authentication layer will authorize the
+> prebuild caller without filtering target URLs.
 
 The frontend is verified and built in a source-addressed local OCI cache. Its
 digest and runtime asset IDs invalidate BuildKit `RUN` cache when a build occurs;

@@ -20,7 +20,6 @@ HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT="${HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT:-/dat
 HARBOR_OPENSANDBOX_IMAGE_PLATFORM="${HARBOR_OPENSANDBOX_IMAGE_PLATFORM:-linux/amd64}"
 HARBOR_OPENSANDBOX_PREBUILD_BUILD_TIMEOUT_SEC="${HARBOR_OPENSANDBOX_PREBUILD_BUILD_TIMEOUT_SEC:-7200}"
 HARBOR_OPENSANDBOX_DOCKERHUB_MIRROR_PREFIX="${HARBOR_OPENSANDBOX_DOCKERHUB_MIRROR_PREFIX:-m.daocloud.io/docker.io}"
-DOMESTIC_APT_MIRROR="http://mirrors.tuna.tsinghua.edu.cn"
 DOMESTIC_PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
 DOMESTIC_NPM_REGISTRY="https://registry.npmmirror.com"
 DOMESTIC_GOPROXY="https://goproxy.cn,direct"
@@ -28,12 +27,9 @@ DOMESTIC_GOSUMDB="sum.golang.google.cn"
 DOMESTIC_CARGO_REGISTRY_URL="sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
 DOMESTIC_RUSTUP_DIST_SERVER="https://mirrors.tuna.tsinghua.edu.cn/rustup"
 DOMESTIC_RUSTUP_UPDATE_ROOT="https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup"
-HARBOR_OPENSANDBOX_APT_MIRROR="${HARBOR_OPENSANDBOX_APT_MIRROR:-${DOMESTIC_APT_MIRROR}}"
-HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACKS="${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACKS:-https://mirrors.tuna.tsinghua.edu.cn,https://mirrors.aliyun.com}"
-HARBOR_OPENSANDBOX_APT_SOURCE_OVERRIDES_JSON="${HARBOR_OPENSANDBOX_APT_SOURCE_OVERRIDES_JSON:-}"
-if [[ -z "${HARBOR_OPENSANDBOX_APT_SOURCE_OVERRIDES_JSON}" ]]; then
-  HARBOR_OPENSANDBOX_APT_SOURCE_OVERRIDES_JSON='{}'
-fi
+# APT routing is fully dynamic: sources keep their authored URLs unless
+# HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL routes them through the cache Gateway.
+HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL="${HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL:-}"
 HARBOR_OPENSANDBOX_PIP_INDEX_URL="${HARBOR_OPENSANDBOX_PIP_INDEX_URL:-${DOMESTIC_PIP_INDEX_URL}}"
 HARBOR_OPENSANDBOX_NPM_REGISTRY="${HARBOR_OPENSANDBOX_NPM_REGISTRY:-${DOMESTIC_NPM_REGISTRY}}"
 HARBOR_OPENSANDBOX_GOPROXY="${HARBOR_OPENSANDBOX_GOPROXY:-${DOMESTIC_GOPROXY}}"
@@ -47,7 +43,7 @@ HARBOR_OPENSANDBOX_GITHUB_MIRROR_URL="${HARBOR_OPENSANDBOX_GITHUB_MIRROR_URL:-}"
 HARBOR_OPENSANDBOX_RUSTUP_INIT_URL="${HARBOR_OPENSANDBOX_RUSTUP_INIT_URL:-}"
 HARBOR_OPENSANDBOX_PYTORCH_INDEX_URL="${HARBOR_OPENSANDBOX_PYTORCH_INDEX_URL:-}"
 HARBOR_OPENSANDBOX_PACKAGE_SOURCE_HEALTH_URL="${HARBOR_OPENSANDBOX_PACKAGE_SOURCE_HEALTH_URL:-}"
-HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC="${HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC:-5}"
+HARBOR_OPENSANDBOX_PACKAGE_SOURCE_PROBE_TIMEOUT_SEC="${HARBOR_OPENSANDBOX_PACKAGE_SOURCE_PROBE_TIMEOUT_SEC:-5}"
 HARBOR_OPENSANDBOX_BUILD_ARGS_JSON="${HARBOR_OPENSANDBOX_BUILD_ARGS_JSON:-}"
 if [[ -z "${HARBOR_OPENSANDBOX_BUILD_ARGS_JSON}" ]]; then
   HARBOR_OPENSANDBOX_BUILD_ARGS_JSON='{}'
@@ -186,9 +182,9 @@ if [[ "${HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION}" == 1 \
   print_error "[ERROR] HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION=1 requires HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE=1"
   exit 1
 fi
-case "${HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC}" in
+case "${HARBOR_OPENSANDBOX_PACKAGE_SOURCE_PROBE_TIMEOUT_SEC}" in
   ''|*[!0-9]*|0)
-    print_error "[ERROR] HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC must be a positive integer"
+    print_error "[ERROR] HARBOR_OPENSANDBOX_PACKAGE_SOURCE_PROBE_TIMEOUT_SEC must be a positive integer"
     exit 1
     ;;
 esac
@@ -212,7 +208,7 @@ done
 package_sources_healthy() {
   [[ -n "${HARBOR_OPENSANDBOX_PACKAGE_SOURCE_HEALTH_URL}" ]] || return 0
   curl --noproxy '*' --fail --silent --show-error \
-    --max-time "${HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC}" \
+    --max-time "${HARBOR_OPENSANDBOX_PACKAGE_SOURCE_PROBE_TIMEOUT_SEC}" \
     "${HARBOR_OPENSANDBOX_PACKAGE_SOURCE_HEALTH_URL}" >/dev/null 2>&1
 }
 
@@ -230,22 +226,6 @@ use_domestic_package_sources() {
   HARBOR_OPENSANDBOX_PYTORCH_INDEX_URL=""
 }
 
-select_domestic_apt_mirror() {
-  local candidate
-  local candidates="${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACKS}"
-  while IFS= read -r candidate; do
-    candidate="${candidate%/}"
-    [[ "${candidate}" =~ ^https://[^/?#]+$ ]] || continue
-    if curl --noproxy '*' --fail --silent --show-error --head \
-      --max-time "${HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC}" \
-      "${candidate}/ubuntu/dists/jammy/InRelease" >/dev/null 2>&1; then
-      printf '%s' "${candidate}"
-      return 0
-    fi
-  done < <(printf '%s' "${candidates}" | tr ',' '\n')
-  return 1
-}
-
 # Fast resume returns from the image manager before package-source validation.
 # Defer health traffic in that mode so a fully local batch performs no network
 # request merely to discover its cache hits. A real cache miss still probes and
@@ -254,10 +234,6 @@ if [[ "${HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION}" != 1 ]] \
   && ! package_sources_healthy; then
   print_warning \
     "[WARN] configured package sources are unavailable; using trusted domestic defaults"
-  if ! HARBOR_OPENSANDBOX_APT_MIRROR="$(select_domestic_apt_mirror)"; then
-    print_error "[ERROR] no configured trusted domestic APT fallback is reachable"
-    exit 1
-  fi
   use_domestic_package_sources
   HARBOR_OPENSANDBOX_PACKAGE_SOURCE_HEALTH_URL=""
 fi
@@ -385,12 +361,12 @@ printf '[prebuild] local_upload_cache=%s hash_verification=%s cache_root=%s\n' \
   "$([[ "${HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE}" == 1 ]] && printf enabled || printf disabled)" \
   "${local_upload_hash_verification}" \
   "${HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT}"
-printf '[prebuild] package_sources=%s apt_mirror=%s fallback_apt_mirrors=%s\n' \
-  "$([[ -n "${HARBOR_OPENSANDBOX_PACKAGE_SOURCE_HEALTH_URL}" ]] && printf configured || printf domestic-defaults)" \
-  "${HARBOR_OPENSANDBOX_APT_MIRROR}" \
-  "${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACKS}"
+printf '[prebuild] package_sources=%s\n' \
+  "$([[ -n "${HARBOR_OPENSANDBOX_PACKAGE_SOURCE_HEALTH_URL}" ]] && printf configured || printf domestic-defaults)"
 printf '[prebuild] github_mirror=%s\n' \
   "$([[ -n "${HARBOR_OPENSANDBOX_GITHUB_MIRROR_URL}" ]] && printf configured || printf disabled)"
+printf '[prebuild] download_source=%s\n' \
+  "$([[ -n "${HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL}" ]] && printf configured || printf disabled)"
 printf '[prebuild] run_dir=%s\n' "${run_dir}"
 if [[ "${skipped_count}" != 0 ]]; then
   print_warning \
@@ -404,9 +380,7 @@ export HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT
 export HARBOR_OPENSANDBOX_IMAGE_PLATFORM
 export HARBOR_OPENSANDBOX_PREBUILD_BUILD_TIMEOUT_SEC
 export HARBOR_OPENSANDBOX_DOCKERHUB_MIRROR_PREFIX
-export HARBOR_OPENSANDBOX_APT_MIRROR
-export HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACKS
-export HARBOR_OPENSANDBOX_APT_SOURCE_OVERRIDES_JSON
+export HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL
 export HARBOR_OPENSANDBOX_PIP_INDEX_URL HARBOR_OPENSANDBOX_NPM_REGISTRY
 export HARBOR_OPENSANDBOX_GOPROXY HARBOR_OPENSANDBOX_GOSUMDB
 export HARBOR_OPENSANDBOX_CARGO_REGISTRY_URL
@@ -418,7 +392,7 @@ export HARBOR_OPENSANDBOX_PACKAGE_SOURCE_HEALTH_URL
 export DOMESTIC_PIP_INDEX_URL DOMESTIC_NPM_REGISTRY DOMESTIC_GOPROXY
 export DOMESTIC_GOSUMDB DOMESTIC_CARGO_REGISTRY_URL
 export DOMESTIC_RUSTUP_DIST_SERVER DOMESTIC_RUSTUP_UPDATE_ROOT
-export HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC
+export HARBOR_OPENSANDBOX_PACKAGE_SOURCE_PROBE_TIMEOUT_SEC
 export HARBOR_OPENSANDBOX_BUILD_ARGS_JSON
 export HARBOR_OPENSANDBOX_BUILD_USE_PROXY
 export HARBOR_OPENSANDBOX_BUILD_NETWORK
@@ -440,7 +414,7 @@ xargs -0 -r -P "${HARBOR_OPENSANDBOX_PREBUILD_CONCURRENCY}" -n 1 \
     package_sources_healthy() {
       [[ -n "${HARBOR_OPENSANDBOX_PACKAGE_SOURCE_HEALTH_URL}" ]] || return 0
       curl --noproxy "*" --fail --silent --show-error \
-        --max-time "${HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC}" \
+        --max-time "${HARBOR_OPENSANDBOX_PACKAGE_SOURCE_PROBE_TIMEOUT_SEC}" \
         "${HARBOR_OPENSANDBOX_PACKAGE_SOURCE_HEALTH_URL}" >/dev/null 2>&1
     }
     use_domestic_package_sources() {
@@ -462,22 +436,7 @@ xargs -0 -r -P "${HARBOR_OPENSANDBOX_PREBUILD_CONCURRENCY}" -n 1 \
       export HARBOR_OPENSANDBOX_PUB_HOSTED_URL HARBOR_OPENSANDBOX_JULIA_PKG_SERVER
       export HARBOR_OPENSANDBOX_RUSTUP_INIT_URL HARBOR_OPENSANDBOX_PYTORCH_INDEX_URL
     }
-    select_domestic_apt_mirror() {
-      local candidate
-      while IFS= read -r candidate; do
-        candidate="${candidate%/}"
-        [[ "${candidate}" =~ ^https://[^/?#]+$ ]] || continue
-        if curl --noproxy "*" --fail --silent --show-error --head \
-          --max-time "${HARBOR_OPENSANDBOX_APT_MIRROR_PROBE_TIMEOUT_SEC}" \
-          "${candidate}/ubuntu/dists/jammy/InRelease" >/dev/null 2>&1; then
-          printf "%s" "${candidate}"
-          return 0
-        fi
-      done < <(printf "%s" "${HARBOR_OPENSANDBOX_APT_MIRROR_FALLBACKS}" | tr "," "\n")
-      return 1
-    }
     build_command() {
-      local apt_mirror="$1"
       command=(
         "${HARBOR_OPENSANDBOX_MANAGER_PYTHON}"
         "${HARBOR_OPENSANDBOX_IMAGE_MANAGER}"
@@ -491,8 +450,7 @@ xargs -0 -r -P "${HARBOR_OPENSANDBOX_PREBUILD_CONCURRENCY}" -n 1 \
         --build-timeout-sec "${HARBOR_OPENSANDBOX_PREBUILD_BUILD_TIMEOUT_SEC}"
         --tag-prefix "${BENCHMARK_NAME}"
         --dockerhub-mirror-prefix "${HARBOR_OPENSANDBOX_DOCKERHUB_MIRROR_PREFIX}"
-        --apt-mirror "${apt_mirror}"
-        --apt-source-overrides-json "${HARBOR_OPENSANDBOX_APT_SOURCE_OVERRIDES_JSON}"
+        --download-source-url "${HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL}"
         --build-args-json "${HARBOR_OPENSANDBOX_BUILD_ARGS_JSON}"
         --build-network "${HARBOR_OPENSANDBOX_BUILD_NETWORK}"
         --bundle-manifest-output "${run_dir}/bundles/${task_name}.json"
@@ -504,19 +462,13 @@ xargs -0 -r -P "${HARBOR_OPENSANDBOX_PREBUILD_CONCURRENCY}" -n 1 \
       [[ "${HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION}" == 1 ]] && command+=(--skip-hash-verification)
       [[ "${HARBOR_OPENSANDBOX_DRY_RUN}" == 1 ]] && command+=(--dry-run)
     }
-    active_apt_mirror="${HARBOR_OPENSANDBOX_APT_MIRROR}"
     if [[ "${HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION}" != 1 ]] \
       && ! package_sources_healthy; then
-      if ! active_apt_mirror="$(select_domestic_apt_mirror)"; then
-        printf "[prebuild][failed] task=%s configured package sources are unavailable and no trusted domestic APT fallback is reachable\n" \
-          "${task_name}" >&2
-        exit 1
-      fi
       use_domestic_package_sources
       printf "[prebuild][warning] task=%s configured package sources are unavailable before build; using trusted domestic defaults\n" \
         "${task_name}" >&2
     fi
-    build_command "${active_apt_mirror}"
+    build_command
     if image_ref="$("${command[@]}")"; then
       printf "[prebuild][ready] task=%s image_ref=%s bundle=%s\n" \
         "${task_name}" "${image_ref}" "${run_dir}/bundles/${task_name}.json"
@@ -527,13 +479,8 @@ xargs -0 -r -P "${HARBOR_OPENSANDBOX_PREBUILD_CONCURRENCY}" -n 1 \
       && ! package_sources_healthy; then
       printf "[prebuild][warning] task=%s configured package sources became unavailable; retrying with trusted domestic defaults\n" \
         "${task_name}" >&2
-      if ! fallback_mirror="$(select_domestic_apt_mirror)"; then
-        printf "[prebuild][failed] task=%s no trusted domestic APT fallback is reachable\n" \
-          "${task_name}" >&2
-        exit 1
-      fi
       use_domestic_package_sources
-      build_command "${fallback_mirror}"
+      build_command
       if image_ref="$("${command[@]}")"; then
         printf "[prebuild][ready-fallback] task=%s image_ref=%s bundle=%s\n" \
           "${task_name}" "${image_ref}" "${run_dir}/bundles/${task_name}.json"

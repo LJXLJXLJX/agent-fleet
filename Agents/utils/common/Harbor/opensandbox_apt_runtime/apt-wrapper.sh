@@ -53,12 +53,24 @@ capture_source() {
     destination=$3
     source_kind=$4
     display_file=$5
+    # Repositories can keep credentials in netrc-style auth.conf(.d) files
+    # instead of the source URI. No source may be rerouted while such
+    # configuration exists, or APT would match those credentials against
+    # the Gateway URL and the upstream fetch would go unauthenticated.
+    auth_conf=
+    for auth_file in /etc/apt/auth.conf /etc/apt/auth.conf.d/*; do
+        if [ -f "$auth_file" ] && grep -q '[^#[:space:]]' "$auth_file" 2>/dev/null; then
+            auth_conf=1
+            break
+        fi
+    done
     if ! cat "$original" > "$saved"; then
         echo "[opensandbox apt] ERROR event=source-copy-failed file=$display_file" >&2
         exit 125
     fi
-    if ! awk -v map_file="$runtime/source-map" -v seen_file="$shadow/seen" \
+    if ! LC_ALL=C awk -v gateway_file="$runtime/gateway-root" -v seen_file="$shadow/seen" \
         -v source_kind="$source_kind" -v display_file="$display_file" \
+        -v auth_conf="$auth_conf" \
         -f "$runtime/source-rewriter.awk" "$saved" > "$destination"; then
         echo "[opensandbox apt] ERROR event=source-rewrite-failed file=$display_file" >&2
         exit 125

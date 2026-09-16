@@ -13,12 +13,22 @@ from pathlib import Path
 
 COMPONENT = Path(__file__).resolve().parent
 CONTEXT_NAME = "opensandbox-instrumentation-frontend"
+GITHUB_MIRROR_CONFIG_MOUNT_ID = "opensandbox-github-mirror-gitconfig"
+DOWNLOAD_WRAPPER_SECRET_PREFIX = "opensandbox-download-wrapper"
+DOWNLOAD_REWRITER_SECRET_PREFIX = "opensandbox-download-url-rewriter"
+DOWNLOAD_SOURCE_SECRET_PREFIX = "opensandbox-download-source"
 
 
 def source_identity() -> str:
     digest = hashlib.sha256(platform.machine().encode())
-    for name in ("upstream.version", "instrumentation.go", "Dockerfile", ".dockerignore", "scripts/build.sh",
-                 "patches/0001-opensandbox-run-instrumentation.patch"):
+    for name in (
+        "upstream.version",
+        "instrumentation.go",
+        "Dockerfile",
+        ".dockerignore",
+        "scripts/build.sh",
+        "patches/0001-opensandbox-run-instrumentation.patch",
+    ):
         digest.update(name.encode() + b"\0" + (COMPONENT / name).read_bytes())
     return digest.hexdigest()
 
@@ -111,26 +121,62 @@ def _ensure_frontend(github_mirror_url: str | None) -> tuple[Path, str]:
 
 
 
-def prepare_frontend(secret_files: dict[str, Path], destination: Path, *,
-                     build_contexts: dict[str, str],
-                     github_mirror_url: str | None = None) -> dict[str, str]:
+def prepare_frontend(
+    secret_files: dict[str, Path],
+    destination: Path,
+    *,
+    build_contexts: dict[str, str],
+    github_mirror_url: str | None = None,
+) -> dict[str, str]:
     args = {}
     for key, prefix in {
         "OPENSANDBOX_APT_WRAPPER": "opensandbox-apt-wrapper-",
         "OPENSANDBOX_APT_REWRITER": "opensandbox-apt-source-rewriter-",
-        "OPENSANDBOX_APT_SOURCE_MAP": "opensandbox-apt-source-map-",
+        "OPENSANDBOX_APT_GATEWAY_ROOT": "opensandbox-apt-gateway-root-",
     }.items():
         matches = [name for name in secret_files if name.startswith(prefix)]
         if len(matches) != 1:
             raise ValueError(f"expected one content-addressed runtime secret for {key}")
         args[key] = matches[0]
+    optional_runtime_args: dict[str, str] = {}
+    optional_prefixes = {
+        "OPENSANDBOX_DOWNLOAD_WRAPPER": DOWNLOAD_WRAPPER_SECRET_PREFIX + "-",
+        "OPENSANDBOX_DOWNLOAD_REWRITER": DOWNLOAD_REWRITER_SECRET_PREFIX + "-",
+        "OPENSANDBOX_DOWNLOAD_SOURCE": DOWNLOAD_SOURCE_SECRET_PREFIX + "-",
+    }
+    optional_matches = {
+        key: [name for name in secret_files if name.startswith(prefix)]
+        for key, prefix in optional_prefixes.items()
+    }
+    if any(optional_matches.values()):
+        for key, matches in optional_matches.items():
+            if len(matches) != 1:
+                raise ValueError(
+                    f"expected one content-addressed runtime secret for {key}"
+                )
+            optional_runtime_args[key] = matches[0]
+    args.update(optional_runtime_args)
     layout, digest = ensure_frontend(github_mirror_url)
-    build_contexts[CONTEXT_NAME] = f"oci-layout://{layout}@{digest}"
-    args["BUILDKIT_SYNTAX"] = CONTEXT_NAME
+    # Docker's local frontend resolver can retain a previously loaded OCI
+    # context behind a reused symbolic name even when the manifest digest has
+    # changed. Make the context name itself content-addressed so a new frontend
+    # implementation can never resolve through the old alias.
+    context_name = f"{CONTEXT_NAME}-{digest.removeprefix('sha256:')}"
+    build_contexts[context_name] = f"oci-layout://{layout}@{digest}"
+    args["BUILDKIT_SYNTAX"] = context_name
     identity = "opensandbox-frontend-" + hashlib.sha256(digest.encode()).hexdigest()
     destination.mkdir(parents=True, exist_ok=True)
     identity_path = destination / "frontend-identity"
     identity_path.write_text(digest + "\n")
     secret_files[identity] = identity_path
     args["OPENSANDBOX_FRONTEND_IDENTITY"] = identity
+    git_config_matches = [
+        name
+        for name in secret_files
+        if name.startswith(GITHUB_MIRROR_CONFIG_MOUNT_ID + "-")
+    ]
+    if len(git_config_matches) > 1:
+        raise ValueError("expected at most one GitHub mirror runtime secret")
+    if git_config_matches:
+        args["OPENSANDBOX_GITHUB_MIRROR_CONFIG"] = git_config_matches[0]
     return args

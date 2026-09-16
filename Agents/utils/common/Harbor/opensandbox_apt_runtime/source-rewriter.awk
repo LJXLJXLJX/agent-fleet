@@ -1,13 +1,104 @@
 BEGIN {
-    while ((getline mapping < map_file) > 0) {
-        separator = index(mapping, "\t")
-        if (!separator) continue
-        origins[++mapping_count] = substr(mapping, 1, separator - 1)
-        replacements[mapping_count] = substr(mapping, separator + 1)
-    }
-    close(map_file)
+    for (byte = 1; byte <= 255; byte++)
+        byte_value[sprintf("%c", byte)] = byte
+    getline dynamic_gateway_root < gateway_file
+    close(gateway_file)
     while ((getline seen_uri < seen_file) > 0) seen[seen_uri] = 1
     close(seen_file)
+}
+
+function encode_component(value, result, position, character, code) {
+    result = ""
+    for (position = 1; position <= length(value); position++) {
+        character = substr(value, position, 1)
+        code = byte_value[character]
+        result = result sprintf("%02x", code)
+    }
+    return result
+}
+
+# Only public DNS names are cache targets. Everything else keeps its authored
+# URI: loopback aliases and IP literals are resolved in the Gateway's own
+# network namespace (not the build namespace, where same-RUN proxies and
+# repositories live), single-label names are build-local service names, and
+# internal suffixes are not public content. IP literals are bypassed
+# wholesale rather than filtered by range.
+function cache_route_allowed(host, lower) {
+    lower = tolower(host)
+    if (lower == "localhost" || lower == "0.0.0.0" || \
+        lower ~ /^127\./ || lower == "::1")
+        return 0
+    if (lower ~ /^[0-9.]+$/ && index(lower, ".") != 0)
+        return 0
+    if (index(lower, ":") != 0)
+        return 0
+    if (index(lower, ".") == 0)
+        return 0
+    if (lower ~ /\.(internal|local|corp|intranet|lan)$/)
+        return 0
+    return 1
+}
+
+function dynamic_route(uri, lowered, scheme, remainder, slash, authority, path,
+                       port, hostname, colon, close_bracket, suffix,
+                       canonical_authority) {
+    lowered = tolower(uri)
+    if (substr(lowered, 1, 8) == "https://") {
+        scheme = "https"
+        remainder = substr(uri, 9)
+    } else if (substr(lowered, 1, 7) == "http://") {
+        scheme = "http"
+        remainder = substr(uri, 8)
+    } else {
+        return ""
+    }
+    if (remainder ~ /[?#]/) return ""
+    slash = index(remainder, "/")
+    if (slash == 0) {
+        authority = remainder
+        path = "/"
+    } else {
+        authority = substr(remainder, 1, slash - 1)
+        path = substr(remainder, slash)
+    }
+    if (authority == "" || authority ~ /@/ || path ~ /^\/\//) return ""
+    while (length(path) > 1 && substr(path, length(path), 1) == "/")
+        path = substr(path, 1, length(path) - 1)
+
+    port = ""
+    if (substr(authority, 1, 1) == "[") {
+        close_bracket = index(authority, "]")
+        if (close_bracket == 0) return ""
+        hostname = substr(authority, 2, close_bracket - 2)
+        suffix = substr(authority, close_bracket + 1)
+        if (suffix != "") {
+            if (substr(suffix, 1, 1) != ":") return ""
+            port = substr(suffix, 2)
+        }
+    } else {
+        colon = index(authority, ":")
+        if (colon == 0) {
+            hostname = authority
+        } else {
+            hostname = substr(authority, 1, colon - 1)
+            port = substr(authority, colon + 1)
+            if (index(port, ":") != 0) return ""
+        }
+    }
+    if (hostname == "") return ""
+    if (!cache_route_allowed(hostname)) return ""
+    if (port != "" && (port !~ /^[0-9]+$/ || port + 0 < 1 || port + 0 > 65535))
+        return ""
+    if (port != "") port = port + 0
+    canonical_authority = tolower(hostname)
+    if (index(canonical_authority, ":") != 0)
+        canonical_authority = "[" canonical_authority "]"
+    if (port != "" && !((scheme == "https" && port == 443) ||
+                         (scheme == "http" && port == 80)))
+        canonical_authority = canonical_authority ":" port
+
+    return dynamic_gateway_root "/apt/v1/" scheme "/" \
+        encode_component(canonical_authority) "/base/" encode_component(path)
 }
 
 function prefix_matches(prefix, uri, suffix) {
@@ -19,8 +110,8 @@ function prefix_matches(prefix, uri, suffix) {
 
 function display_uri(uri, clean, scheme_length, rest, authority, suffix) {
     clean = uri
-    if (clean ~ /^https?:\/\//) {
-        scheme_length = (substr(clean, 1, 5) == "https") ? 8 : 7
+    if (tolower(clean) ~ /^https?:\/\//) {
+        scheme_length = (substr(tolower(clean), 1, 5) == "https") ? 8 : 7
         rest = substr(clean, scheme_length + 1)
         authority = rest
         sub(/[\/?#].*$/, "", authority)
@@ -33,24 +124,18 @@ function display_uri(uri, clean, scheme_length, rest, authority, suffix) {
     return clean
 }
 
-function rewrite_uri(uri, best, best_length, i) {
-    if (uri !~ /^https?:\/\//) return uri
-    for (i = 1; i <= mapping_count; i++) {
-        if (prefix_matches(replacements[i], uri)) return uri
-    }
-    best = 0
-    best_length = -1
-    for (i = 1; i <= mapping_count; i++) {
-        if (length(origins[i]) > best_length && prefix_matches(origins[i], uri)) {
-            best = i
-            best_length = length(origins[i])
-        }
-    }
-    if (best) {
-        return replacements[best] substr(uri, length(origins[best]) + 1)
+function rewrite_uri(uri, generated) {
+    if (tolower(uri) !~ /^https?:\/\//) return uri
+    if (dynamic_gateway_root != "" && prefix_matches(dynamic_gateway_root, uri))
+        return uri
+    # auth.conf(.d) credentials are matched by APT against the source host;
+    # rerouting any source while they exist would break that authentication.
+    if (auth_conf != "1" && dynamic_gateway_root != "") {
+        generated = dynamic_route(uri)
+        if (generated != "") return generated
     }
     if (!seen[uri]) {
-        printf "[opensandbox apt] WARNING event=unmapped-source " \
+        printf "[opensandbox apt] WARNING event=source-bypass " \
             "source=%s file=%s\n", display_uri(uri), display_file > "/dev/stderr"
         seen[uri] = 1
         print uri >> seen_file

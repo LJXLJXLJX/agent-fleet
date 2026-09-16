@@ -36,7 +36,7 @@ Agents/utils/common/Harbor/
 ├── opensandbox_image_manager.py # Per-service image build/cache/publish and Bundle output
 ├── opensandbox_apt_runtime/      # Build-only PATH wrappers and shadow-source rewriter
 │   ├── apt-wrapper.sh            # Runtime apt/apt-get adapter to current /usr/bin binary
-│   └── source-rewriter.awk       # Boundary-safe list and Deb822 URI mapping/warnings
+│   └── source-rewriter.awk       # Derive map-free Gateway routes for list and Deb822 URIs
 ├── opensandbox_buildkit_frontend/ # Pinned upstream frontend, RUN lowering hook, OCI build and differential tests
 ├── OPENSANDBOX_IMAGE_MANAGER.md # OpenSandbox Bundle and image management contract
 ├── prebuild_opensandbox_dataset.sh # Batch prebuild/publish dataset Bundles
@@ -263,6 +263,7 @@ configuration to `OPIK_URL`. An empty `OPIK_URL` still disables tracing.
 | `HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT` | H-local Registry records, image locks, build logs, and immutable Bundle cache root |
 | `HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE` | Dataset prebuild local uploaded-Bundle index switch; defaults to `1` and avoids Registry lookup after a content-hash match |
 | `HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION` | Trust a matching target/task entry in the local uploaded-Bundle index without parsing or hashing task content; defaults to `0` |
+| `HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL` | Optional prebuild-only cache root used by temporary BuildKit RUN-time wrappers for cacheable `curl`/`wget` HTTP(S) GETs; unseen URLs fill on demand, while requests whose behavior cannot be preserved bypass the cache |
 | `HARBOR_OPENSANDBOX_PUB_HOSTED_URL` | Optional provider-neutral Dart Pub source injected only while task images build; empty preserves the Dart default |
 | `HARBOR_OPENSANDBOX_JULIA_PKG_SERVER` | Optional provider-neutral Julia package server injected only while task images build; empty preserves the Julia default |
 | `YICLOUD_HARBOR_HOST` | Required Harbor registry host used for publication and every OpenSandbox image pull; set the real value in `config.local.env` or the environment |

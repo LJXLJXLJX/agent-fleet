@@ -24,10 +24,14 @@ func TestOpenSandboxCorpus(t *testing.T) {
 	for name, fixture := range fixtures {
 		t.Run(name, func(t *testing.T) {
 			args := map[string]string{
-				"OPENSANDBOX_APT_WRAPPER":       "wrapper-v1",
-				"OPENSANDBOX_APT_REWRITER":      "rewriter-v1",
-				"OPENSANDBOX_APT_SOURCE_MAP":    "map-v1",
-				"OPENSANDBOX_FRONTEND_IDENTITY": "frontend-v1",
+				"OPENSANDBOX_APT_WRAPPER":          "wrapper-v1",
+				"OPENSANDBOX_APT_REWRITER":         "rewriter-v1",
+				"OPENSANDBOX_APT_GATEWAY_ROOT":     "gateway-root-v1",
+				"OPENSANDBOX_FRONTEND_IDENTITY":    "frontend-v1",
+				"OPENSANDBOX_DOWNLOAD_WRAPPER":     "download-wrapper-v1",
+				"OPENSANDBOX_DOWNLOAD_REWRITER":    "download-rewriter-v1",
+				"OPENSANDBOX_DOWNLOAD_SOURCE":      "download-source-v1",
+				"OPENSANDBOX_GITHUB_MIRROR_CONFIG": "gitconfig-v1",
 			}
 			caps := pb.Caps.CapSet(pb.Caps.All())
 			st, img, _, _, err := Dockerfile2LLB(ctx, []byte("FROM scratch AS fixture-base\n"+fixture), ConvertOpt{Config: dockerui.Config{BuildArgs: args}, LLBCaps: &caps})
@@ -55,8 +59,8 @@ func TestOpenSandboxCorpus(t *testing.T) {
 				for _, ex := range execs {
 					found := false
 					for _, env := range ex.Meta.Env {
-						found = found || env == "PATH=/run/opensandbox-apt/bin" ||
-							strings.HasPrefix(env, "PATH=/run/opensandbox-apt/bin:")
+						found = found || env == "PATH=/run/opensandbox-download/bin:/run/opensandbox-apt/bin" ||
+							strings.HasPrefix(env, "PATH=/run/opensandbox-download/bin:/run/opensandbox-apt/bin:")
 					}
 					require.True(t, found)
 					count := 0
@@ -66,6 +70,16 @@ func TestOpenSandboxCorpus(t *testing.T) {
 						}
 					}
 					require.Equal(t, 6, count)
+					downloadCount := 0
+					gitConfigFound := false
+					for _, mount := range ex.Mounts {
+						if strings.HasPrefix(mount.Dest, "/run/opensandbox-download/") {
+							downloadCount++
+						}
+						gitConfigFound = gitConfigFound || mount.Dest == "/etc/gitconfig"
+					}
+					require.Equal(t, 4, downloadCount)
+					require.True(t, gitConfigFound)
 				}
 			}
 			result, err := json.MarshalIndent(map[string]any{"execs": execs, "config": img.Config}, "", "  ")

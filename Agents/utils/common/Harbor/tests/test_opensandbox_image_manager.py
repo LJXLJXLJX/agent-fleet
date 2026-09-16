@@ -29,10 +29,9 @@ from opensandbox_image_manager import (
     _service_image_inputs,
     _service_manifest,
     apt_404_requires_cache_refresh,
+    apt_gateway_root_content,
     apt_runtime_asset_digest,
     apt_runtime_secret_ids,
-    apt_runtime_source_overrides,
-    apt_source_map_content,
     check_task_repository,
     environment_content_hash,
     github_mirror_config_content,
@@ -41,7 +40,6 @@ from opensandbox_image_manager import (
     oci_archive_image_config,
     package_source_build_args,
     package_source_hosts,
-    parse_apt_source_overrides,
     parse_args,
     prepare,
     prepare_bundle,
@@ -49,6 +47,7 @@ from opensandbox_image_manager import (
     render_build_dockerfile,
     run_build,
     schema2_manifest,
+    validate_download_source_url,
     validate_github_mirror_url,
 )
 
@@ -125,9 +124,6 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
         )
         self.assertEqual(args.build_network, "host")
         self.assertEqual(
-            args.apt_mirror, "http://mirrors.tuna.tsinghua.edu.cn"
-        )
-        self.assertEqual(
             args.pip_index_url, "https://pypi.tuna.tsinghua.edu.cn/simple"
         )
         self.assertEqual(args.npm_registry, "https://registry.npmmirror.com")
@@ -168,6 +164,33 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
         )
         self.assertEqual(
             args.julia_pkg_server, "https://third-party.example/julia/pkg"
+        )
+
+    def test_cli_reads_download_source_from_environment(self) -> None:
+        source = "http://third-party-source.internal/v1/cache"
+        with patch.dict(
+            os.environ,
+            {"HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL": source},
+            clear=True,
+        ):
+            args = parse_args(
+                [
+                    "--task-dir",
+                    "/tmp/example-task",
+                    "--project",
+                    "test-project",
+                    "--dry-run",
+                ]
+            )
+
+        self.assertEqual(args.download_source_url, source)
+
+    def test_download_source_root_is_provider_neutral(self) -> None:
+        self.assertEqual(
+            validate_download_source_url(
+                "https://third-party-source.example/cache/", "host"
+            ),
+            "https://third-party-source.example/cache",
         )
 
     def test_prepare_requires_registry_from_cli_or_environment(self) -> None:
@@ -505,7 +528,6 @@ networks:
                 platform="linux/amd64",
                 tag_prefix="harbor",
                 dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-                apt_mirror="https://mirrors.tuna.tsinghua.edu.cn",
                 build_args_json="{}",
                 bundle_manifest_output=manifest_path,
                 force=False,
@@ -537,7 +559,6 @@ networks:
                 "FROM builder\n"
             ),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="https://mirrors.tuna.tsinghua.edu.cn",
             package_build_args={
                 "NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com",
                 "PIP_INDEX_URL": "https://pypi.tuna.tsinghua.edu.cn/simple",
@@ -585,7 +606,6 @@ networks:
             "FROM dart:stable\nRUN dart pub get\n"
             "FROM julia:1\nRUN julia -e 'using Pkg; Pkg.instantiate()'\n",
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="https://mirrors.tuna.tsinghua.edu.cn",
             package_build_args=build_args,
         )
 
@@ -630,7 +650,7 @@ networks:
             ):
                 package_source_build_args(Namespace(**{field: value}), "host")
 
-    def test_github_mirror_mount_remains_on_shell_form_run(self) -> None:
+    def test_github_mirror_config_is_not_injected_by_renderer(self) -> None:
         mirror = validate_github_mirror_url(
             "http://github-mirror.internal:8080/repos", "host"
         )
@@ -638,21 +658,17 @@ networks:
         rendered = render_build_dockerfile(
             "FROM ubuntu:24.04 AS builder\nRUN git submodule update --init --recursive\nFROM builder\n",
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="https://mirrors.tuna.tsinghua.edu.cn",
-            github_mirror_config_mount_id="opensandbox-github-mirror-gitconfig",
         )
 
         self.assertEqual(mirror, "http://github-mirror.internal:8080/repos/")
         self.assertIn("insteadOf = https://github.com/", config)
         self.assertIn("insteadOf = git@github.com:", config)
-        self.assertEqual(
-            rendered.count("id=opensandbox-github-mirror-gitconfig"), 1
-        )
-        self.assertIn("target=/etc/gitconfig,mode=0444,required=true", rendered)
+        self.assertIn("RUN git submodule update --init --recursive", rendered)
+        self.assertNotIn("opensandbox-github-mirror-gitconfig", rendered)
         self.assertNotIn("/run/opensandbox-apt", rendered)
         self.assertNotIn(mirror, rendered)
 
-    def test_github_mirror_mount_preserves_exec_form_without_apt_runtime(
+    def test_renderer_preserves_exec_form_for_frontend_runtime(
         self,
     ) -> None:
         source = (
@@ -662,17 +678,13 @@ networks:
         rendered = render_build_dockerfile(
             source,
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="https://mirrors.tuna.tsinghua.edu.cn",
-            github_mirror_config_mount_id="opensandbox-github-mirror-gitconfig",
         )
 
         self.assertIn(
-            "RUN --mount=type=secret,"
-            "id=opensandbox-github-mirror-gitconfig,"
-            "target=/etc/gitconfig,mode=0444,required=true "
             '["git", "clone", "https://github.com/foo/bar.git"]',
             rendered,
         )
+        self.assertNotIn("/etc/gitconfig", rendered)
         self.assertNotIn("run-with-apt-path", rendered)
         self.assertNotIn("/run/opensandbox-apt/bin/apt", rendered)
         self.assertNotIn("target=/run/opensandbox-apt/shadow", rendered)
@@ -686,7 +698,6 @@ networks:
                 'RUN ["git", "clone", "https://github.com/foo/bar.git"]\n'
             ),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="https://mirrors.tuna.tsinghua.edu.cn",
         )
 
         self.assertIn(
@@ -722,27 +733,36 @@ networks:
             )
 
     def rewrite_apt_source(
-        self, source: str, source_kind: str, overrides: dict[str, str]
+        self,
+        source: str,
+        source_kind: str,
+        dynamic_gateway_root: str = "",
+        auth_conf: str = "",
     ) -> tuple[str, str]:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source_path = root / f"source.{source_kind}"
-            map_path = root / "map.tsv"
+            gateway_path = root / "gateway-root"
             seen_path = root / "seen"
             source_path.write_text(source, encoding="utf-8")
-            map_path.write_text(apt_source_map_content(overrides), encoding="utf-8")
+            gateway_path.write_text(
+                apt_gateway_root_content(dynamic_gateway_root),
+                encoding="utf-8",
+            )
             seen_path.touch()
             completed = subprocess.run(
                 [
                     "awk",
                     "-v",
-                    f"map_file={map_path}",
+                    f"gateway_file={gateway_path}",
                     "-v",
                     f"seen_file={seen_path}",
                     "-v",
                     f"source_kind={source_kind}",
                     "-v",
                     "display_file=/etc/apt/sources.list.d/test",
+                    "-v",
+                    f"auth_conf={auth_conf}",
                     "-f",
                     str(APT_RUNTIME_ASSET_DIR / "source-rewriter.awk"),
                     str(source_path),
@@ -765,113 +785,7 @@ networks:
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def test_runtime_map_rejects_overlapping_endpoints(self) -> None:
-        for overrides in (
-            {"http://a/repo": "http://b/repo", "http://x/repo": "http://a/repo"},
-            {"http://a/repo": "http://b/repo", "http://x/repo": "http://a/repo/child"},
-            {"http://a/repo/child": "http://b/repo", "http://x/repo": "http://a/repo"},
-            {"http://gateway/cache": "http://other/cache"},
-        ):
-            with (self.subTest(overrides=overrides),
-                  self.assertRaisesRegex(ValueError, "must not overlap")):
-                apt_runtime_source_overrides("http://gateway/cache", overrides)
-
-    def test_runtime_map_keeps_shared_targets_and_distinct_prefixes(self) -> None:
-        overrides = {
-            "http://a/repo": "http://gateway/vendor",
-            "http://b/repo": "http://gateway/vendor",
-            "http://a/repository": "http://gateway/other",
-            "http://x/repo": "http://a/repository-other",
-        }
-        combined = apt_runtime_source_overrides("http://gateway/cache", overrides)
-        for origin, replacement in overrides.items():
-            self.assertEqual(combined[origin], replacement)
-        self.assertEqual(combined["http://archive.ubuntu.com/ubuntu"],
-                         combined["http://security.ubuntu.com/ubuntu"])
-
-        same_origin = apt_runtime_source_overrides(
-            "http://archive.ubuntu.com", {}
-        )
-        self.assertNotIn("http://archive.ubuntu.com/ubuntu", same_origin)
-        self.assertEqual(
-            same_origin["https://archive.ubuntu.com/ubuntu"],
-            "http://archive.ubuntu.com/ubuntu",
-        )
-
-    def test_apt_source_overrides_normalize_trailing_slashes(self) -> None:
-        overrides = parse_apt_source_overrides(
-            json.dumps(
-                {
-                    "https://packages.example.com/repository/": (
-                        "http://sources.internal/apt/vendor/"
-                    )
-                }
-            ),
-            "host",
-        )
-
-        self.assertEqual(
-            overrides,
-            {
-                "https://packages.example.com/repository": (
-                    "http://sources.internal/apt/vendor"
-                )
-            },
-        )
-
-    def test_runtime_list_mapping_uses_longest_boundary_safe_prefix(self) -> None:
-        overrides = {
-            "https://apt.postgresql.org/pub/repos/apt": (
-                "http://gateway/apt/postgresql"
-            ),
-            "https://download.docker.com": "http://gateway/apt/docker",
-            "https://download.docker.com/linux": (
-                "http://gateway/apt/docker-linux"
-            ),
-            "https://packages.example/repo": "http://gateway/apt/packages",
-        }
-        source = (
-            "deb https://apt.postgresql.org/pub/repos/apt stable main\n"
-            "deb [arch=amd64 signed-by=/keys/docker.gpg] "
-            "https://download.docker.com/linux/ubuntu noble stable\n"
-            "deb https://download.docker.com/repository-other stable main\n"
-            "deb https://packages.example/repository-other stable main\n"
-            "deb http://gateway/apt/docker/linux/debian stable main\n"
-            "deb https://unmapped.example/repo stable main\n"
-            "deb https://unmapped.example/repo stable main\n"
-            "deb https://download.docker.com.evil/linux stable main\n"
-            "deb https://download.docker.com:8443/linux stable main\n"
-            "deb file:/srv/packages stable main\n"
-            "deb cdrom:[Debian GNU/Linux] stable main\n"
-            "# deb https://commented.example/repo stable main\n"
-        )
-
-        rewritten, warnings = self.rewrite_apt_source(source, "list", overrides)
-
-        self.assertIn("deb http://gateway/apt/postgresql stable main", rewritten)
-        self.assertIn(
-            "[arch=amd64 signed-by=/keys/docker.gpg] "
-            "http://gateway/apt/docker-linux/ubuntu noble stable",
-            rewritten,
-        )
-        self.assertIn("http://gateway/apt/docker/repository-other", rewritten)
-        self.assertIn("https://packages.example/repository-other", rewritten)
-        self.assertIn("https://download.docker.com.evil/linux", rewritten)
-        self.assertIn("https://download.docker.com:8443/linux", rewritten)
-        self.assertIn("http://gateway/apt/docker/linux/debian", rewritten)
-        self.assertEqual(warnings.count("source=https://unmapped.example/repo"), 1)
-        self.assertIn(
-            "source=https://packages.example/repository-other", warnings
-        )
-        self.assertIn("file=/etc/apt/sources.list.d/test", warnings)
-        self.assertIn("source=https://download.docker.com.evil/linux", warnings)
-        self.assertIn("source=https://download.docker.com:8443/linux", warnings)
-        self.assertNotIn("commented.example", warnings)
-        self.assertNotIn("source=file:", warnings)
-        self.assertNotIn("source=cdrom:", warnings)
-        self.assertNotIn("source=http://gateway", warnings)
-
-    def test_runtime_deb822_maps_multiple_uris_and_skips_disabled_stanza(self) -> None:
+    def test_runtime_deb822_derives_routes_and_skips_disabled_stanza(self) -> None:
         source = (
             "Types: deb\n"
             "URIs: https://one.example/repo https://two.example/base/child "
@@ -887,16 +801,18 @@ networks:
         rewritten, warnings = self.rewrite_apt_source(
             source,
             "sources",
-            {
-                "https://one.example/repo": "http://gateway/apt/one",
-                "https://two.example/base": "http://gateway/apt/two",
-            },
+            "http://gateway/v1/cache",
         )
-
-        self.assertIn(
-            "URIs: http://gateway/apt/one http://gateway/apt/two/child",
-            rewritten,
+        one = (
+            "http://gateway/v1/cache/apt/v1/https/"
+            f"{b'one.example'.hex()}/base/{b'/repo'.hex()}"
         )
+        two = (
+            "http://gateway/v1/cache/apt/v1/https/"
+            f"{b'two.example'.hex()}/base/"
+            f"{b'/base/child'.hex()}"
+        )
+        self.assertIn(f"URIs: {one} {two} file:/srv/packages", rewritten)
         self.assertIn("Suites: noble noble-updates", rewritten)
         self.assertIn("Signed-By: /keys/example.gpg", rewritten)
         self.assertIn("file:/srv/packages", rewritten)
@@ -904,13 +820,102 @@ networks:
         self.assertIn("URIs: https://disabled.example/repo", rewritten)
         self.assertNotIn("disabled.example", warnings)
 
+    def test_runtime_derives_dynamic_gateway_route_for_unmapped_apt_source(
+        self,
+    ) -> None:
+        source = (
+            "deb https://repo.example:8443/linux/ubuntu/ noble main\n"
+            "deb HTTPS://UPPER.example/repo stable main\n"
+            "deb http://gateway/v1/cache/debian trixie main\n"
+        )
+        rewritten, warnings = self.rewrite_apt_source(
+            source,
+            "list",
+            "http://gateway/v1/cache",
+        )
+        expected = (
+            "http://gateway/v1/cache/apt/v1/https/"
+            f"{b'repo.example:8443'.hex()}/base/"
+            f"{b'/linux/ubuntu'.hex()}"
+        )
+        self.assertIn(f"deb {expected} noble main", rewritten)
+        uppercase = (
+            "http://gateway/v1/cache/apt/v1/https/"
+            f"{b'upper.example'.hex()}/base/{b'/repo'.hex()}"
+        )
+        self.assertIn(f"deb {uppercase} stable main", rewritten)
+        self.assertIn(
+            "deb http://gateway/v1/cache/debian trixie main",
+            rewritten,
+        )
+        self.assertEqual(warnings, "")
+
+    def test_runtime_preserves_authored_apt_source_without_gateway(self) -> None:
+        source = (
+            "deb http://archive.ubuntu.com/ubuntu noble main\n"
+            "deb https://deb.debian.org/debian-security trixie-security main\n"
+        )
+        rewritten, warnings = self.rewrite_apt_source(source, "list")
+        self.assertIn(
+            "deb http://archive.ubuntu.com/ubuntu noble main", rewritten
+        )
+        self.assertIn(
+            "deb https://deb.debian.org/debian-security trixie-security main",
+            rewritten,
+        )
+        self.assertIn("event=source-bypass", warnings)
+        self.assertIn("source=http://archive.ubuntu.com/ubuntu", warnings)
+
+    def test_runtime_preserves_loopback_apt_source_with_gateway(self) -> None:
+        source = (
+            "deb http://127.0.0.1:3142/ubuntu noble main\n"
+            "deb http://localhost:8080/repo stable main\n"
+        )
+        rewritten, warnings = self.rewrite_apt_source(
+            source, "list", "http://gateway/v1/cache"
+        )
+        self.assertIn(
+            "deb http://127.0.0.1:3142/ubuntu noble main", rewritten
+        )
+        self.assertIn("deb http://localhost:8080/repo stable main", rewritten)
+        self.assertIn("event=source-bypass", warnings)
+        self.assertIn("source=http://127.0.0.1:3142/ubuntu", warnings)
+
+    def test_runtime_preserves_non_public_apt_source_with_gateway(self) -> None:
+        source = (
+            "deb http://10.0.0.5/ubuntu noble main\n"
+            "deb http://repo.corp.internal/debian stable main\n"
+        )
+        rewritten, warnings = self.rewrite_apt_source(
+            source, "list", "http://gateway/v1/cache"
+        )
+        self.assertIn("deb http://10.0.0.5/ubuntu noble main", rewritten)
+        self.assertIn(
+            "deb http://repo.corp.internal/debian stable main", rewritten
+        )
+        self.assertIn("event=source-bypass", warnings)
+        self.assertIn("source=http://10.0.0.5/ubuntu", warnings)
+
+    def test_runtime_preserves_all_sources_when_auth_conf_exists(self) -> None:
+        source = "deb http://archive.ubuntu.com/ubuntu noble main\n"
+        rewritten, warnings = self.rewrite_apt_source(
+            source, "list", "http://gateway/v1/cache", auth_conf="1"
+        )
+        self.assertIn(
+            "deb http://archive.ubuntu.com/ubuntu noble main", rewritten
+        )
+        self.assertIn("event=source-bypass", warnings)
+        self.assertIn("source=http://archive.ubuntu.com/ubuntu", warnings)
+
     def test_runtime_warning_redacts_credentials_from_list_source(self) -> None:
         source = (
             "deb https://ci-user:FAKE_LIST_TOKEN@repo.invalid/private "
             "noble main\n"
         )
 
-        rewritten, warnings = self.rewrite_apt_source(source, "list", {})
+        rewritten, warnings = self.rewrite_apt_source(
+            source, "list", "http://gateway/v1/cache"
+        )
 
         self.assertIn(
             "deb https://ci-user:FAKE_LIST_TOKEN@repo.invalid/private",
@@ -926,7 +931,9 @@ networks:
             "noble main\n"
         )
 
-        rewritten, warnings = self.rewrite_apt_source(source, "list", {})
+        rewritten, warnings = self.rewrite_apt_source(
+            source, "list", "http://gateway/v1/cache"
+        )
 
         self.assertIn(
             "https://ci-user:FAKE_TOKEN@SECRET_SUFFIX@repo.invalid/private",
@@ -945,7 +952,9 @@ networks:
             "Components: main\n"
         )
 
-        rewritten, warnings = self.rewrite_apt_source(source, "sources", {})
+        rewritten, warnings = self.rewrite_apt_source(
+            source, "sources", "http://gateway/v1/cache"
+        )
 
         self.assertIn(
             "URIs: https://repo.invalid/private?access_token=FAKE_QUERY_TOKEN",
@@ -970,7 +979,6 @@ networks:
         rendered = render_build_dockerfile(
             source,
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://gateway/apt",
         )
 
         self.assertEqual(rendered.count("target=/run/opensandbox-apt/bin/apt,"), 0)
@@ -994,7 +1002,6 @@ networks:
                 '     "update"]\n'
             ),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://gateway/apt",
         )
 
         self.assertIn('RUN ["apt-get", \\\n     "update"]', rendered)
@@ -1002,7 +1009,7 @@ networks:
         self.assertNotIn("run-with-apt-path", rendered)
         self.assertNotIn("export PATH=", rendered)
 
-    def test_renderer_preserves_all_run_options_with_git_mount(self) -> None:
+    def test_renderer_preserves_all_run_options_for_frontend(self) -> None:
         rendered = render_build_dockerfile(
             (
                 "FROM ubuntu:24.04\n"
@@ -1011,8 +1018,6 @@ networks:
                 "--device=nvidia.com/gpu=all echo hello\n"
             ),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://gateway/apt",
-            github_mirror_config_mount_id="opensandbox-github-mirror-gitconfig",
         )
         run_line = next(
             line for line in rendered.splitlines() if line.startswith("RUN ")
@@ -1023,7 +1028,6 @@ networks:
             "--network=none",
             "--security=sandbox",
             "--device=nvidia.com/gpu=all",
-            "target=/etc/gitconfig,mode=0444,required=true",
         ):
             self.assertLess(run_line.index(option), run_line.index("echo hello"))
         self.assertIn(
@@ -1038,7 +1042,6 @@ networks:
                 "RUN echo no-package-manager-use\n"
             ),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://gateway/apt",
         )
 
         self.assertIn(
@@ -1057,7 +1060,7 @@ networks:
         self.assertIn("Dir::Etc::SourceList=$source_view/sources.list", wrapper)
         self.assertIn("event=index-reconciliation-failed", wrapper)
         self.assertIn("indextargets --no-release-info", wrapper)
-        self.assertIn("event=unmapped-source", (
+        self.assertIn("event=source-bypass", (
             APT_RUNTIME_ASSET_DIR / "source-rewriter.awk"
         ).read_text(encoding="utf-8"))
         self.assertIn('${APT_CONFIG:-}', wrapper)
@@ -1075,10 +1078,6 @@ networks:
                 "RUN /usr/bin/apt-get --version\n"
             ),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://gateway/apt",
-            apt_source_overrides={
-                "https://packages.example/repo": "http://gateway/apt/vendor"
-            },
         )
 
         self.assertIn(
@@ -1099,95 +1098,24 @@ networks:
                 "RUN curl -fsSL https://packages.example.com/key.gpg\n"
             ),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
         )
 
         self.assertIn("https://packages.example.com/key.gpg", rendered)
 
-    def test_render_rewrites_object_fetch_in_opaque_stage(
-        self,
-    ) -> None:
-        rendered = render_build_dockerfile(
-            (
-                "FROM registry.internal/custom/base:latest\n"
-                "RUN curl -fsSL https://packages.example.com/setup.sh | sh\n"
-            ),
-            dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
-            apt_source_overrides={
-                "https://packages.example.com/setup.sh": (
-                    "http://sources.internal/objects/vendor-setup.sh"
-                )
-            },
-        )
-        self.assertIn("sources.internal/objects/vendor-setup.sh", rendered)
-
-    def test_render_does_not_rewrite_url_persisted_outside_apt(self) -> None:
+    def test_renderer_leaves_download_commands_for_runtime_interception(self) -> None:
         rendered = render_build_dockerfile(
             (
                 "FROM registry.internal/opaque:latest\n"
-                "RUN curl -fsSL https://packages.example/repository "
-                "-o /tmp/package && "
-                "printf %s https://packages.example/repository "
-                "> /app/runtime.conf\n"
+                "RUN curl -fsSL https://packages.example/setup.sh | sh\n"
+                "RUN wget -O /tmp/tool https://downloads.example/tool.tar.gz\n"
             ),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
-            apt_source_overrides={
-                "https://packages.example/repository": (
-                    "http://sources.internal/apt/vendor"
-                )
-            },
         )
 
-        task_run = next(line for line in rendered.splitlines() if "curl" in line)
+        self.assertIn("curl -fsSL https://packages.example/setup.sh | sh", rendered)
         self.assertIn(
-            "curl -fsSL http://sources.internal/apt/vendor", task_run
+            "wget -O /tmp/tool https://downloads.example/tool.tar.gz", rendered
         )
-        self.assertIn(
-            "printf %s https://packages.example/repository", task_run
-        )
-        self.assertNotIn(
-            "printf %s http://sources.internal/apt/vendor", task_run
-        )
-
-    def test_render_rewrites_exec_form_fetch_source_override(self) -> None:
-        rendered = render_build_dockerfile(
-            (
-                "FROM registry.internal/opaque:latest\n"
-                'RUN ["/usr/bin/curl", "-fsSL", '
-                '"https://packages.example/key", "-o", "/tmp/key"]\n'
-            ),
-            dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
-            apt_source_overrides={
-                "https://packages.example/key": (
-                    "http://sources.internal/objects/key"
-                )
-            },
-        )
-
-        self.assertIn("http://sources.internal/objects/key", rendered)
-        self.assertNotIn("https://packages.example/key", rendered)
-
-    def test_render_preserves_exec_form_non_fetch_url_data(self) -> None:
-        rendered = render_build_dockerfile(
-            (
-                "FROM registry.internal/opaque:latest\n"
-                'RUN ["printf", "%s", '
-                '"https://packages.example/repository"]\n'
-            ),
-            dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
-            apt_source_overrides={
-                "https://packages.example/repository": (
-                    "http://sources.internal/apt/vendor"
-                )
-            },
-        )
-
-        self.assertIn("https://packages.example/repository", rendered)
-        self.assertNotIn("http://sources.internal/apt/vendor", rendered)
 
     def test_render_never_rewrites_authored_apt_source(self) -> None:
         rendered = render_build_dockerfile(
@@ -1197,12 +1125,6 @@ networks:
                 "> /etc/apt/sources.list.d/vendor.list\n"
             ),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
-            apt_source_overrides={
-                "https://packages.example/repository": (
-                    "http://sources.internal/apt/vendor"
-                )
-            },
         )
 
         self.assertIn("https://packages.example/repository", rendered)
@@ -1219,12 +1141,6 @@ networks:
                 "> /etc/apt/trusted.gpg.d/runtime.conf\n"
             ),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
-            apt_source_overrides={
-                "https://packages.example/repository": (
-                    "http://sources.internal/apt/vendor"
-                )
-            },
         )
 
         task_run = next(
@@ -1232,136 +1148,6 @@ networks:
         )
         self.assertIn("https://packages.example/repository", task_run)
         self.assertNotIn("http://sources.internal/apt/vendor", task_run)
-
-    def test_render_rewrites_url_only_run_continuation(self) -> None:
-        rendered = render_build_dockerfile(
-            (
-                "FROM ubuntu:24.04\n"
-                "RUN curl -fsSL \\\n"
-                "    https://packages.example.com/signing-key.gpg\n"
-            ),
-            dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
-            apt_source_overrides={
-                "https://packages.example.com/signing-key.gpg": (
-                    "http://sources.internal/objects/vendor-key.gpg"
-                )
-            },
-        )
-
-        self.assertIn(
-            "http://sources.internal/objects/vendor-key.gpg", rendered
-        )
-        self.assertNotIn(
-            "    https://packages.example.com/signing-key.gpg", rendered
-        )
-
-    def test_render_rewrites_configured_sources_inside_run_heredoc(self) -> None:
-        rendered = render_build_dockerfile(
-            (
-                "FROM ubuntu:24.04\n"
-                "RUN <<-DOCKER_RUN_EOF\n"
-                "\tcurl -fsSL https://bazel.example/signing-key.gpg "
-                "-o /tmp/bazel.gpg\n"
-                "\techo 'deb https://packages.example/bazel stable main' "
-                "> /etc/apt/sources.list.d/bazel.list\n"
-                "\tapt-get update\n"
-                "DOCKER_RUN_EOF\n"
-            ),
-            dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
-            apt_source_overrides={
-                "https://bazel.example/signing-key.gpg": (
-                    "http://sources.internal/objects/bazel-key.gpg"
-                ),
-                "https://packages.example/bazel": (
-                    "http://sources.internal/apt/bazel"
-                ),
-            },
-        )
-        self.assertIn(
-            "curl -fsSL http://sources.internal/objects/bazel-key.gpg",
-            rendered,
-        )
-        self.assertIn(
-            "deb https://packages.example/bazel stable main", rendered
-        )
-        self.assertIn("DOCKER_RUN_EOF\n", rendered)
-        self.assertNotIn("target=/usr/bin/apt", rendered)
-
-    def test_render_rewrites_object_fetch_in_command_heredoc(
-        self,
-    ) -> None:
-        rendered = render_build_dockerfile(
-            (
-                "FROM registry.internal/opaque:latest\n"
-                "RUN <<'EOF'\n"
-                "curl -fsSL https://packages.example/setup.sh | sh\n"
-                "EOF\n"
-            ),
-            dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
-            apt_source_overrides={
-                "https://packages.example/setup.sh": (
-                    "http://sources.internal/objects/setup.sh"
-                )
-            },
-        )
-
-        self.assertIn(
-            "curl -fsSL http://sources.internal/objects/setup.sh | sh",
-            rendered,
-        )
-
-    def test_render_preserves_source_override_in_persisted_run_heredoc(
-        self,
-    ) -> None:
-        rendered = render_build_dockerfile(
-            (
-                "FROM registry.internal/opaque:latest\n"
-                "RUN cat <<'EOF' > /usr/local/bin/fetch\n"
-                "#!/bin/sh\n"
-                "curl -fsSL https://packages.example/setup.sh | sh\n"
-                "EOF\n"
-            ),
-            dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
-            apt_source_overrides={
-                "https://packages.example/setup.sh": (
-                    "http://sources.internal/objects/setup.sh"
-                )
-            },
-        )
-
-        self.assertIn(
-            "curl -fsSL https://packages.example/setup.sh | sh", rendered
-        )
-        self.assertNotIn("sources.internal/objects/setup.sh", rendered)
-
-    def test_render_rewrites_source_override_in_shell_command_heredoc(
-        self,
-    ) -> None:
-        rendered = render_build_dockerfile(
-            (
-                "FROM registry.internal/opaque:latest\n"
-                "RUN /bin/bash <<'EOF'\n"
-                "curl -fsSL https://packages.example/setup.sh | sh\n"
-                "EOF\n"
-            ),
-            dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
-            apt_source_overrides={
-                "https://packages.example/setup.sh": (
-                    "http://sources.internal/objects/setup.sh"
-                )
-            },
-        )
-
-        self.assertIn(
-            "curl -fsSL http://sources.internal/objects/setup.sh | sh",
-            rendered,
-        )
-        self.assertNotIn("https://packages.example/setup.sh", rendered)
 
     def test_render_preserves_apt_source_data_heredoc(
         self,
@@ -1375,12 +1161,6 @@ networks:
                 "RUN apt-get update\n"
             ),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
-            apt_source_overrides={
-                "https://packages.example/repository": (
-                    "http://sources.internal/apt/vendor"
-                )
-            },
         )
 
         task_heredoc = rendered[
@@ -1399,7 +1179,6 @@ networks:
                 "EOF\n"
             ),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
         )
 
         self.assertIn("apt-get update", rendered)
@@ -1416,12 +1195,6 @@ networks:
                 "SOURCES\n"
             ),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="http://apt-mirror.internal/repos",
-            apt_source_overrides={
-                "https://packages.example/repository": (
-                    "http://sources.internal/apt/vendor"
-                )
-            },
         )
 
         self.assertIn(
@@ -1445,7 +1218,6 @@ networks:
                 "APP\n"
             ),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-            apt_mirror="https://mirrors.tuna.tsinghua.edu.cn",
         )
 
         self.assertIn(
@@ -1659,7 +1431,6 @@ networks:
                 platform="linux/amd64",
                 tag_prefix="harbor",
                 dockerhub_mirror_prefix="m.daocloud.io/docker.io",
-                apt_mirror="https://mirrors.tuna.tsinghua.edu.cn",
                 build_args_json="{}",
                 force=False,
                 registry_tls_verify=False,

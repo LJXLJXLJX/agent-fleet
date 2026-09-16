@@ -18,13 +18,20 @@ from opensandbox_buildkit_frontend import (
 )
 from opensandbox_image_manager import (
     materialize_apt_runtime_assets,
+    materialize_download_runtime_assets,
     render_build_dockerfile,
 )
 
 
 class FrontendContractTest(unittest.TestCase):
     def setUp(self):
-        self.frontend = patch('opensandbox_buildkit_frontend.ensure_frontend', return_value=(Path('/local/layout'), 'sha256:' + '0' * 64))
+        self.frontend = patch(
+            'opensandbox_buildkit_frontend.ensure_frontend',
+            return_value=(
+                Path('/local/layout'),
+                'sha256:' + '0' * 64,
+            ),
+        )
         self.resolve = self.frontend.start()
         self.addCleanup(self.frontend.stop)
 
@@ -33,24 +40,33 @@ class FrontendContractTest(unittest.TestCase):
             with self.subTest(name=name):
                 source = 'FROM scratch AS fixture-base\n' + fixture
                 self.assertEqual(source, render_build_dockerfile(
-                    source, dockerhub_mirror_prefix='', apt_mirror='',
-                    apt_source_overrides={'http://original.invalid/repo': 'http://cache.invalid/repo'},
+                    source, dockerhub_mirror_prefix='',
                 ))
 
     def test_content_addressed_args_and_frontend_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            secrets = materialize_apt_runtime_assets(root, {'http://original/repo': 'http://gateway/repo'})
+            secrets = materialize_apt_runtime_assets(
+                root, 'http://gateway/v1/cache'
+            )
             first = prepare_frontend(secrets, root, build_contexts={})
             self.assertEqual(first, prepare_frontend(secrets, root, build_contexts={}))
-            for name in ('OPENSANDBOX_APT_WRAPPER', 'OPENSANDBOX_APT_REWRITER', 'OPENSANDBOX_APT_SOURCE_MAP', 'OPENSANDBOX_FRONTEND_IDENTITY'):
+            for name in ('OPENSANDBOX_APT_WRAPPER', 'OPENSANDBOX_APT_REWRITER', 'OPENSANDBOX_APT_GATEWAY_ROOT', 'OPENSANDBOX_FRONTEND_IDENTITY'):
                 self.assertIn(first[name], secrets)
-            with patch('opensandbox_buildkit_frontend.ensure_frontend', return_value=(Path('/other/layout'), 'sha256:' + '1' * 64)):
+            with patch(
+                'opensandbox_buildkit_frontend.ensure_frontend',
+                return_value=(
+                    Path('/other/layout'),
+                    'sha256:' + '1' * 64,
+                ),
+            ):
                 second = prepare_frontend(secrets, root, build_contexts={})
             self.assertNotEqual(first['OPENSANDBOX_FRONTEND_IDENTITY'], second['OPENSANDBOX_FRONTEND_IDENTITY'])
-            changed = materialize_apt_runtime_assets(root, {'http://original/repo': 'http://gateway/other'})
+            changed = materialize_apt_runtime_assets(
+                root, 'http://gateway/other/v1/cache'
+            )
             third = prepare_frontend(changed, root, build_contexts={})
-            self.assertNotEqual(first['OPENSANDBOX_APT_SOURCE_MAP'], third['OPENSANDBOX_APT_SOURCE_MAP'])
+            self.assertNotEqual(first['OPENSANDBOX_APT_GATEWAY_ROOT'], third['OPENSANDBOX_APT_GATEWAY_ROOT'])
 
     def test_missing_assets_fail_before_build(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -61,12 +77,86 @@ class FrontendContractTest(unittest.TestCase):
     def test_local_context_and_path_independent_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            secrets = materialize_apt_runtime_assets(root, {})
+            secrets = materialize_apt_runtime_assets(root, '')
             contexts = {}
             first = prepare_frontend(secrets, root, build_contexts=contexts)
+            self.assertEqual(
+                first['BUILDKIT_SYNTAX'],
+                'opensandbox-instrumentation-frontend-' + '0' * 64,
+            )
             self.assertEqual(contexts[first['BUILDKIT_SYNTAX']], 'oci-layout:///local/layout@sha256:' + '0' * 64)
-            self.resolve.return_value = (Path('/moved/layout'), 'sha256:' + '0' * 64)
+            self.resolve.return_value = (
+                Path('/moved/layout'),
+                'sha256:' + '0' * 64,
+            )
             self.assertEqual(first, prepare_frontend(secrets, root, build_contexts={}))
+
+    def test_frontend_packaging_uses_content_addressed_binary_name(self):
+        script = (
+            Path(__file__).resolve().parents[1] / 'scripts' / 'build.sh'
+        ).read_text()
+        self.assertIn(
+            'binary_name="dockerfile-frontend-${binary_digest}"', script
+        )
+        self.assertIn(
+            '> "$FRONTEND_WORK_DIR/image/.dockerignore"', script
+        )
+
+    def test_optional_download_and_git_runtime_secrets_are_content_addressed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.resolve.return_value = (
+                Path('/local/layout'),
+                'sha256:' + '0' * 64,
+            )
+            secrets = materialize_apt_runtime_assets(root, '')
+            secrets.update(
+                materialize_download_runtime_assets(
+                    root / 'download',
+                    'http://third-party-source.internal/v1/cache',
+                )
+            )
+            gitconfig = root / 'gitconfig'
+            gitconfig.write_text('[url "http://mirror/"]\n')
+            gitconfig_id = (
+                'opensandbox-github-mirror-gitconfig-'
+                + hashlib.sha256(gitconfig.read_bytes()).hexdigest()
+            )
+            secrets[gitconfig_id] = gitconfig
+
+            args = prepare_frontend(
+                secrets,
+                root,
+                build_contexts={},
+            )
+
+            self.assertTrue(
+                args['OPENSANDBOX_DOWNLOAD_WRAPPER'].startswith(
+                    'opensandbox-download-wrapper-'
+                )
+            )
+            self.assertTrue(
+                args['OPENSANDBOX_DOWNLOAD_REWRITER'].startswith(
+                    'opensandbox-download-url-rewriter-'
+                )
+            )
+            self.assertTrue(
+                args['OPENSANDBOX_DOWNLOAD_SOURCE'].startswith(
+                    'opensandbox-download-source-'
+                )
+            )
+            self.assertEqual(
+                args['OPENSANDBOX_GITHUB_MIRROR_CONFIG'],
+                gitconfig_id,
+            )
+            self.assertEqual(
+                secrets[args['OPENSANDBOX_DOWNLOAD_SOURCE']].read_text(),
+                'http://third-party-source.internal/v1/cache\n',
+            )
+            self.assertEqual(
+                secrets[args['OPENSANDBOX_DOWNLOAD_WRAPPER']].name,
+                'download-wrapper.sh',
+            )
 
     def test_cache_miss_hit_and_corruption_rebuild(self):
         # Exercise the real cache while replacing only the expensive compiler.

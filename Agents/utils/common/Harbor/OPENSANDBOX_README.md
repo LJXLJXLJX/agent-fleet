@@ -178,16 +178,21 @@ configured package-source health probes, so a batch made entirely of local
 hits performs no per-task network request. If a real miss later fails while
 building, the existing health check and trusted-source fallback still run.
 
-APT source routing is build-runtime scoped. `--apt-mirror` provides the Ubuntu
-and Debian mirror root. Third-party sources use an explicit provider-neutral
-prefix map; Agent Fleet does not guess mirror paths:
+APT source routing is build-runtime scoped and uses the same provider-neutral
+Gateway root as direct downloads:
 
 ```bash
-export HARBOR_OPENSANDBOX_APT_SOURCE_OVERRIDES_JSON='{
-  "https://packages.example.com/repository": "http://<TRUSTED_MIRROR>/apt/vendor-repository",
-  "https://packages.example.com/signing-key.gpg": "http://<TRUSTED_MIRROR>/objects/vendor-key.gpg"
-}'
+export HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL="http://<TRUSTED_SOURCE>/cache"
 ```
+
+Every credential-free HTTP(S) repository URI is encoded from its scheme,
+authority, and base path. APT can then append its normal `dists/...` and
+`pool/...` paths, which the Gateway decodes back into the original upstream
+URL. No local JSON map, repository registration, or named-source distribution
+is required. Object-level URLs such as signing keys and setup scripts use the
+same root through the `curl`/`wget` adapter. Without
+`HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL`, original APT, `curl`, and `wget`
+behavior is preserved.
 
 The [instrumentation frontend](opensandbox_buildkit_frontend/README.md) mounts
 an APT wrapper and prepends its directory to `PATH` for every Dockerfile `RUN`.
@@ -200,8 +205,9 @@ invalidate affected BuildKit cache entries without changing task-image identity.
 Interception covers normal `apt` and `apt-get` lookup from shell, JSON exec,
 nested or downloaded scripts, and subprocesses inheriting `PATH`. Absolute
 paths, PATH replacement, `env -i`, libapt-based tools, and explicit custom APT
-layouts can bypass it. Unmapped HTTP(S) sources remain usable and emit a
-credential-redacted warning. See the linked frontend document and
+layouts can bypass it. Sources with credentials or queries that cannot be
+represented safely remain direct and emit a credential-redacted bypass
+warning. See the linked frontend document and
 [image manager design](OPENSANDBOX_IMAGE_MANAGER.md#apt-build-runtime-interception)
 for the runtime contract and upgrade boundary.
 
@@ -209,10 +215,39 @@ The manager builds and verifies the pinned frontend in a local OCI cache on
 first use. A cold cache needs Git, GNU timeout, and the setup-managed Go; a
 shared preparation failure stops further task dispatch for that batch.
 
-The same explicit map remains available for direct shell- or exec-form `curl`
-and `wget` build-transport URLs, including signing keys and bootstrap objects.
-Other `RUN` data and APT source-file writes remain task-authored. Unconfigured
-third-party URLs are never guessed or silently rewritten.
+Direct shell- or exec-form `curl` and `wget` downloads use that same
+provider-neutral source root:
+
+```bash
+export HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL="http://<TRUSTED_SOURCE>/cache"
+```
+
+When enabled, the BuildKit frontend injects temporary `curl` and `wget` wrappers
+ahead of PATH in every RUN. Each explicit HTTP(S) URL is routed at command
+execution time using the source's versioned request convention:
+`<root>/download/v1/<scheme>/<hex-authority>/root` for an origin root, or
+`<root>/download/v1/<scheme>/<hex-authority>/object/<hex-path>` for an
+object. Components use lowercase hex so reverse proxies never need to preserve
+encoded slashes. The reversible selector keeps the real `/@root` object distinct from
+the origin root and does not truncate long authorities. The source remains an
+opaque cache service to Agent Fleet: the manager does not load its plan or
+maintain a per-object or per-origin map. Runtime interception also covers
+shell-expanded URLs and `curl`/`wget` inside dynamically produced scripts.
+Previously unseen HTTP(S) URLs are filled on demand without a Gateway source
+registration. Calls whose method, credentials, headers, proxy settings, indirect
+configuration, or output semantics cannot be preserved bypass the cache and run
+through the image's real tool unchanged. Calls using absolute executable paths
+or a reset PATH are also outside this PATH-based adapter.
+
+> **Prebuild-only:** the wrappers and dynamic download route are internal
+> OpenSandbox prebuild machinery. Do not invoke the Gateway route manually, put
+> it in task Dockerfiles, expose it publicly, or reuse it inside a running
+> Sandbox. The mounts and source URL do not persist in the resulting image.
+> Server-side prebuild authentication is planned separately from URL handling.
+
+The Gateway is a cache accelerator, not a URL security policy. It must not
+reject a new URL merely because analysis has not seen its origin or path.
+Validate a small batch of tasks before the first full prebuild run.
 
 Other package sources such as pip, npm, Go, Cargo, Rustup, Dart Pub, and Julia
 retain their Docker build-argument behavior and are not part of APT runtime

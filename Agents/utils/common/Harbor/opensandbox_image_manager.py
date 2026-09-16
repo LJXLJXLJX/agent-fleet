@@ -63,7 +63,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -110,7 +110,6 @@ DOCKER_LAYER_GZIP = "application/vnd.docker.image.rootfs.diff.tar.gzip"
 OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
 OCI_LAYER_GZIP = "application/vnd.oci.image.layer.v1.tar+gzip"
 DEFAULT_PLATFORM = "linux/amd64"
-DEFAULT_APT_MIRROR = "http://mirrors.tuna.tsinghua.edu.cn"
 DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
 DEFAULT_NPM_REGISTRY = "https://registry.npmmirror.com"
 DEFAULT_GOPROXY = "https://goproxy.cn,direct"
@@ -132,34 +131,14 @@ APT_RUNTIME_ASSET_NAMES = (
     "apt-wrapper.sh",
     "source-rewriter.awk",
 )
-APT_SOURCE_MAP_SECRET_PREFIX = "opensandbox-apt-source-map"
+APT_GATEWAY_ROOT_SECRET_PREFIX = "opensandbox-apt-gateway-root"
 APT_RUNTIME_ASSET_DIR = Path(__file__).with_name("opensandbox_apt_runtime")
-SOURCE_OVERRIDE_FETCH_COMMAND = re.compile(
-    r"(?:^|\|)\s*(?:RUN\s+)?"
-    r"(?:(?:--mount=\S+|[A-Za-z_][A-Za-z0-9_]*=\S+|"
-    r"if|then|do|command|exec|sudo|env)\s+)*"
-    r"(?:[^\s;&|]+/)?(?:curl|wget)(?=\s|$)",
-    re.IGNORECASE,
+DOWNLOAD_RUNTIME_ASSET_NAMES = (
+    "download-wrapper.sh",
+    "url-rewriter.awk",
 )
-RUN_OPTION = r"--[A-Za-z][A-Za-z0-9-]*=\S+"
-RUN_EXEC_FORM = re.compile(
-    rf"^(?P<prefix>\s*RUN\s+(?:(?:{RUN_OPTION})\s+)*)"
-    r"(?P<argv>\[.*\])(?P<suffix>\s*)$",
-    re.DOTALL | re.IGNORECASE,
-)
-RUN_SHELL_PREFIX = re.compile(
-    rf"^\s*RUN\s+(?:(?:{RUN_OPTION})\s+)*",
-    re.IGNORECASE,
-)
-SHELL_HEREDOC_EXECUTOR = re.compile(
-    r"(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S+|command|exec|sudo|env)\s+)*"
-    r"(?:[^\s;&|]+/)?(?:sh|bash)(?:\s|$)",
-    re.IGNORECASE,
-)
-PIPE_TO_SHELL = re.compile(
-    r"\|\s*(?:(?:command|exec|sudo|env)\s+)*"
-    r"(?:[^\s;&|]+/)?(?:sh|bash)(?:\s|$)",
-    re.IGNORECASE,
+DOWNLOAD_RUNTIME_ASSET_DIR = Path(__file__).with_name(
+    "opensandbox_download_runtime"
 )
 BUILD_ARG_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FROM_LINE = re.compile(
@@ -280,218 +259,6 @@ def mirror_image_ref(image: str, mirror_prefix: str, aliases: set[str]) -> str:
     return image
 
 
-def ordered_source_overrides(
-    source_overrides: dict[str, str],
-) -> tuple[tuple[str, str], ...]:
-    return tuple(
-        sorted(source_overrides.items(), key=lambda item: len(item[0]), reverse=True)
-    )
-
-
-def rewrite_source_overrides(
-    source: str, source_overrides: dict[str, str]
-) -> str:
-    """Rewrite configured URL prefixes without matching a longer URL token."""
-    rewritten = source
-    for original, replacement in ordered_source_overrides(source_overrides):
-        pattern = re.compile(
-            re.escape(original) + r"(?=$|[^A-Za-z0-9._~-])"
-        )
-        rewritten = pattern.sub(lambda _match, value=replacement: value, rewritten)
-    return rewritten
-
-
-def run_heredoc_specs(source: str) -> list[tuple[str, bool, str]]:
-    """Return Dockerfile heredocs and whether payloads run build commands."""
-    specs: list[tuple[str, bool, str]] = []
-    for marker in HEREDOC_MARKER.finditer(source):
-        prefix = re.sub(r"\\\r?\n", " ", source[: marker.start()])
-        run_prefix = RUN_SHELL_PREFIX.match(prefix)
-        shell_body = prefix[run_prefix.end() :] if run_prefix else prefix
-        command_segment = re.split(r"&&|\|\||[;|]", shell_body)[-1].strip()
-        line_start = source.rfind("\n", 0, marker.start()) + 1
-        line_end = source.find("\n", marker.end())
-        if line_end < 0:
-            line_end = len(source)
-        declaration = source[line_start:line_end]
-        payload_is_command = (
-            not command_segment
-            or SHELL_HEREDOC_EXECUTOR.match(command_segment) is not None
-            or PIPE_TO_SHELL.search(declaration[marker.end() - line_start :])
-            is not None
-        )
-        rewrite_mode = "safe" if payload_is_command else "none"
-        specs.append(
-            (marker.group("delimiter"), bool(marker.group("strip")), rewrite_mode)
-        )
-    return specs
-
-
-def rewrite_run_source_overrides(
-    source: str,
-    source_overrides: dict[str, str],
-) -> str:
-    """Rewrite only unambiguously build-transport URL occurrences in a RUN."""
-    if not source_overrides:
-        return source
-
-    exec_form = RUN_EXEC_FORM.match(source)
-    if exec_form:
-        try:
-            argv = json.loads(re.sub(r"\\\r?\n\s*", "", exec_form.group("argv")))
-        except ValueError:
-            argv = None
-        if (
-            isinstance(argv, list)
-            and argv
-            and all(isinstance(argument, str) for argument in argv)
-            and argv[0].rsplit("/", 1)[-1].lower() in {"curl", "wget"}
-        ):
-            rewritten_argv = [
-                argv[0],
-                *(
-                    rewrite_source_overrides(argument, source_overrides)
-                    for argument in argv[1:]
-                ),
-            ]
-            return (
-                exec_form.group("prefix")
-                + json.dumps(rewritten_argv)
-                + exec_form.group("suffix")
-            )
-
-    output: list[str] = []
-    segment_start = 0
-    quote: str | None = None
-    index = 0
-
-    def append_segment(end: int) -> None:
-        segment = source[segment_start:end]
-        probe = re.sub(r"\\\r?\n", " ", segment)
-        is_fetch = SOURCE_OVERRIDE_FETCH_COMMAND.search(probe) is not None
-        output.append(
-            rewrite_source_overrides(segment, source_overrides)
-            if is_fetch
-            else segment
-        )
-
-    while index < len(source):
-        character = source[index]
-        if quote == "'":
-            if character == "'":
-                quote = None
-            index += 1
-            continue
-        if quote == '"':
-            if character == "\\" and index + 1 < len(source):
-                index += 2
-                continue
-            if character == '"':
-                quote = None
-            index += 1
-            continue
-        if character in {"'", '"'}:
-            quote = character
-            index += 1
-            continue
-        if character == "\\" and index + 1 < len(source):
-            index += 2
-            continue
-
-        delimiter_length = 0
-        if source.startswith(("&&", "||"), index):
-            delimiter_length = 2
-        elif character in {";", "\n"}:
-            delimiter_length = 1
-        if not delimiter_length:
-            index += 1
-            continue
-
-        append_segment(index)
-        output.append(source[index : index + delimiter_length])
-        index += delimiter_length
-        segment_start = index
-
-    append_segment(len(source))
-    return "".join(output)
-
-
-def rewrite_dockerfile_run_source_overrides(
-    source: str,
-    source_overrides: dict[str, str],
-    *,
-    run_transform: Callable[[str], str] | None = None,
-) -> str:
-    """Apply source overrides to safe contexts in complete RUN instructions."""
-    if not source_overrides and run_transform is None:
-        return source
-
-    output: list[str] = []
-    run_lines: list[str] = []
-    run_rewrite_modes: list[str] = []
-    heredocs: list[tuple[str, bool, str]] = []
-
-    def rewrite_chunk_content(lines: list[str], mode: str) -> str:
-        content = "".join(lines)
-        if mode == "safe" and source_overrides:
-            return rewrite_run_source_overrides(content, source_overrides)
-        return content
-
-    def flush_run() -> None:
-        rewritten: list[str] = []
-        chunk: list[str] = []
-        rewrite_chunk: str | None = None
-        for line, rewrite_line in zip(run_lines, run_rewrite_modes, strict=True):
-            if rewrite_chunk is not None and rewrite_line != rewrite_chunk:
-                rewritten.append(rewrite_chunk_content(chunk, rewrite_chunk))
-                chunk.clear()
-            rewrite_chunk = rewrite_line
-            chunk.append(line)
-        if chunk:
-            rewritten.append(rewrite_chunk_content(chunk, rewrite_chunk or "none"))
-        content = "".join(rewritten)
-        output.append(run_transform(content) if run_transform else content)
-        run_lines.clear()
-        run_rewrite_modes.clear()
-
-    for source_line in source.splitlines(keepends=True):
-        if not run_lines:
-            instruction = DOCKERFILE_INSTRUCTION.match(source_line)
-            if not instruction:
-                output.append(source_line)
-                continue
-            instruction_name = instruction.group("name").upper()
-            if instruction_name != "RUN":
-                output.append(source_line)
-                continue
-            run_lines.append(source_line)
-            run_rewrite_modes.append("safe")
-            heredocs.extend(run_heredoc_specs("".join(run_lines)))
-        else:
-            if heredocs:
-                delimiter, strip_tabs, rewrite_mode = heredocs[0]
-                candidate = source_line.rstrip("\r\n")
-                if strip_tabs:
-                    candidate = candidate.lstrip("\t")
-                run_lines.append(source_line)
-                run_rewrite_modes.append(
-                    rewrite_mode if candidate != delimiter else "none"
-                )
-                if candidate == delimiter:
-                    heredocs.pop(0)
-            else:
-                run_lines.append(source_line)
-                run_rewrite_modes.append("safe")
-                heredocs.extend(run_heredoc_specs("".join(run_lines)))
-
-        if not heredocs and not source_line.rstrip().endswith("\\"):
-            flush_run()
-
-    if run_lines:
-        flush_run()
-    return "".join(output)
-
-
 def _validate_source_url(
     value: str,
     label: str,
@@ -524,101 +291,25 @@ def _validate_source_url(
     return normalized
 
 
-def validate_apt_mirror(apt_mirror: str, build_network: str) -> str:
-    """Validate mirror syntax and reject container-unreachable loopback use."""
-    normalized = apt_mirror.strip().rstrip("/")
-    if not normalized:
-        raise ValueError(
-            "--apt-mirror or HARBOR_OPENSANDBOX_APT_MIRROR must name an "
-            "APT mirror root"
-        )
-    return _validate_source_url(normalized, "APT mirror", build_network).rstrip("/")
+def validate_download_source_url(value: str, build_network: str) -> str:
+    """Validate the optional provider-neutral curl/wget and APT source root."""
+    if not value.strip():
+        return ""
+    return _validate_source_url(
+        value, "curl/wget download source", build_network
+    ).rstrip("/")
 
 
-def parse_apt_source_overrides(
-    raw: str, build_network: str
-) -> dict[str, str]:
-    """Parse explicit upstream-to-build-source URL prefix mappings."""
-    if not raw.strip():
-        return {}
-    loaded = json.loads(raw)
-    if not isinstance(loaded, dict):
-        raise TypeError("APT source overrides must be a JSON object")
-    overrides: dict[str, str] = {}
-    for original, replacement in loaded.items():
-        if not isinstance(original, str) or not isinstance(replacement, str):
-            raise TypeError("APT source override keys and values must be strings")
-        normalized_original = _validate_source_url(
-            original, "APT source override origin", build_network
-        ).rstrip("/")
-        normalized_replacement = _validate_source_url(
-            replacement, "APT source override replacement", build_network
-        ).rstrip("/")
-        if normalized_original == normalized_replacement:
-            raise ValueError("APT source override must change the source URL")
-        if normalized_original in overrides:
-            raise ValueError(
-                f"duplicate normalized APT source override: {normalized_original}"
-            )
-        overrides[normalized_original] = normalized_replacement
-    return overrides
+def apt_gateway_root_content(dynamic_gateway_root: str) -> str:
+    """Render the one endpoint needed for deterministic APT route generation."""
+    return f"{dynamic_gateway_root.rstrip('/')}\n" if dynamic_gateway_root else ""
 
 
-def apt_runtime_source_overrides(
-    apt_mirror: str, source_overrides: dict[str, str]
-) -> dict[str, str]:
-    """Combine the existing distro mirror routes with explicit URL overrides."""
-    mirror = apt_mirror.rstrip("/")
-    combined = {
-        "http://archive.ubuntu.com/ubuntu": f"{mirror}/ubuntu",
-        "https://archive.ubuntu.com/ubuntu": f"{mirror}/ubuntu",
-        "http://security.ubuntu.com/ubuntu": f"{mirror}/ubuntu",
-        "https://security.ubuntu.com/ubuntu": f"{mirror}/ubuntu",
-        "http://ports.ubuntu.com/ubuntu": f"{mirror}/ubuntu",
-        "https://ports.ubuntu.com/ubuntu": f"{mirror}/ubuntu",
-        "http://deb.debian.org/debian": f"{mirror}/debian",
-        "https://deb.debian.org/debian": f"{mirror}/debian",
-        "http://deb.debian.org/debian-security": f"{mirror}/debian-security",
-        "https://deb.debian.org/debian-security": f"{mirror}/debian-security",
-        "http://security.debian.org/debian-security": (
-            f"{mirror}/debian-security"
-        ),
-        "https://security.debian.org/debian-security": (
-            f"{mirror}/debian-security"
-        ),
-    }
-    combined.update(source_overrides)
-    combined = {
-        origin: replacement
-        for origin, replacement in combined.items()
-        if origin != replacement
-    }
-    # The rewriter treats replacement prefixes as already routed. Reject
-    # ambiguous origins in the effective map, including built-in distro routes.
-    for origin in combined:
-        for replacement in combined.values():
-            if (origin == replacement or origin.startswith(replacement + "/")
-                    or replacement.startswith(origin + "/")):
-                raise ValueError(
-                    "APT source override origins and replacements must not overlap "
-                    f"by URL prefix: {origin} <> {replacement}"
-                )
-    return combined
-
-
-def apt_source_map_content(source_overrides: dict[str, str]) -> str:
-    """Render the runtime map in longest-prefix order for the AWK helper."""
-    return "".join(
-        f"{origin}\t{replacement}\n"
-        for origin, replacement in ordered_source_overrides(source_overrides)
-    )
-
-
-def apt_source_map_secret_id(source_overrides: dict[str, str]) -> str:
+def apt_gateway_root_secret_id(dynamic_gateway_root: str) -> str:
     digest = hashlib.sha256(
-        apt_source_map_content(source_overrides).encode()
+        apt_gateway_root_content(dynamic_gateway_root).encode()
     ).hexdigest()
-    return f"{APT_SOURCE_MAP_SECRET_PREFIX}-{digest[:16]}"
+    return f"{APT_GATEWAY_ROOT_SECRET_PREFIX}-{digest[:16]}"
 
 
 def apt_runtime_asset_digest() -> str:
@@ -656,7 +347,8 @@ def apt_runtime_secret_ids() -> dict[str, str]:
 
 
 def materialize_apt_runtime_assets(
-    destination: Path, source_overrides: dict[str, str]
+    destination: Path,
+    dynamic_gateway_root: str,
 ) -> dict[str, Path]:
     """Write host-side BuildKit secrets; none are included in image layers."""
     destination.mkdir(parents=True, exist_ok=True)
@@ -664,13 +356,45 @@ def materialize_apt_runtime_assets(
         name: APT_RUNTIME_ASSET_DIR / name for name in APT_RUNTIME_ASSET_NAMES
     }
     secret_ids = apt_runtime_secret_ids()
-    map_path = destination / "source-map.tsv"
-    map_path.write_text(apt_source_map_content(source_overrides), encoding="utf-8")
+    gateway_path = destination / "gateway-root"
+    gateway_path.write_text(
+        apt_gateway_root_content(dynamic_gateway_root),
+        encoding="utf-8",
+    )
     return {
         secret_ids["wrapper"]: assets["apt-wrapper.sh"],
         secret_ids["rewriter"]: assets["source-rewriter.awk"],
-        apt_source_map_secret_id(source_overrides): map_path,
+        apt_gateway_root_secret_id(dynamic_gateway_root): gateway_path,
     }
+
+
+def materialize_download_runtime_assets(
+    destination: Path, source_url: str
+) -> dict[str, Path]:
+    """Materialize content-addressed curl/wget runtime secrets."""
+    destination.mkdir(parents=True, exist_ok=True)
+    assets = {
+        name: DOWNLOAD_RUNTIME_ASSET_DIR / name
+        for name in DOWNLOAD_RUNTIME_ASSET_NAMES
+    }
+    secret_files: dict[str, Path] = {}
+    for name, prefix in (
+        ("download-wrapper.sh", "opensandbox-download-wrapper"),
+        ("url-rewriter.awk", "opensandbox-download-url-rewriter"),
+    ):
+        path = assets[name]
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(
+                f"OpenSandbox download runtime asset is unavailable: {path}"
+            ) from exc
+        secret_files[f"{prefix}-{hashlib.sha256(content).hexdigest()}"] = path
+    source_path = destination / "source"
+    source_path.write_text(source_url.rstrip("/") + "\n", encoding="utf-8")
+    source_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    secret_files[f"opensandbox-download-source-{source_digest}"] = source_path
+    return secret_files
 
 
 def package_source_build_args(
@@ -895,45 +619,15 @@ def materialize_package_source_context(
     return destination, tuple(sorted(str(path) for path in rewritten))
 
 
-def inject_run_mount(source_line: str, mount: str) -> str:
-    """Add one RUN option without changing shell- or exec-form command content."""
-    if not mount:
-        return source_line
-    run_prefix = RUN_SHELL_PREFIX.match(source_line)
-    if run_prefix is None:
-        return source_line
-    return f"{source_line[:run_prefix.end()]}{mount} {source_line[run_prefix.end():]}"
-
-
 def render_build_dockerfile(
     source: str,
     *,
     dockerhub_mirror_prefix: str,
-    apt_mirror: str,
-    apt_source_overrides: dict[str, str] | None = None,
     package_build_args: dict[str, str] | None = None,
     rustup_init_url: str = "",
     pytorch_index_url: str = "",
-    github_mirror_config_mount_id: str = "",
 ) -> str:
     package_build_args = package_build_args or {}
-    apt_source_overrides = apt_source_overrides or {}
-    git_mount = ""
-    if github_mirror_config_mount_id:
-        git_mount = (
-            "--mount=type=secret,id="
-            f"{github_mirror_config_mount_id},target=/etc/gitconfig,"
-            "mode=0444,required=true"
-        )
-
-    def inject_run_runtime(instruction: str) -> str:
-        return inject_run_mount(instruction, git_mount)
-
-    source = rewrite_dockerfile_run_source_overrides(
-        source,
-        apt_source_overrides,
-        run_transform=inject_run_runtime,
-    )
     output: list[str] = []
     aliases: set[str] = set()
     active_instruction: str | None = None
@@ -1801,16 +1495,14 @@ def inspect_external_image(
 def _transport_record(
     *,
     dockerhub_mirror_prefix: str,
-    apt_mirror: str,
-    apt_source_overrides: dict[str, str],
+    download_source_url: str,
     package_build_args: dict[str, str],
     github_mirror_url: str,
     rustup_init_url: str,
     pytorch_index_url: str,
 ) -> dict[str, str]:
     return {
-        "apt_mirror": apt_mirror,
-        "apt_source_override_origins": ",".join(sorted(apt_source_overrides)),
+        "download_source_configured": str(bool(download_source_url)).lower(),
         "dockerhub_mirror_prefix": dockerhub_mirror_prefix,
         "github_mirror_configured": str(bool(github_mirror_url)).lower(),
         "package_source_args": ",".join(sorted(package_build_args)),
@@ -2099,8 +1791,7 @@ def _prepare_service_image(
                     "last_resolution": "registry-cache",
                     "transport": _transport_record(
                         dockerhub_mirror_prefix=args.dockerhub_mirror_prefix,
-                        apt_mirror=args.apt_mirror,
-                        apt_source_overrides=args.apt_source_overrides,
+                        download_source_url=args.download_source_url,
                         package_build_args=args.package_build_args,
                         github_mirror_url=args.github_mirror_url,
                         rustup_init_url=args.rustup_init_url,
@@ -2148,22 +1839,30 @@ def _prepare_service_image(
                     )
                 apt_runtime_secrets = materialize_apt_runtime_assets(
                     temporary / "apt-runtime",
-                    apt_runtime_source_overrides(
-                        args.apt_mirror, args.apt_source_overrides
-                    ),
+                    args.download_source_url,
                 )
+                if args.download_source_url:
+                    apt_runtime_secrets.update(
+                        materialize_download_runtime_assets(
+                            temporary / "download-runtime",
+                            args.download_source_url,
+                        )
+                    )
+                if github_mirror_config_path is not None:
+                    git_config_digest = hashlib.sha256(
+                        github_mirror_config_path.read_bytes()
+                    ).hexdigest()
+                    git_config_id = (
+                        f"{GITHUB_MIRROR_CONFIG_MOUNT_ID}-{git_config_digest}"
+                    )
+                    apt_runtime_secrets[git_config_id] = github_mirror_config_path
                 rendered_dockerfile.write_text(
                     render_build_dockerfile(
                         dockerfile_source,
                         dockerhub_mirror_prefix=args.dockerhub_mirror_prefix,
-                        apt_mirror=args.apt_mirror,
-                        apt_source_overrides=args.apt_source_overrides,
                         package_build_args=args.package_build_args,
                         rustup_init_url=args.rustup_init_url,
                         pytorch_index_url=args.pytorch_index_url,
-                        github_mirror_config_mount_id=(
-                            GITHUB_MIRROR_CONFIG_MOUNT_ID if github_mirror_config else ""
-                        ),
                     ),
                     encoding="utf-8",
                 )
@@ -2193,18 +1892,7 @@ def _prepare_service_image(
                     target=target_stage,
                     no_cache=getattr(args, "no_cache", False),
                     build_network=getattr(args, "build_network", "default"),
-                    secret_files={
-                        **apt_runtime_secrets,
-                        **(
-                            {
-                                GITHUB_MIRROR_CONFIG_MOUNT_ID: (
-                                    github_mirror_config_path
-                                )
-                            }
-                            if github_mirror_config_path is not None
-                            else {}
-                        ),
-                    },
+                    secret_files=apt_runtime_secrets,
                 )
                 local_image_config = oci_archive_image_config(archive_path)
                 log(f"publishing service={service.name}: {tag_ref}")
@@ -2232,8 +1920,7 @@ def _prepare_service_image(
                 "last_resolution": resolution,
                 "transport": _transport_record(
                     dockerhub_mirror_prefix=args.dockerhub_mirror_prefix,
-                    apt_mirror=args.apt_mirror,
-                    apt_source_overrides=args.apt_source_overrides,
+                    download_source_url=args.download_source_url,
                     package_build_args=args.package_build_args,
                     github_mirror_url=args.github_mirror_url,
                     rustup_init_url=args.rustup_init_url,
@@ -2412,13 +2099,8 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
             f"task={task_dir.name}; falling back to Registry resolution"
         )
     build_network = getattr(args, "build_network", "default")
-    args.apt_mirror = validate_apt_mirror(
-        getattr(args, "apt_mirror", DEFAULT_APT_MIRROR),
-        build_network,
-    )
-    args.apt_source_overrides = parse_apt_source_overrides(
-        getattr(args, "apt_source_overrides_json", "{}"),
-        build_network,
+    args.download_source_url = validate_download_source_url(
+        getattr(args, "download_source_url", ""), build_network
     )
     args.github_mirror_url = validate_github_mirror_url(
         getattr(args, "github_mirror_url", ""), build_network
@@ -2445,11 +2127,10 @@ def prepare_bundle(args: argparse.Namespace) -> PreparedBundle:
             build_network,
             direct_hosts=package_source_hosts(
                 args.package_build_args,
-                args.apt_mirror,
                 args.github_mirror_url,
                 args.rustup_init_url,
                 args.pytorch_index_url,
-                *args.apt_source_overrides.values(),
+                args.download_source_url,
             ),
         )
 
@@ -2604,18 +2285,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--apt-mirror",
-        default=os.environ.get("HARBOR_OPENSANDBOX_APT_MIRROR", DEFAULT_APT_MIRROR),
-        help="APT mirror root containing ubuntu, debian, and debian-security",
-    )
-    parser.add_argument(
-        "--apt-source-overrides-json",
-        default=os.environ.get(
-            "HARBOR_OPENSANDBOX_APT_SOURCE_OVERRIDES_JSON", "{}"
-        ),
+        "--download-source-url",
+        default=os.environ.get("HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL", ""),
         help=(
-            "JSON object mapping third-party APT URL prefixes to explicit "
-            "build-time source URL prefixes"
+            "optional provider-neutral source root for curl/wget and APT HTTP(S) "
+            "downloads; original URLs are translated by fixed dynamic route rules"
         ),
     )
     parser.add_argument(

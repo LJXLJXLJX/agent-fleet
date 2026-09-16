@@ -19,7 +19,7 @@ class AptWrapperErrorsTest(unittest.TestCase):
             sources = root / 'sources'
             (sources / 'sources.list.d').mkdir(parents=True)
             (sources / 'sources.list').write_text('deb http://origin.invalid stable main\n')
-            (runtime / 'source-map').write_text('')
+            (runtime / 'gateway-root').write_text('')
             (runtime / 'source-rewriter.awk').write_text('{print}')
             tools = root / 'bin'
             tools.mkdir()
