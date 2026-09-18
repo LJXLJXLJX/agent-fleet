@@ -1,0 +1,15 @@
+.git
+.github
+.gitignore
+.venv
+config.local.env
+*.local.env
+cache
+data
+state
+tmp
+__pycache__/
+*.py[cod]
+*.log
+tests/
+docs/

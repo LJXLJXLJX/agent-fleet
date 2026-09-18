@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=59.6"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff.lint.per-file-ignores]
+# analyzer 拆包后 typing.Iterator/Sequence 的导入行数随模块数增加（同一存量告警的
+# mechanical 复制）；保持代码逐字搬运，按重构约定用 per-file-ignores 压制而非改代码。
+"src/harbor_tasks/analyzer/*.py" = ["UP035"]
+# 同上：providers apt/pip 包化后 typing.Callable/Sequence 存量告警随模块复制。
+"src/harbor_tasks/preparer/providers/*.py" = ["UP035"]
+# pip resolver 容器内脚本（package_data 资源，逐字抽取）：在容器内运行、独立命名空间，
+# 宿主机 lint 不适用。
+"src/harbor_tasks/preparer/providers/pip/resolver_script.py" = ["F401", "BLE001", "S112"]

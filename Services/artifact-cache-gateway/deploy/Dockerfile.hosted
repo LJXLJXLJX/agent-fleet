@@ -1,0 +1,62 @@
+ARG GATEWAY_IMAGE=artifact-cache-gateway:hosted-base
+FROM ${GATEWAY_IMAGE}
+
+USER root
+
+WORKDIR /app
+COPY pyproject.toml setup.cfg README.md /app/
+COPY src/ /app/src/
+COPY config/ /app/config/
+ARG APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn
+RUN sed -i "s|http://deb.debian.org|${APT_MIRROR}|g; s|http://security.debian.org|${APT_MIRROR}|g" \
+      /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir --no-deps --no-build-isolation .
+
+ARG MIHOMO_VERSION=1.19.30
+ARG MIHOMO_URL=https://github.com/MetaCubeX/mihomo/releases/download/v1.19.30/mihomo-linux-amd64-v1.19.30.gz
+ARG MIHOMO_SHA256=cf06ce2c7d1421bdbda14ee4a5b6046672dc35ebf8eecd8e77504ec3c0ed9a84
+ARG HOSTED_UID=10250
+ARG HOSTED_GID=10250
+
+COPY deploy/install_mihomo.py /tmp/install_mihomo.py
+RUN if ! command -v mihomo >/dev/null 2>&1 \
+      || [ "$(mihomo -v | awk 'NR == 1 {print $3}')" != "v${MIHOMO_VERSION}" ]; then \
+      python /tmp/install_mihomo.py \
+        --url "${MIHOMO_URL}" \
+        --sha256 "${MIHOMO_SHA256}" \
+        --output /usr/local/bin/mihomo; \
+    fi \
+    && test "$(mihomo -v | awk 'NR == 1 {print $3}')" = "v${MIHOMO_VERSION}" \
+    && rm /tmp/install_mihomo.py
+
+COPY deploy/hosted-entrypoint.sh /usr/local/bin/artifact-cache-hosted-entrypoint
+COPY deploy/hosted_supervisor.py /app/deploy/hosted_supervisor.py
+RUN chmod 0755 \
+      /usr/local/bin/artifact-cache-hosted-entrypoint \
+      /app/deploy/hosted_supervisor.py \
+    && if getent group hosted >/dev/null; then \
+         test "$(getent group hosted | cut -d: -f3)" = "${HOSTED_GID}"; \
+       else \
+         groupadd --gid "${HOSTED_GID}" hosted; \
+       fi \
+    && if id -u hosted >/dev/null 2>&1; then \
+         test "$(id -u hosted)" = "${HOSTED_UID}" \
+           && test "$(id -g hosted)" = "${HOSTED_GID}"; \
+       else \
+         useradd --uid "${HOSTED_UID}" --gid "${HOSTED_GID}" --no-create-home hosted; \
+       fi \
+    && chown -R "${HOSTED_UID}:${HOSTED_GID}" /data/artifact-cache
+
+ENV ARTIFACT_CACHE_RUNTIME_CONFIG_DIR=/etc/artifact-cache-gateway \
+    ARTIFACT_CACHE_HOST=0.0.0.0 \
+    ARTIFACT_CACHE_PORT=8080 \
+    ARTIFACT_CACHE_RUNTIME_UID=${HOSTED_UID} \
+    ARTIFACT_CACHE_RUNTIME_GID=${HOSTED_GID} \
+    MIHOMO_HOST=127.0.0.1 \
+    MIHOMO_PORT=7890
+
+USER hosted
+ENTRYPOINT ["/usr/local/bin/artifact-cache-hosted-entrypoint"]

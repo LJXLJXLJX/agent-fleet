@@ -25,6 +25,8 @@ agent-fleet/
 │   ├── SWE-smith/             # SWE-Smith task list
 │   ├── Terminal-bench-2/      # Terminal-Bench task lists
 │   └── SETA/                  # SETA task lists
+└── Services/
+    └── artifact-cache-gateway/  # Build-time dependency cache gateway (self-contained subproject)
 ```
 
 ## Design
@@ -32,6 +34,12 @@ agent-fleet/
 `Agents/` owns execution. Agent-specific code stays under its own directory, while shared Harbor orchestration lives under `Agents/utils/common/Harbor/`.
 
 `Tasks/` owns benchmark and task inputs. Harbor and OpenClaw runners read task lists from here instead of duplicating task files inside agent directories.
+
+`Services/` owns self-contained infrastructure services that are deployed and
+operated independently of agent execution. `Services/artifact-cache-gateway/`
+is the build-time dependency cache gateway consumed by the image prebuild
+pipeline through URL injection; it keeps its own packaging, tests, lint
+configuration, and per-directory documentation conventions.
 
 Shell files remain the operator entry points and own top-level workflow
 orchestration and environment setup. Focused Python modules own delegated

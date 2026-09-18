@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Artifact Cache Gateway</title>
+  <link rel="stylesheet" href="/ui/styles.css">
+  <script type="module" src="/ui/app.js"></script>
+</head>
+<body>
+  <gateway-dashboard>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">YiCloud Build Infrastructure</p>
+        <h1>Artifact Cache Gateway</h1>
+        <p class="subtitle">S3-backed unified artifact cache and distribution entry point</p>
+      </div>
+      <div class="actions">
+        <span id="health" class="health pending"><span></span>Connecting</span>
+        <button id="refresh" type="button">Refresh</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="metrics" aria-label="Gateway metrics">
+        <article><span>Strict S3 hit rate</span><strong id="fresh-hit-rate">--</strong></article>
+        <article><span>S3 reuse rate</span><strong id="hit-rate">--</strong></article>
+        <article><span>Cache lookups</span><strong id="request-total">--</strong></article>
+        <article><span>Errors</span><strong id="error-total">--</strong></article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">Cache layer &middot; cumulative persistent</p><h2>Request cache states</h2></div>
+          <p><span id="request-scope">Loading statistics scope&hellip;</span> &middot; <span id="updated">Not updated yet</span></p>
+        </div>
+        <div id="request-states" class="state-grid" aria-live="polite"></div>
+        <p class="metric-note"><strong>S3 fresh hit</strong> means a valid object was used directly from S3; <strong>upstream passthrough</strong> means the origin succeeded but nothing was written to S3. S3 reuse also includes conditional-validation hits and stale-cache fallback.</p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">Module layer &middot; cumulative persistent</p><h2>Independent per-module statistics</h2></div>
+          <p>Rolled up by module first, then counted independently per data source; GitHub counts as a single data source</p>
+        </div>
+        <div id="request-modules" class="module-grid" aria-live="polite"></div>
+        <p class="metric-note">Requests from before the upgrade that lack a module dimension show as &ldquo;unclassified history&rdquo;; older stats that have a module but no data-source dimension show as &ldquo;not recorded by data source before the upgrade&rdquo;.</p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">Upstream layer &middot; cumulative persistent</p><h2>Domestic sources and Proxy results</h2></div>
+          <p>Each actually issued upstream request is counted separately</p>
+        </div>
+        <div id="upstream-attempts" class="upstream-grid" aria-live="polite"></div>
+        <p class="metric-note">&ldquo;Hit&rdquo; means that route returned a usable object; &ldquo;miss&rdquo; means that attempt failed and may continue to the next fallback; it does not mean the final request failed.</p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">Write layer &middot; cumulative persistent</p><h2>Objects written to S3</h2></div>
+          <p id="cache-mode">Loading cache mode&hellip;</p>
+        </div>
+        <div id="cache-fills" class="cache-fill-grid" aria-live="polite"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">Upstream diagnostics</p><h2>Recent failures</h2></div>
+          <p>Credential-free attempt details, newest first</p>
+        </div>
+        <div id="recent-failures" class="failure-list" aria-live="polite"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">Access policy</p><h2>Configured sources</h2></div>
+          <p><span id="source-count">--</span> sources &middot; <span id="storage">--</span></p>
+        </div>
+        <div id="source-groups" class="source-groups" aria-live="polite"></div>
+        <p class="metric-note">&ldquo;Config updated&rdquo; is the date an admin last modified the source config, not the freshness of cached objects. Manual policies do not update automatically; expiration policies force an admin review when due.</p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">Git mirror</p><h2>GitHub repository cache</h2></div>
+          <p id="git-mirror-state">Loading&hellip;</p>
+        </div>
+        <div id="git-mirror-metrics" class="cache-fill-grid" aria-live="polite"></div>
+        <p class="metric-note">Only public GitHub repositories on an analysis plan; batch prewarm and on-demand first fetch share the GPFS bare mirror.</p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">Object inventory</p><h2>Cached objects</h2></div>
+          <p>Expand a package name to view exact versions and artifact objects</p>
+        </div>
+        <div id="object-inventory" class="object-inventory" aria-live="polite">
+          <p class="muted">Loading cached objects&hellip;</p>
+        </div>
+      </section>
+
+      <p id="error" class="error" role="alert" hidden></p>
+      <noscript><p class="error">This read-only page requires JavaScript to be enabled.</p></noscript>
+    </main>
+  </gateway-dashboard>
+</body>
+</html>

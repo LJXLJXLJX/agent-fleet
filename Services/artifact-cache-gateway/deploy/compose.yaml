@@ -1,0 +1,26 @@
+services:
+  gateway:
+    build:
+      context: ..
+    env_file:
+      - ../config.local.env
+    environment:
+      ARTIFACT_CACHE_STORAGE: s3
+      ARTIFACT_CACHE_CONFIG: /app/config/sources.json
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - artifact-cache-work:/data/artifact-cache
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  artifact-cache-work:

@@ -1,0 +1,8 @@
+name: artifact_cache_gateway_dart_smoke
+publish_to: none
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  http: ^1.0.0

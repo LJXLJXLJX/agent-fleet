@@ -21,6 +21,7 @@ Shared launchers support direct arguments, FleetSpec JSON, and prompt mode.
 | `Agents/Harbor-claude-code/`, `Agents/Harbor-opencode/`, `Agents/Harbor-pi/` | Agent-specific Harbor integration | per-directory `STRUCT.md` |
 | `Agents/Openclaw/` | Dockerized OpenClaw gateway fleet | `Agents/AGENTS.md` |
 | `Tasks/` | Harbor task inputs/adapters; PinchBench and ClawBio runners | `Tasks/AGENTS.md` |
+| `Services/` | Self-contained infrastructure services (currently the artifact cache gateway) | `Services/artifact-cache-gateway/AGENTS.md` |
 | `skills/` | Repository operation skills and end-to-end prompts | `skills/README.md` |
 | `.github/` | CI workflows, review automation, and validation helpers | `.github/workflows/`, `.github/scripts/tests/` |
 | `third_party/agent-opik-plugin/` | Opik tracing plugin (git submodule) | — |

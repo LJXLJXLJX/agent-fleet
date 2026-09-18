@@ -1,5 +1,9 @@
 required-version = "==0.16.0"
 
+# Self-contained subprojects keep their own lint configuration
+# (see Services/artifact-cache-gateway/pyproject.toml).
+extend-exclude = ["Services/artifact-cache-gateway"]
+
 [lint]
 external = ["E402", "N802"]
 

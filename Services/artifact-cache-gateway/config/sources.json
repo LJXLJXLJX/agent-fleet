@@ -1,0 +1,1069 @@
+{
+  "sources": [
+    {
+      "name": "ubuntu",
+      "kind": "apt-repository",
+      "base_url": "https://mirrors.tuna.tsinghua.edu.cn/ubuntu/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "direct",
+      "upstream_label": "tuna",
+      "attempt_timeout_seconds": 20,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 65536,
+      "fallback_upstreams": [
+        {
+          "label": "aliyun",
+          "base_url": "https://mirrors.aliyun.com/ubuntu/",
+          "proxy_mode": "direct",
+          "attempt_timeout_seconds": 20,
+          "slow_after_seconds": 5,
+          "min_bytes_per_second": 65536,
+          "allowed_redirect_origins": []
+        },
+        {
+          "label": "ubuntu-archive",
+          "base_url": "https://archive.ubuntu.com/ubuntu/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        },
+        {
+          "label": "ubuntu-security",
+          "base_url": "https://security.ubuntu.com/ubuntu/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "debian",
+      "kind": "apt-repository",
+      "base_url": "https://mirrors.tuna.tsinghua.edu.cn/debian/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "direct",
+      "upstream_label": "tuna",
+      "attempt_timeout_seconds": 20,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 65536,
+      "fallback_upstreams": [
+        {
+          "label": "aliyun",
+          "base_url": "https://mirrors.aliyun.com/debian/",
+          "proxy_mode": "direct",
+          "attempt_timeout_seconds": 20,
+          "slow_after_seconds": 5,
+          "min_bytes_per_second": 65536,
+          "allowed_redirect_origins": []
+        },
+        {
+          "label": "debian-official",
+          "base_url": "https://deb.debian.org/debian/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "debian-security",
+      "kind": "apt-repository",
+      "base_url": "https://mirrors.tuna.tsinghua.edu.cn/debian-security/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "direct",
+      "upstream_label": "tuna",
+      "attempt_timeout_seconds": 20,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 65536,
+      "fallback_upstreams": [
+        {
+          "label": "aliyun",
+          "base_url": "https://mirrors.aliyun.com/debian-security/",
+          "proxy_mode": "direct",
+          "attempt_timeout_seconds": 20,
+          "slow_after_seconds": 5,
+          "min_bytes_per_second": 65536,
+          "allowed_redirect_origins": []
+        },
+        {
+          "label": "debian-security-official",
+          "base_url": "https://security.debian.org/debian-security/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "docker-ce",
+      "kind": "apt-repository",
+      "base_url": "https://mirrors.tuna.tsinghua.edu.cn/docker-ce/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "linux/ubuntu/dists/",
+        "linux/ubuntu/pool/",
+        "linux/debian/dists/",
+        "linux/debian/pool/"
+      ],
+      "allowed_exact_paths": [
+        "linux/ubuntu/gpg",
+        "linux/debian/gpg"
+      ],
+      "mutable_path_prefixes": [
+        "linux/ubuntu/dists/",
+        "linux/debian/dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "direct",
+      "upstream_label": "tuna",
+      "attempt_timeout_seconds": 20,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 65536,
+      "fallback_upstreams": [
+        {
+          "label": "aliyun",
+          "base_url": "https://mirrors.aliyun.com/docker-ce/",
+          "proxy_mode": "direct",
+          "attempt_timeout_seconds": 20,
+          "slow_after_seconds": 5,
+          "min_bytes_per_second": 65536,
+          "allowed_redirect_origins": []
+        },
+        {
+          "label": "docker-official",
+          "base_url": "https://download.docker.com/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "ubuntu-upstream",
+      "kind": "apt-repository",
+      "base_url": "https://archive.ubuntu.com/ubuntu/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "configured",
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "debian-upstream",
+      "kind": "apt-repository",
+      "base_url": "https://deb.debian.org/debian/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "configured",
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "ubuntu-security-upstream",
+      "kind": "apt-repository",
+      "base_url": "https://security.ubuntu.com/ubuntu/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "configured",
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "debian-security-upstream",
+      "kind": "apt-repository",
+      "base_url": "https://security.debian.org/debian-security/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "configured",
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-objects-releases-bazel-build",
+      "kind": "static-objects",
+      "ecosystem": "apt",
+      "base_url": "https://releases.bazel.build/",
+      "allowed_redirect_origins": [],
+      "allowed_exact_paths": [
+        "bazel-release.pub.gpg"
+      ],
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-objects-deb-nodesource-com",
+      "kind": "static-objects",
+      "ecosystem": "apt",
+      "base_url": "https://deb.nodesource.com/",
+      "allowed_redirect_origins": [],
+      "allowed_exact_paths": [
+        "gpgkey/nodesource-repo.gpg.key",
+        "setup_18.x",
+        "setup_22.x",
+        "setup_23.x",
+        "setup_24.x"
+      ],
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-objects-debian-neo4j-com",
+      "kind": "static-objects",
+      "ecosystem": "apt",
+      "base_url": "https://debian.neo4j.com/",
+      "allowed_redirect_origins": [],
+      "allowed_exact_paths": [
+        "neotechnology.gpg.key"
+      ],
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-objects-download-memgraph-com",
+      "kind": "static-objects",
+      "ecosystem": "apt",
+      "base_url": "https://download.memgraph.com/",
+      "allowed_redirect_origins": [],
+      "allowed_exact_paths": [
+        "memgraph/v2.12.0/ubuntu-22.04/memgraph_2.12.0-1_amd64.deb",
+        "memgraph/v2.15.0/ubuntu-22.04/memgraph_2.15.0-1_amd64.deb"
+      ],
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-objects-dl-yarnpkg-com",
+      "kind": "static-objects",
+      "ecosystem": "apt",
+      "base_url": "https://dl.yarnpkg.com/",
+      "allowed_redirect_origins": [],
+      "allowed_exact_paths": [
+        "debian/pubkey.gpg"
+      ],
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-objects-openresty-org",
+      "kind": "static-objects",
+      "ecosystem": "apt",
+      "base_url": "https://openresty.org/",
+      "allowed_redirect_origins": [],
+      "allowed_exact_paths": [
+        "package/pubkey.gpg"
+      ],
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-objects-packages-clickhouse-com",
+      "kind": "static-objects",
+      "ecosystem": "apt",
+      "base_url": "https://packages.clickhouse.com/",
+      "allowed_redirect_origins": [],
+      "allowed_exact_paths": [
+        "rpm/lts/repodata/repomd.xml.key"
+      ],
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-objects-pgp-mongodb-com",
+      "kind": "static-objects",
+      "ecosystem": "apt",
+      "base_url": "https://pgp.mongodb.com/",
+      "allowed_redirect_origins": [],
+      "allowed_exact_paths": [
+        "server-6.0.asc",
+        "server-7.0.asc"
+      ],
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-objects-www-mongodb-org",
+      "kind": "static-objects",
+      "ecosystem": "apt",
+      "base_url": "https://www.mongodb.org/",
+      "allowed_redirect_origins": [
+        "https://pgp.mongodb.com"
+      ],
+      "allowed_exact_paths": [
+        "static/pgp/server-6.0.asc",
+        "static/pgp/server-7.0.asc"
+      ],
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-objects-www-postgresql-org",
+      "kind": "static-objects",
+      "ecosystem": "apt",
+      "base_url": "https://www.postgresql.org/",
+      "allowed_redirect_origins": [],
+      "allowed_exact_paths": [
+        "media/keys/ACCC4CF8.asc"
+      ],
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-repo-apt-postgresql-org-pub-repos-apt",
+      "kind": "apt-repository",
+      "ecosystem": "apt",
+      "base_url": "https://apt.postgresql.org/pub/repos/apt/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-repo-deb-nodesource-com-node-18-x",
+      "kind": "apt-repository",
+      "base_url": "https://deb.nodesource.com/node_18.x/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-repo-deb-nodesource-com-node-20-x",
+      "kind": "apt-repository",
+      "ecosystem": "apt",
+      "base_url": "https://deb.nodesource.com/node_20.x/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-repo-deb-nodesource-com-node-22-x",
+      "kind": "apt-repository",
+      "ecosystem": "apt",
+      "base_url": "https://deb.nodesource.com/node_22.x/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-repo-deb-nodesource-com-node-23-x",
+      "kind": "apt-repository",
+      "ecosystem": "apt",
+      "base_url": "https://deb.nodesource.com/node_23.x/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-repo-deb-nodesource-com-node-24-x",
+      "kind": "apt-repository",
+      "ecosystem": "apt",
+      "base_url": "https://deb.nodesource.com/node_24.x/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-repo-debian-neo4j-com",
+      "kind": "apt-repository",
+      "base_url": "https://debian.neo4j.com/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-repo-dl-yarnpkg-com-debian",
+      "kind": "apt-repository",
+      "ecosystem": "apt",
+      "base_url": "https://dl.yarnpkg.com/debian/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-repo-openresty-org-package-ubuntu",
+      "kind": "apt-repository",
+      "base_url": "http://openresty.org/package/ubuntu/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-repo-storage-googleapis-com-bazel-apt",
+      "kind": "apt-repository",
+      "ecosystem": "apt",
+      "base_url": "https://storage.googleapis.com/bazel-apt/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-repo-packages-clickhouse-com-deb",
+      "kind": "apt-repository",
+      "ecosystem": "apt",
+      "base_url": "https://packages.clickhouse.com/deb/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-repo-repo-mongodb-org-apt-ubuntu",
+      "kind": "apt-repository",
+      "base_url": "https://repo.mongodb.org/apt/ubuntu/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-repo-ppa-launchpadcontent-net-apptainer-ppa-ubuntu",
+      "kind": "apt-repository",
+      "base_url": "https://ppa.launchpadcontent.net/apptainer/ppa/ubuntu/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "configured",
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "apt-repo-ppa-launchpadcontent-net-deadsnakes-ppa-ubunt",
+      "kind": "apt-repository",
+      "base_url": "https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dists/",
+        "pool/"
+      ],
+      "mutable_path_prefixes": [
+        "dists/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "configured",
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "npm-registry",
+      "kind": "npm-registry",
+      "ecosystem": "node",
+      "base_url": "https://registry.npmmirror.com/",
+      "allowed_redirect_origins": [
+        "https://cdn.npmmirror.com"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "configured",
+      "upstream_label": "npmmirror",
+      "attempt_timeout_seconds": 20,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 65536,
+      "fallback_upstreams": [
+        {
+          "label": "npm-official",
+          "base_url": "https://registry.npmjs.org/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-15",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "dart-pub",
+      "kind": "dart-pub",
+      "ecosystem": "dart",
+      "base_url": "https://pub.flutter-io.cn/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "api/packages/"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "direct",
+      "upstream_label": "flutter-china",
+      "attempt_timeout_seconds": 30,
+      "fallback_upstreams": [
+        {
+          "label": "pub-dev-official",
+          "base_url": "https://pub.dev/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "dart-pub-archives",
+      "kind": "dart-pub",
+      "ecosystem": "dart",
+      "base_url": "https://storage.flutter-io.cn/dartlang-pub-exported-api/latest/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "api/archives/",
+        "packages/"
+      ],
+      "allow_query": false,
+      "proxy_mode": "direct",
+      "upstream_label": "flutter-china-storage",
+      "attempt_timeout_seconds": 120,
+      "slow_after_seconds": 10,
+      "min_bytes_per_second": 65536,
+      "fallback_upstreams": [
+        {
+          "label": "pub-dev-official",
+          "base_url": "https://pub.dev/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "julia-pkg",
+      "kind": "julia-pkg",
+      "ecosystem": "julia",
+      "base_url": "https://pkg.julialang.org/",
+      "allowed_redirect_origins": [
+        "https://in.pkg.julialang.org",
+        "https://storage.julialang.net"
+      ],
+      "allowed_path_prefixes": [
+        "registry/",
+        "package/",
+        "artifact/"
+      ],
+      "allowed_exact_paths": [
+        "registries"
+      ],
+      "mutable_exact_paths": [
+        "registries"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "configured",
+      "upstream_label": "julia-official",
+      "attempt_timeout_seconds": 600,
+      "slow_after_seconds": 30,
+      "min_bytes_per_second": 65536,
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "pypi-simple",
+      "ecosystem": "pip",
+      "base_url": "https://pypi.tuna.tsinghua.edu.cn/simple/",
+      "allowed_redirect_origins": [],
+      "html_rewrite_routes": {
+        "https://pypi.tuna.tsinghua.edu.cn": "pypi-files",
+        "https://files.pythonhosted.org": "pypi-files"
+      },
+      "html_rewrite_relative_routes": {
+        "packages/": "pypi-files"
+      },
+      "rewrite_html": true,
+      "allow_query": false,
+      "proxy_mode": "direct",
+      "upstream_label": "tuna",
+      "attempt_timeout_seconds": 20,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 65536,
+      "fallback_upstreams": [
+        {
+          "label": "pypi-official",
+          "base_url": "https://pypi.org/simple/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "pypi-files",
+      "ecosystem": "pip",
+      "base_url": "https://pypi.tuna.tsinghua.edu.cn/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "packages/"
+      ],
+      "allow_query": false,
+      "proxy_mode": "direct",
+      "upstream_label": "tuna",
+      "attempt_timeout_seconds": 20,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 65536,
+      "fallback_upstreams": [
+        {
+          "label": "pypi-files-official",
+          "base_url": "https://files.pythonhosted.org/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "go-proxy",
+      "kind": "go-proxy",
+      "ecosystem": "go",
+      "base_url": "https://goproxy.cn/",
+      "allowed_redirect_origins": [],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "configured",
+      "upstream_label": "goproxy-cn",
+      "attempt_timeout_seconds": 20,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 65536,
+      "fallback_upstreams": [
+        {
+          "label": "go-official",
+          "base_url": "https://proxy.golang.org/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-15",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "go-sumdb",
+      "kind": "go-sumdb",
+      "ecosystem": "go",
+      "base_url": "https://sum.golang.google.cn/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "lookup/",
+        "tile/"
+      ],
+      "allowed_exact_paths": [
+        "latest"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "configured",
+      "upstream_label": "go-sumdb-china",
+      "attempt_timeout_seconds": 20,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 1024,
+      "fallback_upstreams": [
+        {
+          "label": "go-sumdb-official",
+          "base_url": "https://sum.golang.org/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-15",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "rustup-init",
+      "kind": "static-objects",
+      "ecosystem": "cargo",
+      "base_url": "https://rsproxy.cn/",
+      "allowed_redirect_origins": [],
+      "allowed_exact_paths": [
+        "rustup-init.sh"
+      ],
+      "allow_query": false,
+      "proxy_mode": "direct",
+      "upstream_label": "rsproxy",
+      "attempt_timeout_seconds": 20,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 65536,
+      "fallback_upstreams": [
+        {
+          "label": "rustup-official",
+          "base_url": "https://sh.rustup.rs/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "rustup-dist",
+      "ecosystem": "cargo",
+      "base_url": "https://rsproxy.cn/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dist/"
+      ],
+      "mutable_exact_paths": [
+        "dist/channel-rust-stable.toml",
+        "dist/channel-rust-stable.toml.sha256",
+        "dist/channel-rust-beta.toml",
+        "dist/channel-rust-beta.toml.sha256",
+        "dist/channel-rust-nightly.toml",
+        "dist/channel-rust-nightly.toml.sha256"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "direct",
+      "upstream_label": "rsproxy",
+      "attempt_timeout_seconds": 20,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 65536,
+      "fallback_upstreams": [
+        {
+          "label": "rust-static-official",
+          "base_url": "https://static.rust-lang.org/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "rustup-update",
+      "ecosystem": "cargo",
+      "base_url": "https://rsproxy.cn/rustup/",
+      "allowed_redirect_origins": [],
+      "allowed_path_prefixes": [
+        "dist/",
+        "archive/"
+      ],
+      "allowed_exact_paths": [
+        "release-stable.toml"
+      ],
+      "mutable_exact_paths": [
+        "release-stable.toml"
+      ],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "direct",
+      "upstream_label": "rsproxy",
+      "attempt_timeout_seconds": 20,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 65536,
+      "fallback_upstreams": [
+        {
+          "label": "rustup-update-official",
+          "base_url": "https://static.rust-lang.org/rustup/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "cargo-index",
+      "kind": "cargo-sparse",
+      "ecosystem": "cargo",
+      "base_url": "https://rsproxy.cn/index/",
+      "allowed_redirect_origins": [],
+      "metadata_ttl_seconds": 300,
+      "allow_query": false,
+      "proxy_mode": "direct",
+      "upstream_label": "rsproxy",
+      "attempt_timeout_seconds": 20,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 65536,
+      "fallback_upstreams": [
+        {
+          "label": "crates-index-official",
+          "base_url": "https://index.crates.io/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": []
+        }
+      ],
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "cargo-crates",
+      "kind": "cargo-crates",
+      "ecosystem": "cargo",
+      "base_url": "https://rsproxy.cn/api/v1/crates/",
+      "allowed_redirect_origins": [
+        "https://lf3-static.rsproxy.cn",
+        "https://lf6-static.rsproxy.cn",
+        "https://lf9-static.rsproxy.cn"
+      ],
+      "allow_query": false,
+      "proxy_mode": "direct",
+      "upstream_label": "rsproxy",
+      "attempt_timeout_seconds": 20,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 65536,
+      "fallback_upstreams": [
+        {
+          "label": "crates-official",
+          "base_url": "https://crates.io/api/v1/crates/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": [
+            "https://static.crates.io"
+          ]
+        }
+      ],
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "sglang-wheel-files",
+      "kind": "generic",
+      "ecosystem": "download",
+      "base_url": "https://github.com/sgl-project/whl/releases/download/",
+      "allowed_redirect_origins": [
+        "https://release-assets.githubusercontent.com"
+      ],
+      "allow_query": false,
+      "proxy_mode": "configured",
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "flashinfer-wheel-files",
+      "kind": "generic",
+      "ecosystem": "download",
+      "base_url": "https://github.com/flashinfer-ai/flashinfer/releases/download/",
+      "allowed_redirect_origins": [
+        "https://release-assets.githubusercontent.com"
+      ],
+      "allow_query": false,
+      "proxy_mode": "configured",
+      "config_updated_at": "2026-09-07",
+      "config_update_policy": "manual"
+    },
+    {
+      "name": "pytorch",
+      "kind": "pytorch-wheels",
+      "ecosystem": "pip",
+      "base_url": "https://mirrors.aliyun.com/pytorch-wheels/",
+      "allowed_redirect_origins": [],
+      "flat_index_packages": [
+        "torch",
+        "torchaudio",
+        "torchvision"
+      ],
+      "root_artifact_packages": [
+        "setuptools",
+        "triton"
+      ],
+      "metadata_ttl_seconds": 60,
+      "allow_query": false,
+      "proxy_mode": "configured",
+      "upstream_label": "aliyun-pytorch-wheels",
+      "attempt_timeout_seconds": 30,
+      "slow_after_seconds": 5,
+      "min_bytes_per_second": 1048576,
+      "html_rewrite_url_prefixes": [
+        "https://mirrors.aliyun.com/pytorch-wheels/",
+        "https://download.pytorch.org/whl/",
+        "https://download-r2.pytorch.org/whl/"
+      ],
+      "html_rewrite_routes": {
+        "https://files.pythonhosted.org": "pypi-files"
+      },
+      "rewrite_html": true,
+      "fallback_upstreams": [
+        {
+          "label": "pytorch-official",
+          "base_url": "https://download.pytorch.org/whl/",
+          "proxy_mode": "configured",
+          "allowed_redirect_origins": [
+            "https://download-r2.pytorch.org"
+          ],
+          "attempt_timeout_seconds": 600,
+          "slow_after_seconds": 30,
+          "min_bytes_per_second": 65536
+        }
+      ],
+      "config_updated_at": "2026-09-09",
+      "config_update_policy": "manual"
+    }
+  ]
+}

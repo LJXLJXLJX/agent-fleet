@@ -28,13 +28,13 @@ run_ruff() {
     return 0
   fi
   if command -v ruff >/dev/null 2>&1; then
-    ruff check --config .github/ruff.toml "${python_files[@]}"
+    ruff check --force-exclude --config .github/ruff.toml "${python_files[@]}"
   elif command -v uvx >/dev/null 2>&1; then
-    uvx --from "ruff==$ruff_version" ruff check --config .github/ruff.toml \
+    uvx --from "ruff==$ruff_version" ruff check --force-exclude --config .github/ruff.toml \
       "${python_files[@]}"
   elif [[ -x "$managed_bin/uvx" ]]; then
     "$managed_bin/uvx" --from "ruff==$ruff_version" ruff check \
-      --config .github/ruff.toml "${python_files[@]}"
+      --force-exclude --config .github/ruff.toml "${python_files[@]}"
   else
     printf '[WARN] Ruff is unavailable; install Ruff %s or run scripts/setup.sh.\n' \
       "$ruff_version" >&2
