@@ -13,8 +13,8 @@ defaults="$(
     -u OUTPUT_PATH \
     -u OPIK_PROJECT_NAME \
     -u HARBOR_ZELLIJ_SESSION_NAME \
-    -u HARBOR_OPENSANDBOX_BUILD_USE_PROXY \
-    -u HARBOR_OPENSANDBOX_BUILD_NETWORK \
+    -u HARBOR_TASK_IMAGE_BUILD_USE_PROXY \
+    -u HARBOR_TASK_IMAGE_BUILD_NETWORK \
     HOME="$TEST_ROOT/home" \
     AGENT="opencode" \
     DATASET_NAME="terminalbench21" \
@@ -30,8 +30,8 @@ defaults="$(
         "$OUTPUT_PATH" \
         "$OPIK_PROJECT_NAME" \
         "$HARBOR_ZELLIJ_SESSION_NAME" \
-        "$HARBOR_OPENSANDBOX_BUILD_USE_PROXY" \
-        "$HARBOR_OPENSANDBOX_BUILD_NETWORK"
+        "$HARBOR_TASK_IMAGE_BUILD_USE_PROXY" \
+        "$HARBOR_TASK_IMAGE_BUILD_NETWORK"
     ' bash "$HARBOR_DIR/env.sh"
 )"
 default_output_root="$(printf '%s\n' "$defaults" | sed -n '1p')"

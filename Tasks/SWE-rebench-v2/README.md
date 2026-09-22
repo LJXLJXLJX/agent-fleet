@@ -75,7 +75,7 @@ uv run --project Tasks/SWE-rebench-v2 swe-rebench-v2 \
 The summary reports converted and failed tasks plus resolved base-image names.
 Generated task directories are runtime data and must not be committed here.
 Generated Dockerfiles retain logical builder image names. Configure
-`HARBOR_OPENSANDBOX_BASE_IMAGE_REGISTRY` when prebuilding or running
+`HARBOR_TASK_IMAGE_BASE_IMAGE_REGISTRY` when prebuilding or running
 through OpenSandbox so the image manager resolves those names through the
 configured base Registry without embedding an environment-specific Registry
 in the dataset.
@@ -87,10 +87,10 @@ behavior. Records with a null `problem_statement` use the non-answer-bearing
 
 ## Prebuild and run
 
-Prebuild through the existing OpenSandbox image pipeline:
+Prebuild through the existing Harbor task image pipeline:
 
 ```bash
-bash Agents/utils/common/Harbor/prebuild_opensandbox_dataset.sh \
+bash Agents/utils/common/Harbor/task_image_manager/prebuild_dataset.sh \
   <generated-harbor-dataset> agent-fleet-swe-rebench-v2
 ```
 

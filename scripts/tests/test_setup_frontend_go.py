@@ -38,7 +38,7 @@ class FrontendGoTest(unittest.TestCase):
 uname() { if [[ "$1" == -s ]]; then echo Linux; else echo x86_64; fi; }
 agent_fleet_download() { printf corrupt > "$2"; }
 agent_fleet_install_frontend_go
-''', HARBOR_OPENSANDBOX_GOPROXY='http://mirror.invalid/go-proxy')
+''', HARBOR_TASK_IMAGE_GOPROXY='http://mirror.invalid/go-proxy')
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((root / 'bin/go').exists())
 
@@ -49,7 +49,7 @@ agent_fleet_install_frontend_go
 uname() { if [[ "$1" == -s ]]; then echo Linux; else echo x86_64; fi; }
 agent_fleet_download() { echo "$1"; return 42; }
 agent_fleet_install_frontend_go
-''', HARBOR_OPENSANDBOX_GOPROXY='http://mirror.invalid/go-proxy,direct')
+''', HARBOR_TASK_IMAGE_GOPROXY='http://mirror.invalid/go-proxy,direct')
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(
                 'http://mirror.invalid/go-proxy/golang.org/toolchain/@v/'
@@ -72,7 +72,7 @@ agent_fleet_install_frontend_go
                     'agent_fleet_check_commands'))
                 body += '\nagent_fleet_install_frontend_go() { echo install; }\nagent_fleet_find_frontend_go() { echo check; }\nagent_fleet_bootstrap_setup_prerequisites'
                 result = self.run_shell(Path(tmp), body, HARBOR_ENVIRONMENT_TYPE=backend,
-                                        HARBOR_OPENSANDBOX_BUILD_TOOLS_SETUP=enabled,
+                                        HARBOR_TASK_IMAGE_BUILD_TOOLS_SETUP=enabled,
                                         AGENT_FLEET_PREREQUISITES_INSTALL_MANAGED=managed)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)

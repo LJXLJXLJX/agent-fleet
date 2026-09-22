@@ -93,7 +93,7 @@ Backend-specific setup and limitations:
 - [E2B](../../Agents/utils/common/Harbor/E2B_README.md)
 - [qz](../../Agents/utils/common/Harbor/QZ_SANDBOX_README.md)
 - [OpenSandbox](../../Agents/utils/common/Harbor/OPENSANDBOX_README.md) and
-  [Bundle/image preparation](../../Agents/utils/common/Harbor/OPENSANDBOX_IMAGE_MANAGER.md)
+  [image preparation](../../Agents/utils/common/Harbor/task_image_manager/README.md)
 
 ## Monitoring and Debugging
 
