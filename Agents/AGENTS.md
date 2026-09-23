@@ -76,7 +76,7 @@ image preparation, runtime delivery, or provider configuration:
 - [qz](utils/common/Harbor/QZ_SANDBOX_README.md) and
   [template management](utils/common/Harbor/QZ_TEMPLATE_MANAGER.md)
 - [OpenSandbox](utils/common/Harbor/OPENSANDBOX_README.md) and
-  [Bundle/image management](utils/common/Harbor/OPENSANDBOX_IMAGE_MANAGER.md)
+  [image preparation](utils/common/Harbor/task_image_manager/README.md)
 
 Reusable Python runtime construction belongs in `python_runtime.py`;
 dataset-specific verifier composition belongs in `verifier_runtime/`.

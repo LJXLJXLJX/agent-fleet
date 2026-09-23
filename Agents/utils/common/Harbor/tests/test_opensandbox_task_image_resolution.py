@@ -13,7 +13,10 @@ from urllib.request import HTTPRedirectHandler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import opensandbox_image_manager as manager
+import task_image_manager.registry as image_registry
+import task_image_manager.service_images as image_planner
+from task_image_manager import task_cli as manager
+from task_image_manager.build_engine import image_build
 
 
 class TaskImageResolutionTest(unittest.TestCase):
@@ -33,7 +36,7 @@ class TaskImageResolutionTest(unittest.TestCase):
             '--no-use-proxy', '--no-validate-image-hash',
         ])
         self.opener = Mock()
-        self.stack.enter_context(patch.object(manager, 'build_opener', return_value=self.opener))
+        self.stack.enter_context(patch.object(image_registry, 'build_opener', return_value=self.opener))
         self.real_inspect_config = manager.SkopeoPublisher.inspect_config
         self.config = self.stack.enter_context(patch.object(
             manager.SkopeoPublisher, 'inspect_config', return_value={
@@ -41,15 +44,15 @@ class TaskImageResolutionTest(unittest.TestCase):
                 'exposed_ports': [], 'healthcheck': None,
             },
         ))
-        self.real_identity = manager.image_identity
+        self.real_identity = image_planner.image_identity
         self.identity = self.stack.enter_context(patch.object(
-            manager, 'image_identity', side_effect=AssertionError('consumer must not hash'),
+            image_planner, 'image_identity', side_effect=AssertionError('consumer must not hash'),
         ))
         self.credentials = self.stack.enter_context(patch.object(
-            manager, 'registry_credentials', side_effect=AssertionError('consumer must be anonymous'),
+            image_planner, 'registry_credentials', side_effect=AssertionError('consumer must be anonymous'),
         ))
         self.build = self.stack.enter_context(patch.object(
-            manager, 'run_build', side_effect=AssertionError('consumer must not build'),
+            image_build, 'run_build', side_effect=AssertionError('consumer must not build'),
         ))
         self.copy = self.stack.enter_context(patch.object(
             manager.SkopeoPublisher, 'copy', side_effect=AssertionError('consumer must not push'),
@@ -58,7 +61,7 @@ class TaskImageResolutionTest(unittest.TestCase):
             manager.SkopeoPublisher, 'inspect', side_effect=AssertionError('no hash-derived manifest lookup'),
         ))
         self.stack.enter_context(patch.object(
-            manager, 'inspect_external_image', side_effect=AssertionError('no upstream image lookup'),
+            image_planner, 'inspect_external_image', side_effect=AssertionError('no upstream image lookup'),
         ))
 
     def artifact(self, tag, pushed='2026-09-01T01:00:00Z', digest='a'):
@@ -71,7 +74,7 @@ class TaskImageResolutionTest(unittest.TestCase):
         ]
 
     def prepare_image(self):
-        prepared = manager.prepare_bundle(self.args)
+        prepared = manager.prepare_task_images(self.args)
         return prepared.manifest['services']['main']['image']
 
     def test_single_tag_reused_despite_changed_local_content_without_hash(self):
@@ -101,7 +104,7 @@ class TaskImageResolutionTest(unittest.TestCase):
         self.assertTrue(manager.parse_args(argv + ['--validate-image-hash']).validate_image_hash)
         for value, enabled in [('0', False), ('1', True), ('true', True), ('TRUE', True)]:
             with self.subTest(value=value), patch.dict(
-                os.environ, {'HARBOR_OPENSANDBOX_VALIDATE_IMAGE_HASH': value}
+                os.environ, {'HARBOR_TASK_IMAGE_VALIDATE_HASH': value}
             ):
                 self.assertEqual(manager.parse_args(argv).validate_image_hash, enabled)
                 self.assertFalse(manager.parse_args(argv + ['--no-validate-image-hash']).validate_image_hash)
@@ -119,7 +122,7 @@ class TaskImageResolutionTest(unittest.TestCase):
         self.identity.assert_not_called()
 
     def test_environment_opt_out_reuses_without_hashing_and_warns(self):
-        with patch.dict(os.environ, {'HARBOR_OPENSANDBOX_VALIDATE_IMAGE_HASH': '0'}):
+        with patch.dict(os.environ, {'HARBOR_TASK_IMAGE_VALIDATE_HASH': '0'}):
             self.args = manager.parse_args([
                 '--task-dir', str(self.task), '--registry', 'registry.example',
                 '--project', 'test-project', '--cache-root', str(self.root / 'cache'),
@@ -196,7 +199,7 @@ class TaskImageResolutionTest(unittest.TestCase):
             self.environment, docker_image=source
         )[:20]) for name, source in [('main', 'ubuntu:24.04'), ('worker', 'redis:7')]]
         self.responses(artifacts)
-        prepared = manager.prepare_bundle(self.args)
+        prepared = manager.prepare_task_images(self.args)
         self.assertEqual(set(prepared.manifest['services']), {'main', 'worker'})
         self.assertEqual(self.identity.call_count, 2)
         self.identity.assert_any_call(self.environment, docker_image='ubuntu:24.04')
@@ -253,8 +256,8 @@ class TaskImageResolutionTest(unittest.TestCase):
         self.copy.side_effect = None
         self.copy.return_value = {'artifact_digest': 'sha256:' + 'd' * 64,
                                   'media_type': manager.DOCKER_MANIFEST}
-        self.stack.enter_context(patch.object(manager, 'oci_archive_image_config', return_value=self.config.return_value))
-        self.stack.enter_context(patch.object(manager, 'prepare_frontend', return_value={}))
+        self.stack.enter_context(patch.object(image_build, 'oci_archive_image_config', return_value=self.config.return_value))
+        self.stack.enter_context(patch.object(image_build, 'prepare_frontend', return_value={}))
 
     def test_empty_repository_uses_existing_hash_build_and_push_flow(self):
         self.responses([])
@@ -311,7 +314,7 @@ class TaskImageResolutionTest(unittest.TestCase):
                     )]).encode()),
                 ]
                 with patch.object(manager.SkopeoPublisher, 'inspect_config', self.real_inspect_config), patch.object(
-                    manager.SkopeoPublisher, '_run', return_value='{"config": {}}'
+                    image_registry.subprocess, 'run', return_value=Mock(returncode=0, stdout='{"config": {}}', stderr='')
                 ) as run, patch('sys.stderr', new_callable=io.StringIO) as stderr:
                     image = self.prepare_image()
                 self.assertEqual(image['artifact_digest'], 'sha256:' + 'b' * 64)
@@ -330,7 +333,7 @@ class TaskImageResolutionTest(unittest.TestCase):
                 login, inspect = run.call_args_list
                 self.assertEqual(login.args[0][:2], ['skopeo', 'login'])
                 self.assertIn('fake-user', login.args[0])
-                self.assertEqual(login.kwargs['input_text'], 'fake-password')
+                self.assertEqual(login.kwargs['input'], 'fake-password')
                 self.assertEqual(inspect.args[0][:2], ['skopeo', 'inspect'])
                 self.assertIn('--config', inspect.args[0])
                 self.assertIn(image['digest_ref'], inspect.args[0][-1])
@@ -373,7 +376,7 @@ class TaskImageResolutionTest(unittest.TestCase):
         artifacts = [self.artifact('main-' + 'a' * 20),
                      self.artifact('worker-' + 'b' * 20, '2026-09-02T00:00:00Z', 'b')]
         self.responses(artifacts)
-        prepared = manager.prepare_bundle(self.args)
+        prepared = manager.prepare_task_images(self.args)
         services = prepared.manifest['services']
         self.assertEqual(services['main']['image']['artifact_digest'], 'sha256:' + 'a' * 64)
         self.assertEqual(services['worker']['image']['artifact_digest'], 'sha256:' + 'b' * 64)
@@ -387,7 +390,7 @@ class TaskImageResolutionTest(unittest.TestCase):
         # the first service is published to the repository.
         self.responses([])
         self.allow_build()
-        prepared = manager.prepare_bundle(self.args)
+        prepared = manager.prepare_task_images(self.args)
         self.assertEqual(set(prepared.manifest['services']), {'main', 'worker'})
         self.assertEqual(self.build.call_count, 2)
         self.assertEqual(self.copy.call_count, 2)
@@ -397,7 +400,10 @@ class TaskImageResolutionTest(unittest.TestCase):
         target = manager.RegistryTarget('registry.example', 'test-project', self.task.name)
         publisher = manager.SkopeoPublisher(target, '', '', tls_verify=True)
         self.addCleanup(publisher.close)
-        with patch.object(publisher, '_run', return_value='{"config": {}}') as run:
+        with patch.object(image_registry.subprocess, 'run', return_value=Mock(returncode=0, stdout='{"config": {}}', stderr='')) as run:
             publisher.login()
             run.assert_not_called()
-            self.assertEqual(json.loads(Path(publisher._authfile).read_text()), {'auths': {}})
+            self.real_inspect_config(publisher, 'registry.example/test-project/image:latest')
+            command = run.call_args.args[0]
+            authfile = Path(command[command.index('--authfile') + 1])
+            self.assertEqual(json.loads(authfile.read_text()), {'auths': {}})

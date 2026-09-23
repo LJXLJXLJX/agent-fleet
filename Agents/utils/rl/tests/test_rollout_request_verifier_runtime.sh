@@ -24,12 +24,12 @@ harbor_prepare_verifier_runtime_bundle() {
 }
 
 HARBOR_ENVIRONMENT_TYPE=opensandbox
-HARBOR_OPENSANDBOX_BENCHMARK=prebuilt-registry-alias
+HARBOR_TASK_IMAGE_BENCHMARK=prebuilt-registry-alias
 prepare_request_verifier_runtime_bundle agent-fleet-swe-rebench-v2
 grep -Fx -- 'test-bundle' "$tmp/resolved" >/dev/null
 grep -Fx -- 'prepared' "$tmp/prepared" >/dev/null
 [[ "$HARBOR_VERIFIER_BENCHMARK" == "agent-fleet-swe-rebench-v2" ]]
-[[ "$HARBOR_OPENSANDBOX_BENCHMARK" == "prebuilt-registry-alias" ]]
+[[ "$HARBOR_TASK_IMAGE_BENCHMARK" == "prebuilt-registry-alias" ]]
 
 : > "$tmp/resolved"
 : > "$tmp/prepared"
@@ -38,7 +38,7 @@ prepare_request_verifier_runtime_bundle other-dataset
 grep -Fx -- 'none' "$tmp/resolved" >/dev/null
 grep -Fx -- 'prepared' "$tmp/prepared" >/dev/null
 [[ "$HARBOR_VERIFIER_BENCHMARK" == "other-dataset" ]]
-[[ "$HARBOR_OPENSANDBOX_BENCHMARK" == "prebuilt-registry-alias" ]]
+[[ "$HARBOR_TASK_IMAGE_BENCHMARK" == "prebuilt-registry-alias" ]]
 
 : > "$tmp/resolved"
 : > "$tmp/prepared"

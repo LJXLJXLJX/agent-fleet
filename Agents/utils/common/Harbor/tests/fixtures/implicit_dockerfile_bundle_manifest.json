@@ -1,0 +1,119 @@
+{
+  "benchmark": {
+    "name": "benchmark"
+  },
+  "bundle_format": "harbor-environment-bundle-v2",
+  "bundle_identity": "sha256:3097924d646a527f89c0612a6f14c13a18273bdc1b7086762eb07e04ab0c98b8",
+  "definition_identity": "sha256:4e1490a2f70056710b14267980414ae55129024313c2139fb092e0b70cffa672",
+  "definition_kind": "dockerfile",
+  "main": "main",
+  "normalization_backend": "dockerfile",
+  "registry": {
+    "host": "registry.example",
+    "project": "benchmark",
+    "repository": "benchmark/example",
+    "task_repository": "example"
+  },
+  "requirements": {
+    "multi_service": false
+  },
+  "schema_version": 2,
+  "services": {
+    "main": {
+      "aliases": [
+        "app"
+      ],
+      "build": {
+        "build_arg_names": [
+          "PIP_INDEX_URL"
+        ],
+        "context": ".",
+        "dockerfile": "Dockerfile",
+        "target": null
+      },
+      "cap_add": [],
+      "command": null,
+      "command_present": false,
+      "container_name": null,
+      "depends_on": {},
+      "entrypoint": null,
+      "entrypoint_present": false,
+      "environment": {
+        "MODE": "test"
+      },
+      "expose": [
+        "22/tcp"
+      ],
+      "healthcheck": null,
+      "image": {
+        "artifact_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "build_arg_names": [
+          "PIP_INDEX_URL"
+        ],
+        "config": {
+          "cmd": [
+            "-c",
+            "print(1)"
+          ],
+          "entrypoint": [
+            "/usr/bin/python3"
+          ],
+          "exposed_ports": [
+            {
+              "port": 8080,
+              "protocol": "tcp"
+            }
+          ],
+          "healthcheck": null,
+          "working_dir": "/app"
+        },
+        "config_resolved": true,
+        "digest_ref": "registry.example/benchmark/example@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "input_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "media_type": "application/vnd.docker.distribution.manifest.v2+json",
+        "platform": "linux/amd64",
+        "source": "build",
+        "tag": "main-11111111111111111111",
+        "tag_ref": "registry.example/benchmark/example:main-11111111111111111111"
+      },
+      "networks": {},
+      "ports": [
+        {
+          "protocol": "tcp",
+          "target": 8080
+        }
+      ],
+      "privileged": false,
+      "resources": {},
+      "runtime": {
+        "internal_ports": [
+          {
+            "port": 8080,
+            "protocol": "tcp",
+            "source": "compose.ports.target"
+          },
+          {
+            "port": 22,
+            "protocol": "tcp",
+            "source": "compose.expose"
+          }
+        ],
+        "readiness": null,
+        "start_argv": [
+          "/usr/bin/python3",
+          "sh",
+          "-c",
+          "while :; do sleep 60; done"
+        ],
+        "start_argv_source": "image-config.entrypoint+adapter.legacy-keepalive",
+        "workdir": "/app",
+        "workdir_source": "image-config.working-dir"
+      },
+      "source_image": null,
+      "unsupported_fields": [],
+      "volumes": [],
+      "working_dir": null
+    }
+  },
+  "task_identity": "example"
+}

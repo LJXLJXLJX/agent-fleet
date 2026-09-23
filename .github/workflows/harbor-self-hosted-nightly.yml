@@ -171,7 +171,7 @@ jobs:
           fi
           export BASE_URL="${BASE_URL_RAW%/chat/completions}"
           export OPIK_PROJECT_NAME="$(date -u +'%Y-%m-%d-%H')-harbor-self-hosted-nightly"
-          export HARBOR_OPENSANDBOX_BENCHMARK="$BENCHMARK"
+          export HARBOR_TASK_IMAGE_BENCHMARK="$BENCHMARK"
           # Keep Analyzer artifacts and detached Pi homes inside this run.
           export HARBOR_ANALYZER_OUTPUT_DIR="$OUTPUT_PATH/analyzer"
 

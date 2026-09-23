@@ -314,7 +314,7 @@ agent_fleet_find_frontend_go() {
       return 0
     fi
   done
-  agent_fleet_prereq_error "Go 1.25.4 required; run setup with HARBOR_OPENSANDBOX_BUILD_TOOLS_SETUP=1"
+  agent_fleet_prereq_error "Go 1.25.4 required; run setup with HARBOR_TASK_IMAGE_BUILD_TOOLS_SETUP=1"
   return 1
 }
 
@@ -331,12 +331,12 @@ agent_fleet_install_frontend_go() {
   mkdir -p "$(dirname "$archive")" "$(dirname "$destination")" "$AGENT_FLEET_BIN_DIR" || return 1
   printf '%s\n' f4fa35e13952bae9836a82d8cf077710cd58fee98d31680f94edf435852b1af2 > "$archive.sha256" || return 1
   if [[ ! -f "$archive" ]] || ! agent_fleet_verify_sha256 "$archive" "$archive.sha256"; then
-    go_proxy="${HARBOR_OPENSANDBOX_GOPROXY:-https://goproxy.cn,direct}"
+    go_proxy="${HARBOR_TASK_IMAGE_GOPROXY:-https://goproxy.cn,direct}"
     go_download_proxy="${go_proxy%%,*}"
     go_download_proxy="${go_download_proxy%%|*}"
     case "$go_download_proxy" in
       http://*|https://*) ;;
-      *) agent_fleet_prereq_error "HARBOR_OPENSANDBOX_GOPROXY must start with an HTTP(S) Go module mirror"; return 1 ;;
+      *) agent_fleet_prereq_error "HARBOR_TASK_IMAGE_GOPROXY must start with an HTTP(S) Go module mirror"; return 1 ;;
     esac
     agent_fleet_prereq_info "Downloading Go 1.25.4 from the configured Go module mirror; cache=$archive"
     agent_fleet_download "${go_download_proxy%/}/golang.org/toolchain/@v/${module#*@}.zip" "$archive" --max-time 120 || return 1
@@ -450,14 +450,14 @@ agent_fleet_bootstrap_setup_prerequisites() {
       agent_fleet_install_uv || return 1
   fi
   agent_fleet_check_harbor || return 1
-  local build_tools="${HARBOR_OPENSANDBOX_BUILD_TOOLS_SETUP:-auto}"
+  local build_tools="${HARBOR_TASK_IMAGE_BUILD_TOOLS_SETUP:-auto}"
   if [[ "$build_tools" == auto ]]; then
     build_tools=0
     [[ "${HARBOR_ENVIRONMENT_TYPE:-${RL_ENVIRONMENT_TYPE:-docker}}" != opensandbox ]] || build_tools=1
   fi
   case "$build_tools" in
     1)
-      agent_fleet_check_commands "OpenSandbox frontend build" timeout || return 1
+      agent_fleet_check_commands "Harbor task image frontend build" timeout || return 1
       (
         source "$AGENT_FLEET_PREREQ_SCRIPT_DIR/config_loader.sh"
         agent_fleet_load_config "${REPO_DIR:-$AGENT_FLEET_PREREQ_SCRIPT_DIR/..}"
@@ -469,7 +469,7 @@ agent_fleet_bootstrap_setup_prerequisites() {
       ) || return 1
       ;;
     0) ;;
-    *) agent_fleet_prereq_error "HARBOR_OPENSANDBOX_BUILD_TOOLS_SETUP must be auto, 1 or 0"; return 1 ;;
+    *) agent_fleet_prereq_error "HARBOR_TASK_IMAGE_BUILD_TOOLS_SETUP must be auto, 1 or 0"; return 1 ;;
   esac
   agent_fleet_save_prerequisite_paths
 }

@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 HARBOR_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HARBOR_DIR))
 
-from opensandbox_image_manager import (
+from task_image_manager.task_cli import (
     APT_RUNTIME_ASSET_DIR,
     APT_RUNTIME_ASSET_NAMES,
     DOCKER_CONFIG,
@@ -25,9 +25,6 @@ from opensandbox_image_manager import (
     OCI_LAYER_GZIP,
     RegistryTarget,
     SkopeoPublisher,
-    _compose_runtime,
-    _service_image_inputs,
-    _service_manifest,
     apt_404_requires_cache_refresh,
     apt_gateway_root_content,
     apt_runtime_asset_digest,
@@ -46,7 +43,7 @@ from opensandbox_image_manager import (
     package_source_hosts,
     parse_args,
     prepare,
-    prepare_bundle,
+    prepare_task_images,
     proxy_build_args,
     render_build_dockerfile,
     resolve_base_image_contexts,
@@ -66,6 +63,32 @@ def add_tar_bytes(archive: tarfile.TarFile, name: str, data: bytes) -> None:
     info.size = len(data)
     archive.addfile(info, io.BytesIO(data))
 
+
+
+def _assemble_test_service(service, artifact, environment_dir, *, benchmark, task_identity, definition_kind):
+    # Exercise runtime derivation through the public Bundle assembly boundary.
+    from compose_bundle import BundleSpec
+    from task_image_manager.task_bundle import assemble_bundle_manifest
+
+    bundle = BundleSpec(
+        task_dir=Path("/tasks") / task_identity, environment_dir=environment_dir,
+        definition_kind=definition_kind, main_service=service.name,
+        services={service.name: service}, requirements={}, normalization_backend="test",
+    )
+    artifact = {"artifact_digest": "sha256:" + "a" * 64, "build_arg_names": [], **artifact}
+    return assemble_bundle_manifest(
+        bundle, {service.name: artifact}, benchmark=benchmark,
+        registry_host="registry.example", project="test", task_repository=task_identity,
+        repository=f"test/{task_identity}",
+    )["services"][service.name]
+
+
+def _runtime_from_manifest(service, config, *, benchmark, task_identity):
+    environment_dir = service.build.context_dir if service.build else Path("/environment")
+    return _assemble_test_service(
+        service, {"config": config}, environment_dir, benchmark=benchmark,
+        task_identity=task_identity, definition_kind="compose",
+    )["runtime"]
 
 class OpenSandboxImageManagerTest(unittest.TestCase):
     def make_task(self, root: Path, name: str = "0") -> Path:
@@ -156,13 +179,9 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
             )
 
         self.assertTrue(args.use_proxy)
-        self.assertEqual(
-            args.registry, "harbor.example.internal"
-        )
+        self.assertEqual(args.registry, "harbor.example.internal")
         self.assertEqual(args.build_network, "host")
-        self.assertEqual(
-            args.pip_index_url, "https://pypi.tuna.tsinghua.edu.cn/simple"
-        )
+        self.assertEqual(args.pip_index_url, "https://pypi.tuna.tsinghua.edu.cn/simple")
         self.assertEqual(args.npm_registry, "https://registry.npmmirror.com")
         self.assertEqual(args.goproxy, "https://goproxy.cn,direct")
         self.assertEqual(args.gosumdb, "sum.golang.google.cn")
@@ -177,10 +196,10 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "HARBOR_OPENSANDBOX_PUB_HOSTED_URL": (
+                "HARBOR_TASK_IMAGE_PUB_HOSTED_URL": (
                     "https://third-party.example/dart/pub"
                 ),
-                "HARBOR_OPENSANDBOX_JULIA_PKG_SERVER": (
+                "HARBOR_TASK_IMAGE_JULIA_PKG_SERVER": (
                     "https://third-party.example/julia/pkg"
                 ),
             },
@@ -196,18 +215,14 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
                 ]
             )
 
-        self.assertEqual(
-            args.pub_hosted_url, "https://third-party.example/dart/pub"
-        )
-        self.assertEqual(
-            args.julia_pkg_server, "https://third-party.example/julia/pkg"
-        )
+        self.assertEqual(args.pub_hosted_url, "https://third-party.example/dart/pub")
+        self.assertEqual(args.julia_pkg_server, "https://third-party.example/julia/pkg")
 
     def test_cli_reads_download_source_from_environment(self) -> None:
         source = "http://third-party-source.internal/v1/cache"
         with patch.dict(
             os.environ,
-            {"HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL": source},
+            {"HARBOR_TASK_IMAGE_DOWNLOAD_SOURCE_URL": source},
             clear=True,
         ):
             args = parse_args(
@@ -235,23 +250,26 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
             ValueError,
             "--registry or YICLOUD_HARBOR_HOST is required",
         ):
-            prepare_bundle(Namespace(platform="linux/amd64", registry=""))
+            prepare_task_images(Namespace(platform="linux/amd64", registry=""))
         for registry in (
             "https://harbor.example",
             "harbor.example/project",
         ):
-            with self.subTest(registry=registry), self.assertRaisesRegex(
-                ValueError,
-                "bare OCI registry host",
+            with (
+                self.subTest(registry=registry),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "bare OCI registry host",
+                ),
             ):
-                prepare_bundle(Namespace(registry=registry))
+                prepare_task_images(Namespace(registry=registry))
 
     def test_prepare_rejects_unimplemented_platform_before_other_work(self) -> None:
         with self.assertRaisesRegex(
             NotImplementedError,
             "platform 'linux/arm64' is not implemented",
         ):
-            prepare_bundle(Namespace(platform="linux/arm64"))
+            prepare_task_images(Namespace(platform="linux/arm64"))
 
     def test_loopback_proxy_requires_host_build_network(self) -> None:
         with patch.dict(
@@ -270,7 +288,7 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "HARBOR_OPENSANDBOX_BUILD_PROXY_URL": "http://127.0.0.1:7890",
+                "HARBOR_TASK_IMAGE_BUILD_PROXY_URL": "http://127.0.0.1:7890",
                 "HTTPS_PROXY": "http://127.0.0.1:7897",
             },
             clear=True,
@@ -312,31 +330,25 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             task = self.make_task(Path(tmp))
             environment = task / "environment"
-            from compose_bundle import resolve_bundle_spec
-
-            bundle = resolve_bundle_spec(task)
-            service = bundle.services["main"]
             expected = environment_content_hash(environment, truncate=64)
 
             def service_identity() -> str:
-                return _service_image_inputs(
-                    service,
-                    bundle=bundle,
-                    dockerhub_mirror_prefix="",
-                    package_build_args={},
-                    platform="linux/amd64",
-                    explicit_build_args={},
-                    dry_run=True,
-                )[0]
+                with patch.dict(os.environ, {}, clear=True):
+                    args = parse_args([
+                        "--task-dir", str(task), "--registry", "registry.example",
+                        "--project", "test", "--dry-run",
+                    ])
+                prepared = prepare_task_images(args)
+                return prepared.manifest["services"]["main"]["image"]["input_hash"].removeprefix("sha256:")
 
             first = service_identity()
             with patch(
-                "opensandbox_image_manager.apt_runtime_asset_digest",
+                "task_image_manager.build_engine.dockerfile_renderer.strategies.apt.apt_runtime_asset_digest",
                 return_value="changed-runtime-assets",
             ):
                 second = service_identity()
             with patch(
-                "opensandbox_image_manager.render_build_dockerfile",
+                "task_image_manager.build_engine.image_build.render_build_dockerfile",
                 return_value="different generated Dockerfile",
             ):
                 third = service_identity()
@@ -353,7 +365,8 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
             for name in APT_RUNTIME_ASSET_NAMES:
                 (asset_dir / name).write_text(f"{name}:first\n", encoding="utf-8")
             with patch(
-                "opensandbox_image_manager.APT_RUNTIME_ASSET_DIR", asset_dir
+                "task_image_manager.build_engine.dockerfile_renderer.strategies.apt.APT_RUNTIME_ASSET_DIR",
+                asset_dir,
             ):
                 first_digest = apt_runtime_asset_digest()
                 first_secret_ids = apt_runtime_secret_ids()
@@ -387,12 +400,16 @@ class OpenSandboxImageManagerTest(unittest.TestCase):
         )
         self.assertEqual(config["healthcheck"], {"test": ["CMD", "true"]})
 
-    def test_task_973_runtime_uses_compose_command_and_oci_worker_defaults(self) -> None:
+    def test_task_973_runtime_uses_compose_command_and_oci_worker_defaults(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             task = self.make_task(root, "973")
             environment = task / "environment"
-            (environment / "Dockerfile.worker").write_text("FROM alpine:3.20\n", encoding="utf-8")
+            (environment / "Dockerfile.worker").write_text(
+                "FROM alpine:3.20\n", encoding="utf-8"
+            )
             (environment / "docker-compose.yaml").write_text(
                 """
 services:
@@ -409,7 +426,7 @@ services:
             from compose_bundle import resolve_bundle_spec
 
             bundle = resolve_bundle_spec(task)
-        main = _compose_runtime(
+        main = _runtime_from_manifest(
             bundle.services["main"],
             {
                 "entrypoint": None,
@@ -421,7 +438,7 @@ services:
             benchmark="seta",
             task_identity="973",
         )
-        worker = _compose_runtime(
+        worker = _runtime_from_manifest(
             bundle.services["worker"],
             {
                 "entrypoint": None,
@@ -445,7 +462,9 @@ services:
             worker["internal_ports"],
             [{"port": 22, "protocol": "tcp", "source": "image-config.exposed-ports"}],
         )
-        self.assertEqual(worker["readiness"]["source"], "adapter-metadata:seta/973/worker")
+        self.assertEqual(
+            worker["readiness"]["source"], "adapter-metadata:seta/973/worker"
+        )
 
     def test_compose_scalar_command_is_appended_as_argv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -458,7 +477,7 @@ services:
 
             service = resolve_bundle_spec(task).services["main"]
 
-        runtime = _compose_runtime(
+        runtime = _runtime_from_manifest(
             service,
             {
                 "entrypoint": ["python", "server.py"],
@@ -496,7 +515,7 @@ services:
                 "config_resolved": True,
                 "build_arg_names": [],
             }
-            implicit = _service_manifest(
+            implicit = _assemble_test_service(
                 service,
                 artifact,
                 bundle.environment_dir,
@@ -504,7 +523,7 @@ services:
                 task_identity="commandless",
                 definition_kind="dockerfile",
             )
-            explicit_compose = _service_manifest(
+            explicit_compose = _assemble_test_service(
                 service,
                 artifact,
                 bundle.environment_dir,
@@ -571,7 +590,7 @@ networks:
                 registry_tls_verify=False,
                 dry_run=True,
             )
-            prepared = prepare_bundle(args)
+            prepared = prepare_task_images(args)
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
         self.assertEqual(prepared.manifest_path, manifest_path)
@@ -590,11 +609,7 @@ networks:
 
     def test_render_preserves_run_and_stage_alias(self) -> None:
         rendered = render_build_dockerfile(
-            (
-                "FROM ubuntu:24.04 AS builder\n"
-                "RUN apt-get update\n"
-                "FROM builder\n"
-            ),
+            ("FROM ubuntu:24.04 AS builder\nRUN apt-get update\nFROM builder\n"),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
             package_build_args={
                 "NPM_CONFIG_REGISTRY": "https://registry.npmmirror.com",
@@ -627,7 +642,7 @@ networks:
             "FROM builder\n"
         )
         with patch(
-            "opensandbox_image_manager.inspect_external_image",
+            "task_image_manager.build_engine.base_images.inspect_external_image",
             return_value=(
                 "registry.example/base/go_1.19.13",
                 "sha256:" + "a" * 64,
@@ -654,8 +669,7 @@ networks:
         self.assertRegex(context_name, r"^opensandbox-base-[0-9a-f]{20}$")
         self.assertEqual(
             contexts[context_name],
-            "docker-image://registry.example/base/go_1.19.13@sha256:"
-            + "a" * 64,
+            "docker-image://registry.example/base/go_1.19.13@sha256:" + "a" * 64,
         )
 
         rendered = render_build_dockerfile(
@@ -675,9 +689,7 @@ networks:
         cases = {
             "go_1.19.13": "registry.example/base/go_1.19.13",
             "ubuntu:22.04": "registry.example/base/ubuntu:22.04",
-            "docker.io/library/ubuntu:22.04": (
-                "registry.example/base/ubuntu:22.04"
-            ),
+            "docker.io/library/ubuntu:22.04": ("registry.example/base/ubuntu:22.04"),
             "index.docker.io/library/ubuntu:22.04": (
                 "registry.example/base/ubuntu:22.04"
             ),
@@ -726,7 +738,7 @@ networks:
             return image_ref, "sha256:" + "b" * 64
 
         with patch(
-            "opensandbox_image_manager.inspect_external_image",
+            "task_image_manager.build_engine.base_images.inspect_external_image",
             side_effect=fake_inspect,
         ):
             replacements, contexts = resolve_base_image_contexts(
@@ -781,7 +793,7 @@ networks:
         source = "FROM go_1.19.13\n"
         with (
             patch(
-                "opensandbox_image_manager.inspect_external_image",
+                "task_image_manager.build_engine.base_images.inspect_external_image",
                 side_effect=RuntimeError(
                     "failed to inspect external image "
                     "'registry.example/base/go_1.19.13'"
@@ -816,9 +828,7 @@ networks:
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
         )
 
-        self.assertIn(
-            "FROM m.daocloud.io/docker.io/library/ubuntu:22.04\n", rendered
-        )
+        self.assertIn("FROM m.daocloud.io/docker.io/library/ubuntu:22.04\n", rendered)
         self.assertIn(
             "FROM m.daocloud.io/docker.io/library/go_1.19.13 AS builder\n",
             rendered,
@@ -889,8 +899,9 @@ networks:
             ("pub_hosted_url", "https://user:secret@packages.example/dart"),
             ("julia_pkg_server", "https://user:secret@packages.example/julia"),
         ):
-            with self.subTest(field=field), self.assertRaisesRegex(
-                ValueError, "without credentials"
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "without credentials"),
             ):
                 package_source_build_args(Namespace(**{field: value}), "host")
 
@@ -1022,10 +1033,19 @@ networks:
         # masking a broken package-relative import.
         repo = HARBOR_DIR.parents[3]
         completed = subprocess.run(
-            [sys.executable, "-I", "-c",
-             (f"import sys; sys.path.insert(0, {str(repo)!r}); "
-              "from Agents.utils.common.Harbor import opensandbox_image_manager")],
-            capture_output=True, text=True, timeout=30, check=False,
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                (
+                    f"import sys; sys.path.insert(0, {str(repo)!r}); "
+                    "from Agents.utils.common.Harbor.task_image_manager import task_cli"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
@@ -1100,9 +1120,7 @@ networks:
             "deb https://deb.debian.org/debian-security trixie-security main\n"
         )
         rewritten, warnings = self.rewrite_apt_source(source, "list")
-        self.assertIn(
-            "deb http://archive.ubuntu.com/ubuntu noble main", rewritten
-        )
+        self.assertIn("deb http://archive.ubuntu.com/ubuntu noble main", rewritten)
         self.assertIn(
             "deb https://deb.debian.org/debian-security trixie-security main",
             rewritten,
@@ -1118,9 +1136,7 @@ networks:
         rewritten, warnings = self.rewrite_apt_source(
             source, "list", "http://gateway/v1/cache"
         )
-        self.assertIn(
-            "deb http://127.0.0.1:3142/ubuntu noble main", rewritten
-        )
+        self.assertIn("deb http://127.0.0.1:3142/ubuntu noble main", rewritten)
         self.assertIn("deb http://localhost:8080/repo stable main", rewritten)
         self.assertIn("event=source-bypass", warnings)
         self.assertIn("source=http://127.0.0.1:3142/ubuntu", warnings)
@@ -1134,9 +1150,7 @@ networks:
             source, "list", "http://gateway/v1/cache"
         )
         self.assertIn("deb http://10.0.0.5/ubuntu noble main", rewritten)
-        self.assertIn(
-            "deb http://repo.corp.internal/debian stable main", rewritten
-        )
+        self.assertIn("deb http://repo.corp.internal/debian stable main", rewritten)
         self.assertIn("event=source-bypass", warnings)
         self.assertIn("source=http://10.0.0.5/ubuntu", warnings)
 
@@ -1145,17 +1159,12 @@ networks:
         rewritten, warnings = self.rewrite_apt_source(
             source, "list", "http://gateway/v1/cache", auth_conf="1"
         )
-        self.assertIn(
-            "deb http://archive.ubuntu.com/ubuntu noble main", rewritten
-        )
+        self.assertIn("deb http://archive.ubuntu.com/ubuntu noble main", rewritten)
         self.assertIn("event=source-bypass", warnings)
         self.assertIn("source=http://archive.ubuntu.com/ubuntu", warnings)
 
     def test_runtime_warning_redacts_credentials_from_list_source(self) -> None:
-        source = (
-            "deb https://ci-user:FAKE_LIST_TOKEN@repo.invalid/private "
-            "noble main\n"
-        )
+        source = "deb https://ci-user:FAKE_LIST_TOKEN@repo.invalid/private noble main\n"
 
         rewritten, warnings = self.rewrite_apt_source(
             source, "list", "http://gateway/v1/cache"
@@ -1216,9 +1225,9 @@ networks:
             "RUN printf '#!/bin/sh\\napt-get update\\n' >/tmp/install.sh "
             "&& sh /tmp/install.sh\n"
             "RUN python3 -c 'import subprocess; "
-            "subprocess.run([\"apt-get\", \"update\"], check=True)'\n"
-            "RUN [\"apt-get\", \"update\"]\n"
-            "RUN [\"/usr/bin/apt-get\", \"update\"]\n"
+            'subprocess.run(["apt-get", "update"], check=True)\'\n'
+            'RUN ["apt-get", "update"]\n'
+            'RUN ["/usr/bin/apt-get", "update"]\n'
         )
         rendered = render_build_dockerfile(
             source,
@@ -1226,25 +1235,19 @@ networks:
         )
 
         self.assertEqual(rendered.count("target=/run/opensandbox-apt/bin/apt,"), 0)
-        self.assertEqual(
-            rendered.count("target=/run/opensandbox-apt/bin/apt-get,"), 0
-        )
+        self.assertEqual(rendered.count("target=/run/opensandbox-apt/bin/apt-get,"), 0)
         self.assertEqual(
             rendered.count("export PATH=/run/opensandbox-apt/bin:$PATH;"), 0
         )
         self.assertIn('RUN ["apt-get", "update"]', rendered)
         self.assertIn('RUN ["/usr/bin/apt-get", "update"]', rendered)
-        self.assertNotIn("run-with-apt-path\", \"apt-get", rendered)
+        self.assertNotIn('run-with-apt-path", "apt-get', rendered)
         self.assertNotIn("target=/usr/bin/apt", rendered)
         self.assertNotIn("type=bind", rendered)
 
     def test_renderer_preserves_multiline_exec_run_for_frontend(self) -> None:
         rendered = render_build_dockerfile(
-            (
-                "FROM ubuntu:24.04\n"
-                'RUN ["apt-get", \\\n'
-                '     "update"]\n'
-            ),
+            ('FROM ubuntu:24.04\nRUN ["apt-get", \\\n     "update"]\n'),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
         )
 
@@ -1274,17 +1277,12 @@ networks:
             "--device=nvidia.com/gpu=all",
         ):
             self.assertLess(run_line.index(option), run_line.index("echo hello"))
-        self.assertIn(
-            "echo hello", run_line
-        )
+        self.assertIn("echo hello", run_line)
         self.assertNotIn("; --device=", run_line)
 
     def test_runtime_path_is_mechanical_not_apt_detection(self) -> None:
         rendered = render_build_dockerfile(
-            (
-                "FROM alpine:3.20\n"
-                "RUN echo no-package-manager-use\n"
-            ),
+            ("FROM alpine:3.20\nRUN echo no-package-manager-use\n"),
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
         )
 
@@ -1296,18 +1294,17 @@ networks:
     def test_runtime_wrapper_assets_are_standalone_and_use_current_rootfs_apt(
         self,
     ) -> None:
-        wrapper = (APT_RUNTIME_ASSET_DIR / "apt-wrapper.sh").read_text(
-            encoding="utf-8"
-        )
+        wrapper = (APT_RUNTIME_ASSET_DIR / "apt-wrapper.sh").read_text(encoding="utf-8")
 
         self.assertIn("real=/usr/bin/$command_name", wrapper)
         self.assertIn("Dir::Etc::SourceList=$source_view/sources.list", wrapper)
         self.assertIn("event=index-reconciliation-failed", wrapper)
         self.assertIn("indextargets --no-release-info", wrapper)
-        self.assertIn("event=source-bypass", (
-            APT_RUNTIME_ASSET_DIR / "source-rewriter.awk"
-        ).read_text(encoding="utf-8"))
-        self.assertIn('${APT_CONFIG:-}', wrapper)
+        self.assertIn(
+            "event=source-bypass",
+            (APT_RUNTIME_ASSET_DIR / "source-rewriter.awk").read_text(encoding="utf-8"),
+        )
+        self.assertIn("${APT_CONFIG:-}", wrapper)
         self.assertIn("*dir::etc=*", wrapper)
         self.assertNotIn("base-root", wrapper)
 
@@ -1324,16 +1321,12 @@ networks:
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
         )
 
-        self.assertIn(
-            "deb https://packages.example/repo stable main", rendered
-        )
+        self.assertIn("deb https://packages.example/repo stable main", rendered)
         self.assertIn(
             "RUN /usr/bin/apt-get --version",
             rendered,
         )
-        self.assertNotIn(
-            "deb http://gateway/apt/vendor stable main", rendered
-        )
+        self.assertNotIn("deb http://gateway/apt/vendor stable main", rendered)
 
     def test_render_does_not_guess_unconfigured_third_party_sources(self) -> None:
         rendered = render_build_dockerfile(
@@ -1407,9 +1400,7 @@ networks:
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
         )
 
-        task_heredoc = rendered[
-            rendered.index("cat <<'EOF'") : rendered.index("EOF\n")
-        ]
+        task_heredoc = rendered[rendered.index("cat <<'EOF'") : rendered.index("EOF\n")]
         self.assertIn("packages.example/repository", task_heredoc)
         self.assertNotIn("sources.internal/apt/vendor", task_heredoc)
 
@@ -1441,9 +1432,7 @@ networks:
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
         )
 
-        self.assertIn(
-            "deb https://packages.example/repository stable main", rendered
-        )
+        self.assertIn("deb https://packages.example/repository stable main", rendered)
         self.assertNotIn("sources.internal/apt/vendor", rendered)
 
     def test_render_does_not_rewrite_from_inside_dockerfile_heredocs(self) -> None:
@@ -1464,9 +1453,7 @@ networks:
             dockerhub_mirror_prefix="m.daocloud.io/docker.io",
         )
 
-        self.assertIn(
-            "FROM m.daocloud.io/docker.io/library/ubuntu:24.04", rendered
-        )
+        self.assertIn("FROM m.daocloud.io/docker.io/library/ubuntu:24.04", rendered)
         self.assertIn("from PIL import Image", rendered)
         self.assertIn("from pathlib import Path", rendered)
         self.assertIn("from flask import Flask", rendered)
@@ -1479,11 +1466,11 @@ networks:
             process.wait.return_value = 0
             with (
                 patch(
-                    "opensandbox_image_manager.subprocess.run",
+                    "task_image_manager.build_engine.executor.subprocess.run",
                     return_value=Mock(returncode=0),
                 ),
                 patch(
-                    "opensandbox_image_manager.subprocess.Popen",
+                    "task_image_manager.build_engine.executor.subprocess.Popen",
                     return_value=process,
                 ) as popen,
             ):
@@ -1495,13 +1482,22 @@ networks:
                     platform="linux/amd64",
                     timeout_sec=60,
                     build_args={},
-                    build_contexts={"local-frontend": "oci-layout:///cache/frontend@sha256:" + "0" * 64},
+                    build_contexts={
+                        "local-frontend": "oci-layout:///cache/frontend@sha256:"
+                        + "0" * 64
+                    },
                 )
 
         command = popen.call_args.args[0]
         self.assertIn("--provenance=false", command)
-        self.assertEqual(command[command.index("--build-context") + 1],
-                         "local-frontend=oci-layout:///cache/frontend@sha256:" + "0" * 64)
+        output = next(item for item in command if item.startswith("--output="))
+        self.assertIn("type=oci", output)
+        self.assertIn("compression=gzip", output)
+        self.assertIn("force-compression=true", output)
+        self.assertEqual(
+            command[command.index("--build-context") + 1],
+            "local-frontend=oci-layout:///cache/frontend@sha256:" + "0" * 64,
+        )
 
     def test_interrupted_build_terminates_detached_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1510,14 +1506,14 @@ networks:
             process.wait.side_effect = [KeyboardInterrupt, 0]
             with (
                 patch(
-                    "opensandbox_image_manager.subprocess.run",
+                    "task_image_manager.build_engine.executor.subprocess.run",
                     return_value=Mock(returncode=0),
                 ),
                 patch(
-                    "opensandbox_image_manager.subprocess.Popen",
+                    "task_image_manager.build_engine.executor.subprocess.Popen",
                     return_value=process,
                 ),
-                patch("opensandbox_image_manager.os.killpg") as killpg,
+                patch("task_image_manager.build_engine.executor.os.killpg") as killpg,
                 self.assertRaises(KeyboardInterrupt),
             ):
                 run_build(
@@ -1539,11 +1535,11 @@ networks:
             process.wait.return_value = 0
             with (
                 patch(
-                    "opensandbox_image_manager.subprocess.run",
+                    "task_image_manager.build_engine.executor.subprocess.run",
                     return_value=Mock(returncode=0),
                 ),
                 patch(
-                    "opensandbox_image_manager.subprocess.Popen",
+                    "task_image_manager.build_engine.executor.subprocess.Popen",
                     return_value=process,
                 ) as popen,
             ):
@@ -1567,11 +1563,11 @@ networks:
             process.wait.return_value = 0
             with (
                 patch(
-                    "opensandbox_image_manager.subprocess.run",
+                    "task_image_manager.build_engine.executor.subprocess.run",
                     return_value=Mock(returncode=0),
                 ),
                 patch(
-                    "opensandbox_image_manager.subprocess.Popen",
+                    "task_image_manager.build_engine.executor.subprocess.Popen",
                     return_value=process,
                 ) as popen,
             ):
@@ -1629,18 +1625,27 @@ networks:
             with tarfile.open(archive_path, "w") as archive:
                 add_tar_bytes(archive, "index.json", index)
                 for data in (source_manifest, config, layer):
-                    add_tar_bytes(archive, f"blobs/sha256/{sha256(data).split(':')[1]}", data)
+                    add_tar_bytes(
+                        archive, f"blobs/sha256/{sha256(data).split(':')[1]}", data
+                    )
             with tarfile.open(archive_path, "r") as archive:
                 manifest, descriptors = schema2_manifest(archive)
 
         self.assertEqual(manifest["mediaType"], DOCKER_MANIFEST)
         self.assertEqual(manifest["config"]["mediaType"], DOCKER_CONFIG)
         self.assertEqual(manifest["layers"][0]["mediaType"], DOCKER_LAYER_GZIP)
-        self.assertEqual([item["digest"] for item in descriptors], [sha256(config), sha256(layer)])
+        self.assertEqual(
+            [item["digest"] for item in descriptors], [sha256(config), sha256(layer)]
+        )
 
     def test_oci_archive_config_is_read_before_archive_is_discarded(self) -> None:
         config = json.dumps(
-            {"config": {"Cmd": ["/usr/sbin/sshd", "-D"], "ExposedPorts": {"22/tcp": {}}}}
+            {
+                "config": {
+                    "Cmd": ["/usr/sbin/sshd", "-D"],
+                    "ExposedPorts": {"22/tcp": {}},
+                }
+            }
         ).encode()
         source_manifest = json.dumps(
             {"schemaVersion": 2, "config": {"digest": sha256(config)}}
@@ -1652,11 +1657,19 @@ networks:
             archive_path = Path(tmp) / "image.tar"
             with tarfile.open(archive_path, "w") as archive:
                 add_tar_bytes(archive, "index.json", index)
-                add_tar_bytes(archive, f"blobs/sha256/{sha256(source_manifest).split(':')[1]}", source_manifest)
-                add_tar_bytes(archive, f"blobs/sha256/{sha256(config).split(':')[1]}", config)
+                add_tar_bytes(
+                    archive,
+                    f"blobs/sha256/{sha256(source_manifest).split(':')[1]}",
+                    source_manifest,
+                )
+                add_tar_bytes(
+                    archive, f"blobs/sha256/{sha256(config).split(':')[1]}", config
+                )
             image_config = oci_archive_image_config(archive_path)
         self.assertEqual(image_config["cmd"], ["/usr/sbin/sshd", "-D"])
-        self.assertEqual(image_config["exposed_ports"], [{"port": 22, "protocol": "tcp"}])
+        self.assertEqual(
+            image_config["exposed_ports"], [{"port": 22, "protocol": "tcp"}]
+        )
 
     def test_dry_run_returns_platform_image_ref_without_external_access(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1730,19 +1743,19 @@ networks:
             first_output = root / "first.json"
             with (
                 patch(
-                    "opensandbox_image_manager.registry_credentials",
+                    "task_image_manager.task_preparation.registry_credentials",
                     return_value=("user", "password"),
                 ),
                 patch(
-                    "opensandbox_image_manager.SkopeoPublisher",
+                    "task_image_manager.task_preparation.SkopeoPublisher",
                     return_value=publisher,
                 ),
                 patch(
-                    "opensandbox_image_manager.RegistryClient",
+                    "task_image_manager.task_preparation.RegistryClient",
                     return_value=registry,
                 ),
             ):
-                first = prepare_bundle(make_args(first_output))
+                first = prepare_task_images(make_args(first_output))
 
             self.assertTrue(first_output.is_file())
             self.assertEqual(registry.manifest.call_count, 1)
@@ -1752,15 +1765,15 @@ networks:
             verified_output = root / "verified.json"
             with (
                 patch(
-                    "opensandbox_image_manager.registry_credentials",
+                    "task_image_manager.task_preparation.registry_credentials",
                     side_effect=AssertionError("Registry access is not expected"),
                 ),
                 patch(
-                    "opensandbox_image_manager.environment_content_hash",
+                    "task_image_manager.task_image_identity.environment_content_hash",
                     wraps=environment_content_hash,
                 ) as content_hash,
             ):
-                verified = prepare_bundle(make_args(verified_output))
+                verified = prepare_task_images(make_args(verified_output))
 
             self.assertGreater(content_hash.call_count, 0)
             self.assertEqual(verified.main_image_ref, first.main_image_ref)
@@ -1774,27 +1787,25 @@ networks:
             )
             with (
                 patch(
-                    "opensandbox_image_manager.registry_credentials",
+                    "task_image_manager.task_preparation.registry_credentials",
                     side_effect=AssertionError("stale cache reached Registry fallback"),
                 ),
                 self.assertRaisesRegex(AssertionError, "Registry fallback"),
             ):
-                prepare_bundle(make_args(root / "stale.json"))
+                prepare_task_images(make_args(root / "stale.json"))
 
             skipped_output = root / "skipped.json"
             with (
                 patch(
-                    "opensandbox_image_manager.resolve_bundle_spec",
+                    "task_image_manager.task_preparation.resolve_bundle_spec",
                     side_effect=AssertionError("task content must not be resolved"),
                 ),
                 patch(
-                    "opensandbox_image_manager.registry_credentials",
+                    "task_image_manager.task_preparation.registry_credentials",
                     side_effect=AssertionError("Registry access is not expected"),
                 ),
             ):
-                skipped = prepare_bundle(
-                    make_args(skipped_output, skip_hash=True)
-                )
+                skipped = prepare_task_images(make_args(skipped_output, skip_hash=True))
 
             self.assertEqual(skipped.main_image_ref, first.main_image_ref)
             self.assertTrue(skipped_output.is_file())
@@ -1802,7 +1813,9 @@ networks:
     def test_registry_target_keeps_project_and_task_repository_separate(self) -> None:
         target = RegistryTarget("registry.example", "seta", "973")
         self.assertEqual(target.repository, "seta/973")
-        self.assertEqual(target.tag("worker", "sha256:" + "a" * 64), "worker-" + "a" * 20)
+        self.assertEqual(
+            target.tag("worker", "sha256:" + "a" * 64), "worker-" + "a" * 20
+        )
         self.assertEqual(
             target.digest_ref("sha256:" + "b" * 64),
             "registry.example/seta/973@sha256:" + "b" * 64,
@@ -1822,8 +1835,9 @@ networks:
 
     def test_task_repository_rejects_identity_that_requires_renaming(self) -> None:
         for identity in ("Owner__Repo-1", "owner/repo-1", "owner repo-1"):
-            with self.subTest(identity=identity), self.assertRaisesRegex(
-                ValueError, "fix the dataset adapter"
+            with (
+                self.subTest(identity=identity),
+                self.assertRaisesRegex(ValueError, "fix the dataset adapter"),
             ):
                 check_task_repository(identity)
 
@@ -1834,7 +1848,7 @@ networks:
         target = RegistryTarget("registry.example", "seta", "973")
         publisher = SkopeoPublisher(target, "user", "password", tls_verify=False)
         with patch(
-            "opensandbox_image_manager.subprocess.run",
+            "task_image_manager.registry.subprocess.run",
             return_value=Mock(returncode=0, stdout="", stderr=""),
         ) as run:
             publisher.login()
@@ -1843,10 +1857,10 @@ networks:
         self.assertIsNone(run.call_args.kwargs["stdin"])
         command = run.call_args.args[0]
         self.assertIn("--authfile", command)
-        self.assertEqual(command[command.index("--authfile") + 1], publisher._authfile)
-        self.assertTrue(Path(publisher._authfile).parent.is_dir())
+        authfile = Path(command[command.index("--authfile") + 1])
+        self.assertTrue(authfile.parent.is_dir())
         publisher.close()
-        self.assertFalse(Path(publisher._authfile).parent.exists())
+        self.assertFalse(authfile.parent.exists())
 
     def test_skopeo_inspect_treats_first_repository_lookup_as_cache_miss(self) -> None:
         publisher = SkopeoPublisher(
@@ -1856,11 +1870,10 @@ networks:
             tls_verify=False,
         )
         publisher.login = Mock()
-        publisher._run = Mock(
-            side_effect=RuntimeError("repository seta/973 not found")
-        )
         try:
-            self.assertIsNone(publisher.inspect("registry.example/seta/973:main-hash"))
+            with patch("task_image_manager.registry.subprocess.run",
+                       return_value=Mock(returncode=1, stdout="", stderr="repository seta/973 not found")):
+                self.assertIsNone(publisher.inspect("registry.example/seta/973:main-hash"))
         finally:
             publisher.close()
 

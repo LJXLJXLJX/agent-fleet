@@ -135,12 +135,12 @@ run_dry() {
     HARBOR_OPENSANDBOX_BUNDLE_MANIFEST="$bundle_manifest" \
     YICLOUD_HARBOR_HOST=harbor.example.internal \
     YICLOUD_HARBOR_PROJECT="${RUN_DRY_HARBOR_PROJECT-test-project}" \
-    HARBOR_OPENSANDBOX_IMAGE_MANAGER="$manager" \
+    HARBOR_TASK_IMAGE_CLI="$manager" \
     HARBOR_OPIK_BIN="$tmp/bin/fake-harbor" \
     HARBOR_CLI_BIN="$tmp/bin/fake-harbor" \
     HARBOR_RUNNER_PREPARE=0 \
     HARBOR_OPIK_PYTHON="$harbor_python" \
-    HARBOR_OPENSANDBOX_BUILD_ARGS_JSON="$build_args_json" \
+    HARBOR_TASK_IMAGE_BUILD_ARGS_JSON="$build_args_json" \
     PI_EXTENSION_SOURCE="$extension_source" \
     E2B_API_KEY=fake-e2b-key \
     YICLOUD_PUBLIC_KEY=fake-public \
@@ -151,7 +151,7 @@ run_dry() {
     bash "$HARBOR_DIR/harboropik.sh" 2>&1
 }
 
-automatic="$(run_dry '' "$HARBOR_DIR/opensandbox_image_manager.py" '{}')"
+automatic="$(run_dry '' "$HARBOR_DIR/task_image_manager/task_cli.py" '{}')"
 grep -F -- '--env yicloud_opensandbox:YiCloudOpenSandboxEnvironment' <<< "$automatic" >/dev/null
 grep -E -- '--ek image_ref=harbor\.example\.internal/test-project/0@sha256:[0-9a-f]{64}' \
   <<< "$automatic" >/dev/null
@@ -275,11 +275,11 @@ assert bundle["services"]["main"]["image"]["digest_ref"].startswith(
 
 concurrent_jobs_0="$tmp/jobs/concurrent/task-0"
 concurrent_jobs_1="$tmp/jobs/concurrent/task-1"
-run_dry '' "$HARBOR_DIR/opensandbox_image_manager.py" '{}' auto \
+run_dry '' "$HARBOR_DIR/task_image_manager/task_cli.py" '{}' auto \
   opensandbox 0 oracle 1 '' '' 0 "$concurrent_jobs_0" \
   > "$tmp/concurrent-0.out" &
 concurrent_pid_0="$!"
-run_dry '' "$HARBOR_DIR/opensandbox_image_manager.py" '{}' auto \
+run_dry '' "$HARBOR_DIR/task_image_manager/task_cli.py" '{}' auto \
   opensandbox 0 oracle 1 '' '' 1 "$concurrent_jobs_1" \
   > "$tmp/concurrent-1.out" &
 concurrent_pid_1="$!"
@@ -312,7 +312,7 @@ fi
 
 for force_build in 1 true; do
   forced="$(run_dry \
-    '' "$HARBOR_DIR/opensandbox_image_manager.py" '{}' auto opensandbox \
+    '' "$HARBOR_DIR/task_image_manager/task_cli.py" '{}' auto opensandbox \
     "$force_build")"
   grep -E -- \
     '--ek image_ref=harbor\.example\.internal/test-project/0@sha256:[0-9a-f]{64}' \
@@ -354,7 +354,7 @@ grep -F -- 'HARBOR_VERIFIER_RUNTIME_BUNDLE_ARCHIVE=/opt/agent-fleet/verifier-run
 grep -F -- 'HARBOR_VERIFIER_PYTHON=/tmp/harbor-verifier-bundles/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python' \
   <<< "$e2b_rebench" >/dev/null
 
-automatic_seta="$(run_dry '' "$HARBOR_DIR/opensandbox_image_manager.py" '{}' seta)"
+automatic_seta="$(run_dry '' "$HARBOR_DIR/task_image_manager/task_cli.py" '{}' seta)"
 grep -E -- '--ek image_ref=harbor\.example\.internal/test-project/0@sha256:[0-9a-f]{64}' \
   <<< "$automatic_seta" >/dev/null
 grep -F -- "--path $tmp/dataset" <<< "$automatic_seta" >/dev/null
@@ -365,7 +365,7 @@ fi
 
 manual="$(run_dry 'test-project/manual:immutable' "$tmp/does-not-exist.py")"
 grep -F -- '--ek image_ref=test-project/manual:immutable' <<< "$manual" >/dev/null
-if grep -F -- '[INFO] preparing OpenSandbox image' <<< "$manual" >/dev/null; then
+if grep -F -- '[INFO] preparing Harbor task image' <<< "$manual" >/dev/null; then
   echo 'manual image override unexpectedly invoked the image manager' >&2
   exit 1
 fi
@@ -394,34 +394,34 @@ grep -F -- '[INFO] using OpenSandbox Bundle Manifest:' \
 
 printf '[environment]\nbuild_timeout_sec = 60\ndocker_image = "harbor-sandbox.example/tasks:prebuilt"\n' \
   > "$tmp/dataset/0/task.toml"
-task_prebuilt="$(run_dry '' "$HARBOR_DIR/opensandbox_image_manager.py")"
+task_prebuilt="$(run_dry '' "$HARBOR_DIR/task_image_manager/task_cli.py")"
 grep -F -- '--ek image_ref=harbor-sandbox.example/tasks:prebuilt' \
   <<< "$task_prebuilt" >/dev/null
 task_prebuilt_without_project="$(
   RUN_DRY_HARBOR_PROJECT='' \
-    run_dry '' "$HARBOR_DIR/opensandbox_image_manager.py"
+    run_dry '' "$HARBOR_DIR/task_image_manager/task_cli.py"
 )"
 grep -F -- '--ek image_ref=harbor-sandbox.example/tasks:prebuilt' \
   <<< "$task_prebuilt_without_project" >/dev/null
-if grep -F -- '[INFO] preparing OpenSandbox image' <<< "$task_prebuilt" >/dev/null; then
+if grep -F -- '[INFO] preparing Harbor task image' <<< "$task_prebuilt" >/dev/null; then
   echo 'task prebuilt image unexpectedly invoked the image manager' >&2
   exit 1
 fi
 if grep -F -- 'import sys, tomllib' "$HARBOR_DIR/harboropik.sh" >/dev/null; then
-  echo 'OpenSandbox task image parser still requires Python 3.11 tomllib' >&2
+  echo 'Harbor task image parser still requires Python 3.11 tomllib' >&2
   exit 1
 fi
 printf '[environment]\ndocker_image = "unterminated\n' \
   > "$tmp/dataset/0/task.toml"
-if invalid_task_image="$(run_dry '' "$HARBOR_DIR/opensandbox_image_manager.py")"; then
+if invalid_task_image="$(run_dry '' "$HARBOR_DIR/task_image_manager/task_cli.py")"; then
   echo 'invalid task.toml unexpectedly produced an OpenSandbox command' >&2
   exit 1
 fi
-grep -F -- '[ERROR] failed to read OpenSandbox image from task.toml' \
+grep -F -- '[ERROR] failed to read Harbor task image from task.toml' \
   <<< "$invalid_task_image" >/dev/null
 printf '[environment]\ndocker_image = "invalid image"\n' \
   > "$tmp/dataset/0/task.toml"
-if whitespace_task_image="$(run_dry '' "$HARBOR_DIR/opensandbox_image_manager.py")"; then
+if whitespace_task_image="$(run_dry '' "$HARBOR_DIR/task_image_manager/task_cli.py")"; then
   echo 'whitespace task image unexpectedly produced an OpenSandbox command' >&2
   exit 1
 fi

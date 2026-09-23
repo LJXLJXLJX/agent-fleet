@@ -37,7 +37,7 @@ class NativeConcurrencyTest(unittest.TestCase):
                 "HARBOR_NATIVE_CONCURRENCY": "1", "HARBOR_N_CONCURRENT": "500",
                 "HARBOR_DRY_RUN": "1", "HARBOR_ENVIRONMENT_TYPE": "opensandbox",
                 "HARBOR_MONITOR_ENABLED": "0", "HARBOR_ANALYZER_ENABLED": "0",
-                "HARBOR_OPENSANDBOX_IMAGE_MANAGER": str(root / "must-not-run"),
+                "HARBOR_TASK_IMAGE_CLI": str(root / "must-not-run"),
                 "YICLOUD_PUBLIC_KEY": "test", "YICLOUD_SECRET_KEY": "test",
                 "YICLOUD_PROJECT_NAME": "test", "YICLOUD_HARBOR_HOST": "registry.test",
                 "YICLOUD_SANDBOX_ENVIRONMENT_ID": "test",
@@ -52,7 +52,7 @@ class NativeConcurrencyTest(unittest.TestCase):
             self.assertEqual(json.loads(config.read_text())["tasks"], [
                 {"path": str(root / "data" / name)} for name in ("two", "one")
             ])
-            self.assertNotIn("preparing OpenSandbox image", result.stdout)
+            self.assertNotIn("preparing Harbor task image", result.stdout)
             limited = subprocess.run(command, env=env | {"HARBOR_LIMIT": "1"}, text=True,
                                      capture_output=True, timeout=30, check=False)
             self.assertEqual(limited.returncode, 0, limited.stdout + limited.stderr)

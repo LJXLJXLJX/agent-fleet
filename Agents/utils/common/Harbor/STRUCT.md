@@ -40,13 +40,33 @@ Agents/utils/common/Harbor/
 ├── model-fusion/
 │   └── router_cli_utils.py     # Shared Router build/config/launcher helpers
 ├── compose_bundle.py            # Dockerfile/Compose to provider-neutral BundleSpec
-├── opensandbox_image_manager.py # Per-service image build/cache/publish and Bundle output
-├── opensandbox_apt_runtime/      # Build-only PATH wrappers and shadow-source rewriter
-│   ├── apt-wrapper.sh            # Runtime apt/apt-get adapter to current /usr/bin binary
-│   └── source-rewriter.awk       # Derive map-free Gateway routes for list and Deb822 URIs
-├── opensandbox_buildkit_frontend/ # Pinned upstream frontend, RUN lowering hook, OCI build and differential tests
-├── OPENSANDBOX_IMAGE_MANAGER.md # OpenSandbox Bundle and image management contract
-├── prebuild_opensandbox_dataset.sh # Batch prebuild/publish dataset Bundles
+├── task_image_manager/           # Image build, publish, cache, and Bundle manifest
+│   ├── task_cli.py              # Single-task arguments, output, and exit codes
+│   ├── dataset_cli.py           # Dataset scheduling, failure handling, GC, and summary
+│   ├── prebuild_dataset.sh      # Config/Python selection and dataset CLI exec
+│   ├── README.md                # Image preparation contract
+│   ├── build_engine/            # Build execution and Dockerfile rendering
+│   │   ├── image_build.py       # Complete image build and temporary artifact lifetime
+│   │   ├── executor.py          # Buildx OCI archive execution, timeout, and cleanup
+│   │   ├── base_images.py       # External FROM resolution and immutable contexts
+│   │   ├── arguments.py         # Build args and proxy settings
+│   │   ├── dockerfile_renderer/ # Dockerfile renderer and its concrete strategies
+│   │   │   └── strategies/      # APT, curl/wget, package, and Git strategies
+│   │   └── frontend/            # Pinned BuildKit frontend and RUN lowering hook
+│   ├── registry.py              # Skopeo copy/inspect and digest checks
+│   ├── image_build_state.py         # Local image records, build locks, and log paths
+│   ├── source_urls.py           # Shared build-source URL validation
+│   ├── build_sources.py         # Shared pre-build source selection policy
+│   ├── dependency_gateway.py    # Gateway source mapping and health probing
+│   ├── task_preparation.py      # Single-task preparation orchestration
+│   ├── service_images.py        # One service image: reuse, build, publish
+│   ├── task_image_identity.py   # Original task environment hashing
+│   ├── uploaded_bundle_cache.py # Uploaded Bundle validation and persistence
+│   ├── oci.py                   # OCI archive and image metadata operations
+│   └── task_bundle/             # Task image Bundle abstraction; no I/O
+│       ├── __init__.py          # Bundle types and assembly exports
+│       └── manifest.py          # Manifest data and runtime configuration derivation
+├── OPENSANDBOX_IMAGE_MANAGER.md # Index: image preparation, Compose input, and runtime handoff
 └── scripts/
     ├── monitor.py              # Monitor CLI entrypoint and path resolution
     ├── controller.py           # Submit benchmark decisions and user-controlled Fixer actions
@@ -266,14 +286,14 @@ configuration to `OPIK_URL`. An empty `OPIK_URL` still disables tracing.
 | `HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER` | Agent setup timeout multiplier |
 | `HARBOR_OPENSANDBOX_IMAGE_REF` | Legacy explicit single-image override; it must be fully qualified under `YICLOUD_HARBOR_HOST` |
 | `HARBOR_OPENSANDBOX_BUNDLE_MANIFEST` | Optional versioned service Bundle Manifest; every service image must be fully qualified under `YICLOUD_HARBOR_HOST` |
-| `HARBOR_OPENSANDBOX_BENCHMARK` | Benchmark identifier recorded in generated OpenSandbox Bundles and used for image/cache identity |
-| `HARBOR_VERIFIER_BENCHMARK` | Dataset identity used only to select a verifier runtime bundle; rollout workers set it per request without replacing the OpenSandbox image/cache identity |
-| `HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT` | H-local Registry records, image locks, build logs, and immutable Bundle cache root |
-| `HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE` | Dataset prebuild local uploaded-Bundle index switch; defaults to `1` and avoids Registry lookup after a content-hash match |
-| `HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION` | Trust a matching target/task entry in the local uploaded-Bundle index without parsing or hashing task content; defaults to `0` |
-| `HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL` | Optional prebuild-only cache root used by temporary BuildKit RUN-time wrappers for cacheable `curl`/`wget` HTTP(S) GETs; unseen URLs fill on demand, while requests whose behavior cannot be preserved bypass the cache |
-| `HARBOR_OPENSANDBOX_PUB_HOSTED_URL` | Optional provider-neutral Dart Pub source injected only while task images build; empty preserves the Dart default |
-| `HARBOR_OPENSANDBOX_JULIA_PKG_SERVER` | Optional provider-neutral Julia package server injected only while task images build; empty preserves the Julia default |
+| `HARBOR_TASK_IMAGE_BENCHMARK` | Benchmark identifier recorded in generated OpenSandbox Bundles and used for image/cache identity |
+| `HARBOR_VERIFIER_BENCHMARK` | Dataset identity used only to select a verifier runtime bundle; rollout workers set it per request without replacing the Harbor task image/cache identity |
+| `HARBOR_TASK_IMAGE_CACHE_ROOT` | H-local Registry records, image locks, build logs, and immutable Bundle cache root |
+| `HARBOR_TASK_IMAGE_PREBUILD_USE_LOCAL_UPLOAD_CACHE` | Dataset prebuild local uploaded-Bundle index switch; defaults to `1` and avoids Registry lookup after a content-hash match |
+| `HARBOR_TASK_IMAGE_PREBUILD_SKIP_HASH_VERIFICATION` | Trust a matching target/task entry in the local uploaded-Bundle index without parsing or hashing task content; defaults to `0` |
+| `HARBOR_TASK_IMAGE_DOWNLOAD_SOURCE_URL` | Optional prebuild-only cache root used by temporary BuildKit RUN-time wrappers for cacheable `curl`/`wget` HTTP(S) GETs; unseen URLs fill on demand, while requests whose behavior cannot be preserved bypass the cache |
+| `HARBOR_TASK_IMAGE_PUB_HOSTED_URL` | Optional provider-neutral Dart Pub source injected only while task images build; empty preserves the Dart default |
+| `HARBOR_TASK_IMAGE_JULIA_PKG_SERVER` | Optional provider-neutral Julia package server injected only while task images build; empty preserves the Julia default |
 | `YICLOUD_HARBOR_HOST` | Required Harbor registry host used for publication and every OpenSandbox image pull; set the real value in `config.local.env` or the environment |
 | `YICLOUD_HARBOR_PROJECT` | Externally provisioned Harbor Project for the selected benchmark; task repositories are derived per task |
 | `YICLOUD_HARBOR_TLS_VERIFY` | Whether `skopeo` verifies the configured Harbor TLS certificate; current internal ingress requires `0` |

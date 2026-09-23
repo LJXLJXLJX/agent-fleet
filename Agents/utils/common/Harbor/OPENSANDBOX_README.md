@@ -57,7 +57,7 @@ YICLOUD_SANDBOX_S3_PROFILE=provider-name
 
 After saving the OpenSandbox backend configuration, run setup once from the
 repository root. This prepares Go 1.25.4 for cold frontend builds from the
-configured `HARBOR_OPENSANDBOX_GOPROXY` or its domestic default:
+configured `HARBOR_TASK_IMAGE_GOPROXY` or its domestic default:
 
 ```bash
 ./scripts/setup.sh
@@ -138,33 +138,11 @@ The command prints the output and summary paths. For debugging, add
 `YICLOUD_SANDBOX_RETAIN_AFTER_TRIAL=1` and delete the retained instance after
 inspection.
 
-Image preparation first lists the task repository anonymously. If Harbor
-returns 401 or 403, it retries once using the existing registry credentials
-(`YICLOUD_HARBOR_USERNAME` / `YICLOUD_HARBOR_PASSWORD`, with the existing
-local registry configuration fallback). Subsequent image inspection uses the
-same credentials. Missing credentials or a failed authenticated query stop
-preparation; they do not trigger a rebuild. Public projects remain usable
-without credentials.
-
-## Task Image Hash Validation
-
-On-demand image preparation selects the task repository's most recently pushed
-tag and validates it against the local content hash by default. The selected
-tag must match `<service>-<first 20 hex characters of the local hash>`.
-A mismatch or a tag without that hash encoding stops preparation; it does not
-silently select an older image or rebuild. This checks the published hash
-prefix, not the full remote hash or image contents.
-
-To skip hashing for faster reuse, explicitly set
-`HARBOR_OPENSANDBOX_VALIDATE_IMAGE_HASH=0` when starting workers, or pass
-`--no-validate-image-hash` to the image manager. Only this opt-out path emits a
-warning that the local dataset task definition may be inconsistent with the
-remote image. `--validate-image-hash` re-enables validation and takes precedence
-over the environment setting.
-
-An empty repository still uses the existing hash-based build/push flow. This
-option does not change prebuild uploaded-Bundle cache verification or
-`--skip-hash-verification`.
+Image preparation lists the task repository, validates the selected tag
+against the local content hash, and publishes a digest reference. The contract
+is [image preparation](task_image_manager/task_bundle/README.md#identity-and-cache).
+`HARBOR_TASK_IMAGE_VALIDATE_HASH=0` or `--no-validate-image-hash` skips
+that tag check for on-demand runs.
 
 ## Optional: Prebuild Task Images
 
@@ -178,10 +156,10 @@ set +a
 # Required for Dockerfile RUN downloads from upstream release hosts.  Pin the
 # development machine's local proxy instead of allowing a shell helper to
 # fall back to a forwarded proxy; BuildKit defaults to host networking.
-export HARBOR_OPENSANDBOX_BUILD_PROXY_URL=http://127.0.0.1:7890
+export HARBOR_TASK_IMAGE_BUILD_PROXY_URL=http://127.0.0.1:7890
 
-HARBOR_OPENSANDBOX_PREBUILD_CONCURRENCY=4 \
-bash Agents/utils/common/Harbor/prebuild_opensandbox_dataset.sh \
+HARBOR_TASK_IMAGE_PREBUILD_CONCURRENCY=4 \
+bash Agents/utils/common/Harbor/task_image_manager/prebuild_dataset.sh \
   /absolute/path/to/Harbor-Dataset seta
 ```
 
@@ -190,122 +168,47 @@ Dockerfiles may use logical base names and resolve them only during image
 preparation:
 
 ```bash
-HARBOR_OPENSANDBOX_BASE_IMAGE_REGISTRY=harbor.example.internal/agent-fleet-task-base \
-bash Agents/utils/common/Harbor/prebuild_opensandbox_dataset.sh \
+HARBOR_TASK_IMAGE_BASE_IMAGE_REGISTRY=harbor.example.internal/agent-fleet-task-base \
+bash Agents/utils/common/Harbor/task_image_manager/prebuild_dataset.sh \
   /absolute/path/to/Harbor-Dataset benchmark-project
 ```
 
-The manager pins each resolved base manifest and passes it as a BuildKit named
-context. With the variable unset, unqualified `FROM` entries keep ordinary
-Docker Hub mirror resolution; with it set, an image that cannot be found under
-the prefix fails the build instead of falling back to the mirror.
-
-Every successful Registry resolution also updates a target-scoped local
-uploaded-Bundle index under `HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT`. On restart,
-prebuild recomputes each task's static environment hash and, when it still
-matches the local record, skips Registry login and manifest inspection. For a
-stable dataset, hashing can also be skipped:
+Base-image pinning, digest references, and the local uploaded-Bundle index are
+specified in
+[image preparation](task_image_manager/build_engine/README.md#build-time-inputs). For a
+stable dataset, the local index can skip content hashing:
 
 ```bash
-HARBOR_OPENSANDBOX_PREBUILD_SKIP_HASH_VERIFICATION=1 \
-bash Agents/utils/common/Harbor/prebuild_opensandbox_dataset.sh \
+HARBOR_TASK_IMAGE_PREBUILD_SKIP_HASH_VERIFICATION=1 \
+bash Agents/utils/common/Harbor/task_image_manager/prebuild_dataset.sh \
   /absolute/path/to/Harbor-Dataset seta
 ```
 
-Fast resume trusts that the recorded Registry artifacts still exist and that
-the task content has not changed. Leave the option at its default `0` to retain
-local hash validation. Set
-`HARBOR_OPENSANDBOX_PREBUILD_USE_LOCAL_UPLOAD_CACHE=0` to bypass the local
-index entirely and restore per-task Registry lookup. Fast resume also defers
-configured package-source health probes, so a batch made entirely of local
-hits performs no per-task network request. If a real miss later fails while
-building, the existing health check and trusted-source fallback still run.
+Leave skip-hash verification at its default `0` to keep local hash validation.
+`HARBOR_TASK_IMAGE_PREBUILD_USE_LOCAL_UPLOAD_CACHE=0` bypasses the local index.
 
-APT source routing is build-runtime scoped and uses the same provider-neutral
-Gateway root as direct downloads:
+APT, `curl`/`wget`, GitHub mirror, and package-index routing are build-time
+behavior of image preparation. Set one Gateway root when those routes should
+be used:
 
 ```bash
-export HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL="http://<TRUSTED_SOURCE>/cache"
+export HARBOR_TASK_IMAGE_DOWNLOAD_SOURCE_URL="http://<TRUSTED_SOURCE>/cache"
 ```
 
-Every credential-free HTTP(S) repository URI is encoded from its scheme,
-authority, and base path. APT can then append its normal `dists/...` and
-`pool/...` paths, which the Gateway decodes back into the original upstream
-URL. No local JSON map, repository registration, or named-source distribution
-is required. Object-level URLs such as signing keys and setup scripts use the
-same root through the `curl`/`wget` adapter. Without
-`HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL`, original APT, `curl`, and `wget`
-behavior is preserved.
-
-The [instrumentation frontend](opensandbox_buildkit_frontend/README.md) mounts
-an APT wrapper and prepends its directory to `PATH` for every Dockerfile `RUN`.
-The wrapper rewrites the current source files in a temporary view, invokes the
-rootfs `/usr/bin/apt*`, and reconciles downloaded indexes back to names derived
-from the original sources. Authored `/etc/apt` files, the persistent stage
-environment, and final image layers remain unchanged. Runtime asset identities
-invalidate affected BuildKit cache entries without changing task-image identity.
-
-Interception covers normal `apt` and `apt-get` lookup from shell, JSON exec,
-nested or downloaded scripts, and subprocesses inheriting `PATH`. Absolute
-paths, PATH replacement, `env -i`, libapt-based tools, and explicit custom APT
-layouts can bypass it. Sources with credentials or queries that cannot be
-represented safely remain direct and emit a credential-redacted bypass
-warning. See the linked frontend document and
-[image manager design](OPENSANDBOX_IMAGE_MANAGER.md#apt-build-runtime-interception)
-for the runtime contract and upgrade boundary.
-
-The manager builds and verifies the pinned frontend in a local OCI cache on
-first use. A cold cache needs Git, GNU timeout, and the setup-managed Go; a
-shared preparation failure stops further task dispatch for that batch.
-
-Direct shell- or exec-form `curl` and `wget` downloads use that same
-provider-neutral source root:
-
-```bash
-export HARBOR_OPENSANDBOX_DOWNLOAD_SOURCE_URL="http://<TRUSTED_SOURCE>/cache"
-```
-
-When enabled, the BuildKit frontend injects temporary `curl` and `wget` wrappers
-ahead of PATH in every RUN. Each explicit HTTP(S) URL is routed at command
-execution time using the source's versioned request convention:
-`<root>/download/v1/<scheme>/<hex-authority>/root` for an origin root, or
-`<root>/download/v1/<scheme>/<hex-authority>/object/<hex-path>` for an
-object. Components use lowercase hex so reverse proxies never need to preserve
-encoded slashes. The reversible selector keeps the real `/@root` object distinct from
-the origin root and does not truncate long authorities. The source remains an
-opaque cache service to Agent Fleet: the manager does not load its plan or
-maintain a per-object or per-origin map. Runtime interception also covers
-shell-expanded URLs and `curl`/`wget` inside dynamically produced scripts.
-Previously unseen HTTP(S) URLs are filled on demand without a Gateway source
-registration. Calls whose method, credentials, headers, proxy settings, indirect
-configuration, or output semantics cannot be preserved bypass the cache and run
-through the image's real tool unchanged. Calls using absolute executable paths
-or a reset PATH are also outside this PATH-based adapter.
-
-> **Prebuild-only:** the wrappers and dynamic download route are internal
-> OpenSandbox prebuild machinery. Do not invoke the Gateway route manually, put
-> it in task Dockerfiles, expose it publicly, or reuse it inside a running
-> Sandbox. The mounts and source URL do not persist in the resulting image.
-> Server-side prebuild authentication is planned separately from URL handling.
-
-The Gateway is a cache accelerator, not a URL security policy. It must not
-reject a new URL merely because analysis has not seen its origin or path.
-Validate a small batch of tasks before the first full prebuild run.
-
-Other package sources such as pip, npm, Go, Cargo, Rustup, Dart Pub, and Julia
-retain their Docker build-argument behavior and are not part of APT runtime
-interception.
-`HARBOR_OPENSANDBOX_PUB_HOSTED_URL` and
-`HARBOR_OPENSANDBOX_JULIA_PKG_SERVER` are optional provider-neutral URLs. When
-configured, the manager passes them to Dockerfile `RUN` instructions as
-`PUB_HOSTED_URL` and `JULIA_PKG_SERVER`; they may name a trusted third-party
-service or a cache gateway and are not persisted in the published image.
+The route format, bypass rules, and the prohibition on calling the Gateway
+from task Dockerfiles or ordinary Sandboxes are in
+[image preparation](task_image_manager/build_engine/README.md#apt-and-download-interception)
+and the [instrumentation frontend](task_image_manager/build_engine/frontend/README.md).
+A shared frontend preparation failure stops further task dispatch for that
+batch. Package indexes such as pip, npm, Go, Cargo, Rustup, Dart Pub, and
+Julia stay on their build-argument settings, documented with the other
+build-time inputs.
 
 Prebuild performs a bounded BuildKit cache prune before starting and every 30
 minutes while it runs. Defaults are `max-used-space=500GB`,
 `min-free-space=300GB`, and `reserved-space=100GB`; all four values are
-configurable through `HARBOR_OPENSANDBOX_PREBUILD_GC_*`. Set
-`HARBOR_OPENSANDBOX_PREBUILD_GC_INTERVAL_SEC=0` to disable only periodic GC;
+configurable through `HARBOR_TASK_IMAGE_PREBUILD_GC_*`. Set
+`HARBOR_TASK_IMAGE_PREBUILD_GC_INTERVAL_SEC=0` to disable only periodic GC;
 the initial prune still runs for every non-dry-run batch. It prunes only unused
 BuildKit cache and does not delete images, containers, volumes, or artifacts
 already published to the OCI Registry.
@@ -329,8 +232,8 @@ creation.
 - A model request failure means the instance started, but its configured model
   gateway is unreachable or rejected the request.
 
-See [task image management](OPENSANDBOX_IMAGE_MANAGER.md) for image naming,
-caching, and registry internals. See [Harbor benchmark framework structure](STRUCT.md) for the full
+See [image preparation](task_image_manager/README.md) for image naming,
+caching, and registry publication. See [Harbor benchmark framework structure](STRUCT.md) for the full
 configuration reference.
 
 ## Bounded artifact downloads

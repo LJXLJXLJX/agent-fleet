@@ -326,8 +326,8 @@ validate_environment_backend() {
           echo "[ERROR] YICLOUD_HARBOR_PROJECT is required when HARBOR_OPENSANDBOX_IMAGE_REF is unset" >&2
           exit 1
         fi
-        if [[ ! -f "$HARBOR_OPENSANDBOX_IMAGE_MANAGER" ]]; then
-          echo "[ERROR] OpenSandbox image manager not found: $HARBOR_OPENSANDBOX_IMAGE_MANAGER" >&2
+        if [[ ! -f "$HARBOR_TASK_IMAGE_CLI" ]]; then
+          echo "[ERROR] Harbor task image manager not found: $HARBOR_TASK_IMAGE_CLI" >&2
           exit 1
         fi
       fi
@@ -436,7 +436,7 @@ resolve_opensandbox_task_image_ref() {
   fi
   local task_image_ref
   if ! task_image_ref="$(opensandbox_task_image_ref)"; then
-    echo "[ERROR] failed to read OpenSandbox image from task.toml" >&2
+    echo "[ERROR] failed to read Harbor task image from task.toml" >&2
     return 1
   fi
   if [[ "$task_image_ref" =~ [[:space:]] ]]; then
@@ -519,15 +519,15 @@ print(ref)
   fi
   resolve_opensandbox_task_image_ref || return 1
   if [[ -n "$HARBOR_OPENSANDBOX_IMAGE_REF" ]]; then
-    echo "[INFO] using task prebuilt OpenSandbox image: $HARBOR_OPENSANDBOX_IMAGE_REF" >&2
+    echo "[INFO] using prebuilt Harbor task image for OpenSandbox: $HARBOR_OPENSANDBOX_IMAGE_REF" >&2
     return 0
   fi
   # DATASET_NAME can have a Harbor Registry alias (for example, seta ->
   # seta-env) while rollout workers still provide a real local DATASET_PATH.
-  # OpenSandbox image preparation needs the local task definition, so decide
+  # Harbor task image preparation needs the local task definition, so decide
   # from the path itself instead of the dataset's registry capability.
   if [[ -z "${DATASET_PATH:-}" || ! -d "$DATASET_PATH" ]]; then
-    echo "[ERROR] automatic OpenSandbox image preparation currently requires a local dataset path" >&2
+    echo "[ERROR] automatic Harbor task image preparation currently requires a local dataset path" >&2
     exit 1
   fi
 
@@ -536,20 +536,20 @@ print(ref)
     manager_python="$(command -v python3)"
   fi
   local -a manager_cmd=(
-    "$manager_python" "$HARBOR_OPENSANDBOX_IMAGE_MANAGER"
+    "$manager_python" "$HARBOR_TASK_IMAGE_CLI"
     --dataset-root "$DATASET_PATH"
     --include "$HARBOR_INCLUDE_TASKS"
     --registry "$YICLOUD_HARBOR_HOST"
     --project "$YICLOUD_HARBOR_PROJECT"
-    --benchmark-name "$HARBOR_OPENSANDBOX_BENCHMARK"
-    --docker-config "$HARBOR_OPENSANDBOX_DOCKER_CONFIG"
-    --cache-root "$HARBOR_OPENSANDBOX_IMAGE_CACHE_ROOT"
-    --platform "$HARBOR_OPENSANDBOX_IMAGE_PLATFORM"
-    --tag-prefix "$HARBOR_OPENSANDBOX_IMAGE_TAG_PREFIX"
-    --dockerhub-mirror-prefix "$HARBOR_OPENSANDBOX_DOCKERHUB_MIRROR_PREFIX"
-    --base-image-registry "$HARBOR_OPENSANDBOX_BASE_IMAGE_REGISTRY"
-    --build-args-json "$HARBOR_OPENSANDBOX_BUILD_ARGS_JSON"
-    --build-network "$HARBOR_OPENSANDBOX_BUILD_NETWORK"
+    --benchmark-name "$HARBOR_TASK_IMAGE_BENCHMARK"
+    --docker-config "$HARBOR_TASK_IMAGE_DOCKER_CONFIG"
+    --cache-root "$HARBOR_TASK_IMAGE_CACHE_ROOT"
+    --platform "$HARBOR_TASK_IMAGE_PLATFORM"
+    --tag-prefix "$HARBOR_TASK_IMAGE_TAG_PREFIX"
+    --dockerhub-mirror-prefix "$HARBOR_TASK_IMAGE_DOCKERHUB_MIRROR_PREFIX"
+    --base-image-registry "$HARBOR_TASK_IMAGE_BASE_IMAGE_REGISTRY"
+    --build-args-json "$HARBOR_TASK_IMAGE_BUILD_ARGS_JSON"
+    --build-network "$HARBOR_TASK_IMAGE_BUILD_NETWORK"
     --bundle-manifest-output "$automatic_bundle_manifest"
   )
   if [[ "$YICLOUD_HARBOR_TLS_VERIFY" == "1" ]]; then
@@ -558,7 +558,7 @@ print(ref)
   if [[ "${HARBOR_FORCE_BUILD:-0}" == "1" || "${HARBOR_FORCE_BUILD:-0}" == "true" ]]; then
     manager_cmd+=( --force )
   fi
-  if [[ "$HARBOR_OPENSANDBOX_BUILD_USE_PROXY" == "1" ]]; then
+  if [[ "$HARBOR_TASK_IMAGE_BUILD_USE_PROXY" == "1" ]]; then
     manager_cmd+=( --use-proxy )
   fi
   if [[ "$HARBOR_DRY_RUN" == "1" ]]; then
@@ -567,22 +567,22 @@ print(ref)
     ensure_docker_daemon
   fi
 
-  echo "[INFO] preparing OpenSandbox image for task: $HARBOR_INCLUDE_TASKS" >&2
+  echo "[INFO] preparing Harbor task image for task: $HARBOR_INCLUDE_TASKS" >&2
   if ! HARBOR_OPENSANDBOX_IMAGE_REF="$("${manager_cmd[@]}")"; then
-    echo "[ERROR] OpenSandbox image preparation failed" >&2
+    echo "[ERROR] Harbor task image preparation failed" >&2
     exit 1
   fi
   if [[ -z "$HARBOR_OPENSANDBOX_IMAGE_REF" ]]; then
-    echo "[ERROR] OpenSandbox image manager returned an empty image reference" >&2
+    echo "[ERROR] Harbor task image manager returned an empty image reference" >&2
     exit 1
   fi
   HARBOR_OPENSANDBOX_BUNDLE_MANIFEST="$automatic_bundle_manifest"
   if [[ ! -f "$HARBOR_OPENSANDBOX_BUNDLE_MANIFEST" ]]; then
-    echo "[ERROR] OpenSandbox image manager did not write Bundle Manifest: $HARBOR_OPENSANDBOX_BUNDLE_MANIFEST" >&2
+    echo "[ERROR] Harbor task image manager did not write Bundle Manifest: $HARBOR_OPENSANDBOX_BUNDLE_MANIFEST" >&2
     exit 1
   fi
   export HARBOR_OPENSANDBOX_IMAGE_REF HARBOR_OPENSANDBOX_BUNDLE_MANIFEST
-  echo "[INFO] OpenSandbox image ready: $HARBOR_OPENSANDBOX_IMAGE_REF" >&2
+  echo "[INFO] Harbor task image ready: $HARBOR_OPENSANDBOX_IMAGE_REF" >&2
   echo "[INFO] OpenSandbox Bundle Manifest ready: $HARBOR_OPENSANDBOX_BUNDLE_MANIFEST" >&2
 }
 
