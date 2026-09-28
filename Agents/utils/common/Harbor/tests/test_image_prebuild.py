@@ -60,6 +60,30 @@ class DatasetPrebuildTest(unittest.TestCase):
         self.assertEqual([p.name for p in tasks], ["first", "second"])
         self.assertEqual(skipped, ["third\tmissing-task.toml"])
 
+    def test_task_list_selects_only_requested_tasks(self):
+        task_list = self.root / "selected.txt"
+        task_list.write_text("third\nfirst\n")
+        status = batch.run(self.args("--task-list", str(task_list)))
+        self.assertEqual(status, 0)
+        run_dir = next((self.root / "runs").iterdir())
+        self.assertEqual((run_dir / "supported.txt").read_text(), "first\nthird\n")
+        self.assertEqual(sorted(path.name for path in (run_dir / "bundles").iterdir()),
+                         ["first.json", "third.json"])
+        self.assertEqual(json.loads((run_dir / "summary.json").read_text())["total"], 2)
+
+    def test_task_list_rejects_invalid_selection_before_dispatch(self):
+        task_list = self.root / "selected.txt"
+        (self.dataset / "third" / "task.toml").unlink()
+        for names in ("", "first\nfirst\n", "missing\n", "third\n", "first\n\n"):
+            with self.subTest(names=names):
+                task_list.write_text(names)
+                with (
+                    patch.object(batch, "prepare_task_images") as prepare,
+                    self.assertRaises(ValueError),
+                ):
+                    batch.run(self.args("--task-list", str(task_list)))
+                prepare.assert_not_called()
+
     def test_shared_failure_stops_new_dispatch(self):
         with patch.object(
             batch, "prepare_task_images", side_effect=FrontendBuildError("unavailable")

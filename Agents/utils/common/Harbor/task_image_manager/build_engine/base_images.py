@@ -89,6 +89,7 @@ def dockerfile_external_base_images(
     source: str,
     *,
     include_docker_io: bool = False,
+    include_registry_qualified: bool = False,
 ) -> tuple[str, ...]:
     """Return external FROM references without inspecting heredoc payloads."""
     images: list[str] = []
@@ -113,8 +114,10 @@ def dockerfile_external_base_images(
         match = FROM_LINE.match(source_line)
         if match:
             image = match.group("image")
-            resolvable = _is_unqualified_image_ref(image) or (
-                include_docker_io and _is_docker_io_image_ref(image)
+            resolvable = (
+                _is_unqualified_image_ref(image)
+                or (include_docker_io and _is_docker_io_image_ref(image))
+                or (include_registry_qualified and "/" in image)
             )
             if (
                 image not in aliases
@@ -160,7 +163,9 @@ def resolve_base_image_contexts(
         return {}, {}
     replacements: dict[str, str] = {}
     contexts: dict[str, str] = {}
-    for image in dockerfile_external_base_images(source, include_docker_io=True):
+    for image in dockerfile_external_base_images(
+        source, include_registry_qualified=True
+    ):
         source_ref = base_image_lookup_ref(image, registry)
         resolved_ref, digest = inspect_external_image(
             source_ref,

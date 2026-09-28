@@ -705,13 +705,14 @@ networks:
                     expected,
                 )
 
-    def test_docker_io_qualified_from_enters_resolution_channel(self) -> None:
+    def test_registry_qualified_from_enters_resolution_channel(self) -> None:
         source = (
             "FROM ubuntu:22.04\n"
             "FROM docker.io/library/ubuntu:22.04\n"
             "FROM docker.io/rocker/r-ver:4.4.1\n"
             "FROM rocker/r-ver:4.4.1 AS rstage\n"
             "FROM mcr.microsoft.com/dotnet/sdk:8.0\n"
+            "FROM ghcr.io/laude-institute/t-bench/ubuntu-24-04:20250624\n"
             "FROM scratch\n"
             "FROM $BASE_IMAGE\n"
             "FROM rstage\n"
@@ -728,6 +729,18 @@ networks:
                 "docker.io/library/ubuntu:22.04",
                 "docker.io/rocker/r-ver:4.4.1",
                 "rocker/r-ver:4.4.1",
+            ),
+        )
+
+        self.assertEqual(
+            dockerfile_external_base_images(source, include_registry_qualified=True),
+            (
+                "ubuntu:22.04",
+                "docker.io/library/ubuntu:22.04",
+                "docker.io/rocker/r-ver:4.4.1",
+                "rocker/r-ver:4.4.1",
+                "mcr.microsoft.com/dotnet/sdk:8.0",
+                "ghcr.io/laude-institute/t-bench/ubuntu-24-04:20250624",
             ),
         )
 
@@ -754,6 +767,8 @@ networks:
                 "registry.example/base/ubuntu:22.04",
                 "registry.example/base/rocker/r-ver:4.4.1",
                 "registry.example/base/rocker/r-ver:4.4.1",
+                "registry.example/base/mcr.microsoft.com/dotnet/sdk:8.0",
+                "registry.example/base/ghcr.io/laude-institute/t-bench/ubuntu-24-04:20250624",
             ],
         )
         self.assertEqual(
@@ -761,6 +776,8 @@ networks:
             [
                 "docker.io/library/ubuntu:22.04",
                 "docker.io/rocker/r-ver:4.4.1",
+                "ghcr.io/laude-institute/t-bench/ubuntu-24-04:20250624",
+                "mcr.microsoft.com/dotnet/sdk:8.0",
                 "rocker/r-ver:4.4.1",
                 "ubuntu:22.04",
             ],
@@ -769,7 +786,7 @@ networks:
             replacements["ubuntu:22.04"],
             replacements["docker.io/library/ubuntu:22.04"],
         )
-        self.assertEqual(len(contexts), 4)
+        self.assertEqual(len(contexts), 6)
         for context_ref in contexts.values():
             self.assertTrue(context_ref.startswith("docker-image://"))
             self.assertIn("@sha256:" + "b" * 64, context_ref)
@@ -784,7 +801,14 @@ networks:
         self.assertIn(
             f"FROM {replacements['docker.io/library/ubuntu:22.04']}\n", rendered
         )
-        self.assertIn("FROM mcr.microsoft.com/dotnet/sdk:8.0\n", rendered)
+        self.assertIn(
+            f"FROM {replacements['mcr.microsoft.com/dotnet/sdk:8.0']}\n", rendered
+        )
+        self.assertIn(
+            f"FROM {replacements['ghcr.io/laude-institute/t-bench/ubuntu-24-04:20250624']}\n",
+            rendered,
+        )
+        self.assertNotIn("FROM ghcr.io/", rendered)
         self.assertIn("FROM m.daocloud.io/docker.io/library/scratch\n", rendered)
         self.assertIn("FROM $BASE_IMAGE\n", rendered)
         self.assertIn("FROM rstage\n", rendered)

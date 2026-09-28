@@ -119,9 +119,10 @@ image environment, or global `.gitconfig`.
 
 `HARBOR_TASK_IMAGE_BASE_IMAGE_REGISTRY` is one OCI registry/repository prefix
 for logical unqualified names such as `FROM go_1.19.13`, and for
-`docker.io`-qualified `FROM` lines. The host and a leading `library/` segment
-are removed before lookup. Preparation pins the current manifest digest and
-passes it as a BuildKit named context. The Dockerfile and its
+registry-qualified `FROM` lines. Non-Docker Hub registry hosts (for example,
+`ghcr.io`) remain in the lookup path; the Docker Hub host and a leading
+`library/` segment are removed. Preparation pins the current manifest digest
+and passes it as a BuildKit named context. The Dockerfile and its
 environment-content identity stay registry-neutral. When the variable is
 empty, unqualified public images continue through the configured Docker Hub
 mirror. When it is set, a missing image fails the build. There is no mirror

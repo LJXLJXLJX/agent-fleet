@@ -87,7 +87,7 @@ def build_image(
         )
         if base_image_contexts:
             log(
-                "resolved logical base images through configured registry "
+                "resolved base images through configured registry "
                 f"count={len(base_image_contexts)}"
             )
         github_mirror_config = github_mirror_config_content(github_mirror_url)

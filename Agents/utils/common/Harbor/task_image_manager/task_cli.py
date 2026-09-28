@@ -285,7 +285,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("HARBOR_TASK_IMAGE_BASE_IMAGE_REGISTRY", ""),
         help=(
             "optional OCI registry/repository prefix that resolves logical "
-            "unqualified or docker.io-qualified FROM names as immutable "
+            "unqualified or registry-qualified FROM names as immutable "
             "BuildKit named contexts; empty keeps mirror-based resolution"
         ),
     )

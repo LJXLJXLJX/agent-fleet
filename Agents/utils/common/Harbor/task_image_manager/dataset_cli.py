@@ -57,6 +57,10 @@ def parse_args(argv=None):
     parser.add_argument("dataset_root", type=Path)
     parser.add_argument("benchmark")
     parser.add_argument(
+        "--task-list", type=Path,
+        help="newline-separated task names to prepare instead of the full dataset",
+    )
+    parser.add_argument(
         "--concurrency", type=positive, default=setting("PREBUILD_CONCURRENCY", "1")
     )
     parser.add_argument(
@@ -161,6 +165,22 @@ def discover_tasks(root: Path):
         else:
             tasks.append(task)
     return tasks, skipped
+
+
+def select_tasks(tasks, skipped, task_list: Path | None):
+    if task_list is None:
+        return tasks, skipped
+    names = task_list.read_text(encoding="utf-8").splitlines()
+    if not names or any(not name or name != name.strip() for name in names):
+        raise ValueError("task list must contain nonempty task names, one per line")
+    if len(names) != len(set(names)):
+        raise ValueError("task list contains duplicate task names")
+    selected = set(names)
+    available = {task.name for task in tasks}
+    unavailable = sorted(selected - available)
+    if unavailable:
+        raise ValueError(f"task list contains unknown or unsupported tasks: {', '.join(unavailable)}")
+    return [task for task in tasks if task.name in selected], []
 
 
 @dataclass(frozen=True)
@@ -285,7 +305,7 @@ def run(args) -> int:
             stderr=subprocess.DEVNULL,
             timeout=30,
         )
-    tasks, skipped = discover_tasks(args.dataset_root)
+    tasks, skipped = select_tasks(*discover_tasks(args.dataset_root), args.task_list)
     args.prebuild_root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = Path(

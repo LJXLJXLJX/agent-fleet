@@ -147,6 +147,12 @@ python /path/to/Harbor/task_image_manager/dataset_cli.py \
   --prebuild-root /path/to/prebuild-runs --concurrency 1 --build-timeout-sec 7200
 ```
 
+To prepare only named tasks, put one exact task directory name per line in a
+UTF-8 file and pass `--task-list /path/to/tasks.txt` to the dataset CLI or shell
+wrapper. Duplicate, empty, unknown, and unsupported names fail before dispatch.
+The run summary and Bundle directory cover only the selected tasks. Omitting
+`--task-list` retains full-dataset discovery and its existing skipped-task report.
+
 Use `--dry-run` to generate manifests without Registry, Buildx, health probes,
 or cache pruning. Shared image options such as `--platform`, `--cache-root`,
 `--download-source-url`, and `--no-use-proxy` use the task CLI parser. Task
