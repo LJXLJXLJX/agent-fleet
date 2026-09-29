@@ -22,6 +22,14 @@ from .oci import DOCKER_MANIFEST, normalize_oci_image_config
 
 SKOPEO_COPY_ATTEMPTS = 3
 SKOPEO_COPY_RETRY_DELAY_SECONDS = 3
+# Per-invocation skopeo timeout. A single layer upload can legitimately take a
+# long time on a busy registry: `copy` is retried up to SKOPEO_COPY_ATTEMPTS
+# times, so the default caps one task at roughly 3 x 30 min before it fails and
+# releases its concurrency slot. Bulk prebuilds over a shared registry can raise
+# this to let slow-but-progressing uploads finish instead of being retried.
+SKOPEO_COMMAND_TIMEOUT_SECONDS = float(
+    os.environ.get("HARBOR_TASK_IMAGE_SKOPEO_TIMEOUT_SEC", "1800")
+)
 
 
 def log(message: str) -> None:
@@ -159,16 +167,24 @@ class SkopeoPublisher:
         return environment
 
     def _run(self, command: list[str], *, input_text: str | None = None) -> str:
-        completed = subprocess.run(
-            command,
-            input=input_text,
-            text=True,
-            stdin=subprocess.DEVNULL if input_text is None else None,
-            capture_output=True,
-            env=self._environment(),
-            check=False,
-            timeout=1800,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                input=input_text,
+                text=True,
+                stdin=subprocess.DEVNULL if input_text is None else None,
+                capture_output=True,
+                env=self._environment(),
+                check=False,
+                timeout=SKOPEO_COMMAND_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # Normalize to RuntimeError: the copy retry loop catches RuntimeError,
+            # so a timeout must not escape it as an unhandled SubprocessError.
+            raise RuntimeError(
+                f"skopeo command timed out after {SKOPEO_COMMAND_TIMEOUT_SECONDS:.0f}s: "
+                f"{' '.join(command)}"
+            ) from exc
         if completed.returncode:
             error = completed.stderr.strip()[-1000:]
             raise RuntimeError(
