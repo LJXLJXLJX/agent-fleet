@@ -9,22 +9,26 @@ set -euo pipefail
 # provider adapter without patching the PyPI Harbor package. qz (SII Inspire)
 # exposes an E2B-compatible control plane, so its adapter reuses Harbor's E2B
 # environment with qz connection settings mapped onto the official e2b SDK.
-HARBOR_ENVIRONMENT_TYPE="${HARBOR_ENVIRONMENT_TYPE:-$RL_ENVIRONMENT_TYPE}"
+harbor_resolve_backend_plan() {
+  local assignments
+  assignments="$(
+    HARBOR_ENVIRONMENT_TYPE="${HARBOR_ENVIRONMENT_TYPE:-}" \
+    HARBOR_ENVIRONMENT_SPEC="${HARBOR_ENVIRONMENT_SPEC:-}" \
+    RL_ENVIRONMENT_TYPE="${RL_ENVIRONMENT_TYPE:-docker}" \
+    HARBOR_E2B_PREBUILT_TEMPLATE="${HARBOR_E2B_PREBUILT_TEMPLATE:-}" \
+    HARBOR_E2B_PREBUILT_ENVIRONMENT_SPEC="${HARBOR_E2B_PREBUILT_ENVIRONMENT_SPEC:-}" \
+    HARBOR_BACKEND_PLAN="${HARBOR_BACKEND_PLAN:-}" \
+      python3 -S "$SCRIPT_DIR/backend_plan.py" "$@"
+  )" || return 1
+  # The helper emits fixed variable names and shlex-quoted values only.
+  eval "$assignments"
+}
+
+harbor_resolve_backend_plan || return 1
 if [[ "$HARBOR_CC_WEB_MCP_ENABLED" == "1" \
   && ( "$HARBOR_ENVIRONMENT_TYPE" == "e2b" || "$HARBOR_ENVIRONMENT_TYPE" == "qz" ) ]]; then
   echo "[ERROR] Web MCP is not supported on $HARBOR_ENVIRONMENT_TYPE: artifact delivery requires docker or opensandbox." >&2
   return 1
-fi
-if [[ -z "${HARBOR_ENVIRONMENT_SPEC:-}" ]]; then
-  if [[ "$HARBOR_ENVIRONMENT_TYPE" == "opensandbox" ]]; then
-    HARBOR_ENVIRONMENT_SPEC="yicloud_opensandbox:YiCloudOpenSandboxEnvironment"
-  elif [[ "$HARBOR_ENVIRONMENT_TYPE" == "e2b" && -n "$HARBOR_E2B_PREBUILT_TEMPLATE" ]]; then
-    HARBOR_ENVIRONMENT_SPEC="$HARBOR_E2B_PREBUILT_ENVIRONMENT_SPEC"
-  elif [[ "$HARBOR_ENVIRONMENT_TYPE" == "qz" ]]; then
-    HARBOR_ENVIRONMENT_SPEC="qz_e2b_sandbox:QzSandboxEnvironment"
-  else
-    HARBOR_ENVIRONMENT_SPEC="$HARBOR_ENVIRONMENT_TYPE"
-  fi
 fi
 # qz does not provide Notebook-host bind mounts. Install the agent runtime
 # inside the Sandbox instead of coupling setup to a runner-local dependency

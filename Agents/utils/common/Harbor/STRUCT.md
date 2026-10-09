@@ -4,6 +4,19 @@ This directory contains shared Harbor orchestration code. It does not own task l
 RL rollout implementation lives in `Agents/utils/rl`; this directory only
 keeps the shared entry point and Harbor runner wrappers.
 
+## Backend selection
+
+`harbor_environment_adapters/core/config.py` owns BackendPlan selection.
+`backend_plan.py` projects the plan into legacy environment variables for fixed,
+registry, rollout, and preflight consumers. Python startup hooks read the same
+serialized plan. See [adapter handoff](harbor_environment_adapters/README.md).
+
+`harbor_environment_adapters/providers/opensandbox_yicloud/` owns the YiCloud
+runtime, split into adapter, configuration, client, lifecycle, services,
+execution, and transfer. `providers/e2b_series/qz_legacy/adapter.py` preserves the qz
+implementation. `yicloud_opensandbox.py` and `qz_e2b_sandbox.py` retain their
+Harbor import paths as compatibility modules.
+
 ## Files
 
 ```text

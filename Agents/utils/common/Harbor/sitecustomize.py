@@ -2,7 +2,9 @@
 
 import os
 
-environment_type = os.environ.get("HARBOR_ENVIRONMENT_TYPE", "docker").strip().lower()
+from harbor_environment_adapters.core.config import runtime_backend_plan
+
+environment_type = runtime_backend_plan(os.environ).environment_type.strip().lower()
 
 if environment_type in {"e2b", "qz"}:
     from e2b_runtime import patch_e2b_runtime_from_env
