@@ -49,20 +49,23 @@ printf 'FROM alpine:3.20\n' > "$tmp/dataset/1/environment/Dockerfile"
 printf 'fake package\n' > "$tmp/deps/claude.tgz"
 printf 'fake wheel\n' > "$tmp/deps/wheels/dependency.whl"
 printf '# fake Claude Opik hook\n' > "$tmp/deps/claude_realtime_trace.py"
-mkdir -p "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin"
-printf 'target-system-libraries\n' \
-  > "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/.harbor-python-runtime-v2"
-printf '#!/bin/sh\nexit 0\n' \
-  > "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python3.12"
-printf '#!/bin/sh\nexit 0\n' \
-  > "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/harbor-verifier-bundle-check"
-chmod +x \
-  "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python3.12" \
-  "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/harbor-verifier-bundle-check"
-ln -s python3.12 "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python3"
-ln -s python3.12 "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python"
-tar -czf "$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" \
-  -C "$tmp/verifier-bundle" agent-fleet-swe-rebench-v2-verifier-bundle
+# Reuse the current static runtime fixture; the old marker-only archive is invalid.
+PYTHONPATH="$(cd "$HARBOR_DIR/../../../.." && pwd)" "$MANAGER_PYTHON" - \
+  "$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" <<'PYTHON'
+from pathlib import Path
+import sys
+from Agents.utils.common.Harbor.tests.test_swe_rebench_v2_bundle_preparer import (
+    SweRebenchV2BundlePreparerTest,
+    swe_rebench_v2_bundle_preparer,
+)
+
+fixture = SweRebenchV2BundlePreparerTest()
+fixture.setUp()
+try:
+    swe_rebench_v2_bundle_preparer.build(fixture.python_runtime, Path(sys.argv[1]))
+finally:
+    fixture.tearDown()
+PYTHON
 bundled_web_mcp="$(python3 "$HARBOR_DIR/../mcp/build.py" "$tmp/deps/wheels")"
 printf 'fake python runtime\n' > "$tmp/deps/wheels/dsh-sdk-minimal-python3.12-runtime.tar.gz"
 printf 'fake sdk minimal runtime\n' > "$tmp/deps/wheels/dsh-sdk-minimal-runtime-dsh-v0.1.3-alpha.1.tar.gz"
@@ -94,6 +97,7 @@ run_dry() {
   env -i \
     PATH="$tmp/bin:/usr/bin:/bin" \
     HOME="$tmp/home" \
+    AGENT_FLEET_CONFIG_LOADED_ROOT="$(cd "$HARBOR_DIR/../../../.." && pwd)" \
     AGENT_FLEET_CACHE_DIR="$tmp/cache" \
     AGENT="$agent" \
     DATASET_NAME="$dataset_name" \
@@ -340,9 +344,9 @@ grep -F -- "$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bun
 docker_rebench_opencode="$(run_dry \
   '' "$tmp/does-not-exist.py" '{}' agent-fleet-swe-rebench-v2 docker 0 \
   opencode)"
-grep -F -- "\"source\":\"$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz\"" \
+grep -F -- "\"source\": \"$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz\"" \
   <<< "$docker_rebench_opencode" >/dev/null
-grep -F -- '"target":"/opt/agent-fleet/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz"' \
+grep -F -- '"target": "/opt/agent-fleet/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz"' \
   <<< "$docker_rebench_opencode" >/dev/null
 
 e2b_rebench="$(run_dry \

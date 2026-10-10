@@ -1,10 +1,10 @@
 # Harbor Environment Adapters 重构设计（WIP）
 
-状态：已暂停并归档。2026-10-09，用户转向其他高优先级工作；阶段 4 + 5 的本地实现和验证快照保留，尚未完成重构验收，未创建 PR。
+状态：2026-10-10 已恢复。main 更新至 upstream `2c3420b`，在 `refactor/harbor-environment-adapters-resume` 收尾阶段 4 + 5；阶段 6 留到下一份 PR。归档分支保留，尚未创建远端 PR。
 
-更新时间：2026-10-09（Asia/Singapore）
+更新时间：2026-10-10（Asia/Singapore）
 
-验证范围：阶段 1–3 已完成（用户确认，阶段 3 的现有 smoke 勾选保留）；本轮推进阶段 4 的 BackendPlan 接入和阶段 5 的运行时 provider 拆分，仅执行 YiCloud 开发机上的本地回归和静态检查，不重跑镜像发布或真实 Sandbox。公共 OpenSandbox SDK 的问题依据用户此前验证结论，本轮未重新实测。
+验证范围：阶段 1–3 已完成（用户确认，阶段 3 的现有 smoke 勾选保留）。2026-10-10 在 YiCloud Linux 开发机完成新基线上的 344 项 Python 测试、6 个 Shell 回归和静态检查。经用户批准的一次真实验收在创建 Sandbox 前被 Opik HTTP 502 阻断；当前模型配置为占位值，真实 provider/Agent/verifier/清理仍待验证。公共 OpenSandbox SDK 的问题依据用户此前验证结论，本轮未重新实测。
 
 当前封存参考：原阶段 1 及其后续 WIP 快照已封存在 `agent-fleet` 分支
 `archive/harbor-environment-adapters-phase1`，孤儿提交 `bccdfcba32ba93590b3cb058c05369dc0b1c6d42`（无父提交）。该提交保留
@@ -19,9 +19,9 @@ BackendPlan、adapter core 契约、image preparation 拆分、兼容 facade、�
 本轮原工作分支为 `refactor/harbor-backend-plan`，从 `upstream/main`
 `84f782a` 创建，现封存为本地分支 `archive/harbor-environment-adapters-phase4-5`。
 归档分支同时保存代码和本文、`PR_HARBOR_BACKEND_PLAN.md` 的副本，路径为仓库内 `wip/`。
-未推送远端；当前开发目录切回 `main`，本项工作暂停。
+2026-10-09 曾切回 main 暂停；2026-10-10 从最新 main 创建恢复分支，再 cherry-pick 归档。归档历史未改写，未推送远端。
 
-本轮封存范围为 **运行时 provider 拆分与统一后端选择（阶段 4 + 5）**：
+本轮独立 PR 范围为 **运行时 provider 拆分与统一后端选择（阶段 4 + 5）**：
 
 1. 在修改公共入口前执行 qz/E2B runtime 本地基线，冻结旧 Shell 选择和 rollout 覆盖策略。
 2. 仅取回并修正有实际调用方的不可变 BackendPlan，只保留 type/spec；不恢复整套未接入的 core 抽象。
@@ -37,19 +37,27 @@ BackendPlan、adapter core 契约、image preparation 拆分、兼容 facade、�
 
 - 原始基线：`84f782a201f0b619856adc918ece914bbf593156`。
 - 封存分支：`archive/harbor-environment-adapters-phase4-5`，普通 WIP 提交，保留基线历史；不是旧阶段 1 的孤儿快照。
+- 封存提交：`fdb38f37527433ddb73971a361e178512ef6ff66`（`WIP: archive Harbor provider and BackendPlan refactor`），包含代码及两份 `wip/` 文档。提交时全仓 Ruff hook 通过。
 - 已执行验证：YiCloud 开发机，2026-10-09，340 项 Python 测试、5 个 Shell 回归通过；Ruff 0.16.0、Shell 语法和 diff 检查通过。
 - 已知未通过项：OpenSandbox Shell fixture 过时；临时修正 fixture 后，当前代码与 upstream 基线均在同一个 DSH 空 API key 断言失败，未纳入本次改动。
 - 待完成：阶段 6 Shell 收缩、阶段 7 集成验收；真实 YiCloud/qz/E2B Sandbox、agent/verifier、观测、镜像发布及清理链路均待验证。
 - 本地验证日志在 `/tmp/harbor-provider-refactor-validation/`、`/tmp/harbor-backend-plan-validation/`，属于临时文件；验证结论已记录在封存文档，不依赖这些日志才能定位代码。
 
-恢复时从封存分支创建新工作分支，再核对最新 upstream 和测试环境，不直接改写 archive：
+### 2026-10-10 恢复与本 PR 验收
 
-```bash
-git -C agent-fleet switch -c refactor/harbor-environment-adapters-resume \
-  archive/harbor-environment-adapters-phase4-5
-```
+- main 已 fast-forward 到 `upstream/main` 的 `2c3420b`。
+- 恢复分支：`refactor/harbor-environment-adapters-resume`；cherry-pick 归档后的提交为 `5f6de400cae6e6db6bc645276142f3ee5a9eadfe`，无冲突。archive 未改写。
+- 用户确认本 PR 收尾阶段 4 + 5；阶段 6 及没有实际消费者的 core 契约保持后续范围。
+- 已执行：344 项 Python 测试、6 个 Shell 回归，无跳过；Ruff 0.16.0、修改 Shell 的 `bash -n` 和 `git diff --check` 通过。runner 为 Python 3.12.13、Harbor 0.18.0、E2B 2.32.1，未安装依赖。
+- 已修正 OpenSandbox Shell fixture：复用现行 static verifier runtime fixture、隔离个人配置、更新两处 JSON 空格断言。新 main 已包含 DSH 显式空 API key 修复，完整 OpenSandbox Shell 回归通过。
+- 仅静态检查：与当前 main 的原 provider 对照，YiCloud 104 个函数/方法 AST 节点保持不变（包含同名/嵌套节点；旧记录按名称统计为 102）；qz 全模块 AST 保持不变。
+- 真实验收：通过 `agent-fleet-opensandbox-task-test` 正式入口，task 为 TMax `task_000076_ad1c5cc9`，单 worker，严格 S3，24 小时排队/生命周期和自动清理配置。预检通过，用户明确批准远程创建/上传/必要镜像构建推送。
+- 已执行的入口运行目录：`/data/harbor-runs/harbor-adapters-phase45-20261010`。`tasks.txt` 仅含目标 task；Opik 健康检查 HTTP 502 导致 worker exit 22，未创建 Sandbox，无 trial result。不能算真实 provider 验收通过。
+- 当前 `API_KEY`、`MODEL` 为占位配置；用户已选择 Oracle 参考解验收，不调用模型。真实 exec、S3 Sandbox 物化、verifier/reward、cleanup 和观测均待验证。
+- Skill 默认等待 native benchmark exit 文件；本次走旧 queue worker，结束后无该文件。已依据 worker 失败日志停止等待进程及本次 Zellij 会话；未伪造退出文件。后续按用户 Oracle 选择为 Skill 增加 Agent 参数、参考解校验和 queue 完成检测，未改动生产入口。
+- 本轮本地日志：`/tmp/harbor-adapters-resume-20261010/`；详细范围见 `wip/PR_HARBOR_BACKEND_PLAN.md`。阶段 7 的全局完成勾选保持未完成。
 
-恢复后先检查 `git diff 84f782a..HEAD`，阅读封存 PR 草稿中的兼容边界和未通过项，再按需要同步 upstream、重跑受影响测试。
+复核本 PR 使用 `git diff 2c3420b..HEAD`；旧归档与旧验证记录作为历史证据保留。
 
 本文记录 Agent Fleet Harbor 运行环境相关代码的重构方向。目标是把 Docker、E2B-compatible 系列、YiCloud OpenSandbox 专属实现及独立 prebuilder 放到清晰的边界内，减少后端分支、全局补丁和超大文件。本文不改变现有运行行为；迁移期间保留兼容入口。
 
@@ -84,7 +92,7 @@ harbor_environment_adapters/
 
 这个名称强调它们是 Harbor 环境接口的适配层。prebuilder 是独立包，不放在此目录中。
 
-当前已落地目录（2026-10-09）；其他模块只在真实消费者需要时加入：
+当前已落地目录（2026-10-10）；其他模块只在真实消费者需要时加入：
 
 ```text
 Agents/utils/common/Harbor/harbor_environment_adapters/
@@ -343,7 +351,7 @@ YiCloud 已有多服务逻辑包括服务启动顺序、`depends_on`、healthche
 
 2026-10-09，YiCloud 开发机：迁移前 qz 129 项、E2B runtime 9 项和 qz Shell 基线通过；
 qz Shell fixture 增加隔离配置，避免加载个人配置后访问 Opik。迁移后验证结果见
-`wip/PR_HARBOR_BACKEND_PLAN.md`。真实 provider、模型、镜像发布和清理链路本轮待验证。
+`wip/PR_HARBOR_BACKEND_PLAN.md`。2026-10-10 新基线上的本地回归再次通过；真实验证进展见恢复记录，尚不能宣称 provider、模型、镜像发布或清理通过。
 
 ### 5. 拆分运行时 provider
 
@@ -433,3 +441,7 @@ qz Shell fixture 增加隔离配置，避免加载个人配置后访问 Opik。�
 - AgentENV 正式接入时再调查实际行为并验证 Harbor 所需操作；不阻塞本次重构，也不据此提前增加抽象。
 
 已确定，不再作为开放问题：qz 本地测试必须先通过、真实平台测试不要求；YiCloud 现有多服务行为保留；prebuilder 当前产物保持不变，并允许作为独立包复用。
+
+2026-10-10 Oracle 验收准备：TMax 原 task 无 `solution/solve.sh`，native 入口也因无预构建镜像引用在创建前失败。候选改为现有 `agent-fleet-prebuild-smoke/bfgroup__b2-113`，已有参考解，Oracle/1 worker/S3/queue 模式预检通过。自动审批要求对这个具体替代 task 单独授权，当前等用户确认；仍未创建 Sandbox。
+
+Skill 辅助改动仅在工作区 `.agents/skills/agent-fleet-opensandbox-task-test/`：增加 `--agent oracle`、明确 Claude 的模型配置要求、Oracle 参考解预检及 queue 完成检测，同步相关说明。该目录不属于本仓库 PR；Shell 语法及非法 Agent/缺参考解拒绝检查已通过。
