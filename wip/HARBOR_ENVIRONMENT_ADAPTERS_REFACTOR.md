@@ -1,10 +1,10 @@
 # Harbor Environment Adapters 重构设计（WIP）
 
-状态：2026-10-10 已恢复。main 更新至 upstream `2c3420b`，在 `refactor/harbor-environment-adapters-resume` 收尾阶段 4 + 5；阶段 6 留到下一份 PR。归档分支保留，尚未创建远端 PR。
+状态：阶段 4 + 5 已恢复到 `refactor/harbor-environment-adapters-resume`，基线 `2c3420b`。2026-10-13 完成一次 Oracle 真实执行和正常结束清理验证；任务补丁失败，reward 0。阶段 6 留到下一份 PR，阶段 7 整体未完成；归档保留，尚未创建远端 PR。
 
-更新时间：2026-10-10（Asia/Singapore）
+更新时间：2026-10-13（Asia/Singapore）
 
-验证范围：阶段 1–3 已完成（用户确认，阶段 3 的现有 smoke 勾选保留）。2026-10-10 在 YiCloud Linux 开发机完成新基线上的 344 项 Python 测试、6 个 Shell 回归和静态检查。经用户批准的一次真实验收在创建 Sandbox 前被 Opik HTTP 502 阻断；当前模型配置为占位值，真实 provider/Agent/verifier/清理仍待验证。公共 OpenSandbox SDK 的问题依据用户此前验证结论，本轮未重新实测。
+验证范围：阶段 1–3 已完成（用户确认）。2026-10-10 本地回归 344 项 Python、6 个 Shell 和静态检查通过；2026-10-13 仅执行一个真实 Oracle task，provider 创建、exec、S3 物化、verifier/结果回收、自动删除已有实测证据，Oracle 补丁失败、reward 0。真实模型 Agent、观测、start 失败/取消、多服务 live 等仍待验证；不把 task 成绩或阶段 7 写成通过。
 
 当前封存参考：原阶段 1 及其后续 WIP 快照已封存在 `agent-fleet` 分支
 `archive/harbor-environment-adapters-phase1`，孤儿提交 `bccdfcba32ba93590b3cb058c05369dc0b1c6d42`（无父提交）。该提交保留
@@ -56,6 +56,15 @@ BackendPlan、adapter core 契约、image preparation 拆分、兼容 facade、�
 - 当前 `API_KEY`、`MODEL` 为占位配置；用户已选择 Oracle 参考解验收，不调用模型。真实 exec、S3 Sandbox 物化、verifier/reward、cleanup 和观测均待验证。
 - Skill 默认等待 native benchmark exit 文件；本次走旧 queue worker，结束后无该文件。已依据 worker 失败日志停止等待进程及本次 Zellij 会话；未伪造退出文件。后续按用户 Oracle 选择为 Skill 增加 Agent 参数、参考解校验和 queue 完成检测，未改动生产入口。
 - 本轮本地日志：`/tmp/harbor-adapters-resume-20261010/`；详细范围见 `wip/PR_HARBOR_BACKEND_PLAN.md`。阶段 7 的全局完成勾选保持未完成。
+
+### 2026-10-13 Oracle 真实验收
+
+- 用户明确批准替代 task `bfgroup__b2-113` 的单次 Oracle/S3/OpenSandbox 验收。
+- 被测代码 `b580d51`，1 completed trial、0 error、0 retry；Skill/入口 exit 0，任务 reward 0。
+- 控制面确认 `sbx-9dd55d21-df7` 处于 Running，环境 `env-6e45c2be-74b` / `jianxiao-sandbox-0`，镜像 digest、`sleep infinity` 和实际 1440min 生命周期匹配。
+- `/solution`、`/tests`、verifier uv 和 agent artifacts 严格 S3 物化；Oracle 参考补丁应用失败，verifier 166 PASS / 1 FAIL（`install_build_no`），成绩 0。
+- 运行结束后控制面 list 无目标实例，GetSandbox ret_code 105「资源不存在」，自动清理已确认。
+- 运行目录：`/data/harbor-runs/harbor-adapters-phase45-oracle-20261013`；详细证据与范围见 [Oracle 真实验收记录](HARBOR_ADAPTERS_ORACLE_ACCEPTANCE_20261013.md)。不扩展到全量 prebuild smoke、不修改任务、不增加真实模型或观测结论。
 
 复核本 PR 使用 `git diff 2c3420b..HEAD`；旧归档与旧验证记录作为历史证据保留。
 
@@ -363,7 +372,7 @@ qz Shell fixture 增加隔离配置，避免加载个人配置后访问 Opik。�
 2026-10-09，YiCloud 开发机：provider 迁移前后 qz 130 项、E2B runtime 9 项、YiCloud
 80 项本地测试通过；兼容导入检查使用已安装的真实 Harbor/E2B API 验证旧新类相同且非抽象。
 静态核对 YiCloud 原有 102 个函数/方法 AST 及 qz 全模块 AST 保持不变。
-真实平台验证仍在阶段 7，不据此宣称线上生命周期或清理链路通过。
+2026-10-13 已补一次 Oracle 真实创建、传输、exec/verifier 和正常结束删除证据，任务成绩 0；见验收记录。start 失败/取消、多服务和真实模型/观测仍待验证，不将阶段 7 整体标为完成。
 
 ### 6. 收缩 Shell 编排
 
@@ -442,6 +451,6 @@ qz Shell fixture 增加隔离配置，避免加载个人配置后访问 Opik。�
 
 已确定，不再作为开放问题：qz 本地测试必须先通过、真实平台测试不要求；YiCloud 现有多服务行为保留；prebuilder 当前产物保持不变，并允许作为独立包复用。
 
-2026-10-10 Oracle 验收准备：TMax 原 task 无 `solution/solve.sh`，native 入口也因无预构建镜像引用在创建前失败。候选改为现有 `agent-fleet-prebuild-smoke/bfgroup__b2-113`，已有参考解，Oracle/1 worker/S3/queue 模式预检通过。自动审批要求对这个具体替代 task 单独授权，当前等用户确认；仍未创建 Sandbox。
+2026-10-10 Oracle 验收准备：TMax 原 task 无 `solution/solve.sh`，native 入口也因无预构建镜像引用在创建前失败。候选改为现有 `agent-fleet-prebuild-smoke/bfgroup__b2-113`，已有参考解，Oracle/1 worker/S3/queue 模式预检通过。当时自动审批要求对这个具体替代 task 单独授权；2026-10-13 用户已授权并执行，结果见上述记录。
 
 Skill 辅助改动仅在工作区 `.agents/skills/agent-fleet-opensandbox-task-test/`：增加 `--agent oracle`、明确 Claude 的模型配置要求、Oracle 参考解预检及 queue 完成检测，同步相关说明。该目录不属于本仓库 PR；Shell 语法及非法 Agent/缺参考解拒绝检查已通过。

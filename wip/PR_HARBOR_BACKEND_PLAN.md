@@ -1,11 +1,11 @@
 # 独立 PR：拆分 Harbor 运行时 provider 并统一后端选择
 
-日期/平台：2026-10-10，YiCloud Linux 开发机。
+日期/平台：2026-10-13，YiCloud Linux 开发机。
 工作分支：`refactor/harbor-environment-adapters-resume`。
 当前基线：`upstream/main` / main，`2c3420b`。
 归档分支：`archive/harbor-environment-adapters-phase4-5`，提交 `fdb38f37527433ddb73971a361e178512ef6ff66`（旧基线 `84f782a`）。
 恢复提交：`5f6de400cae6e6db6bc645276142f3ee5a9eadfe`；从最新 main cherry-pick 归档，无冲突，未改写 archive。
-状态：用户确认本 PR 收尾阶段 4 + 5。新基线本地验收完成；真实验收尚未通过。未推送、未创建远端 PR。
+状态：用户确认本 PR 收尾阶段 4 + 5。本地验收完成，2026-10-13 单次 Oracle 真实运行验证 provider 执行与自动清理；任务补丁失败、reward 0。未推送、未创建远端 PR，阶段 7 整体未完成。
 
 ## 1. Why the change?
 
@@ -51,7 +51,7 @@ remain the runtime contracts. Further Shell reduction remains phase 6.
 ## 3. Other details
 
 已执行验证：复用 setup runner，Python 3.12.13、Harbor 0.18.0、E2B SDK 2.32.1。
-未安装依赖。本轮已执行一次真实入口预检和启动，启动在创建 Sandbox 前失败；未访问真实 Sandbox 或模型，未构建/发布镜像。
+未安装依赖。2026-10-10 的 TMax 入口尝试在创建前失败；2026-10-13 已完成单次 Oracle 真正运行和清理，未调用模型，未新增镜像构建/发布验收结论。
 
 迁移前：BackendPlan 修改前 qz 129 项、E2B runtime 9 项和 qz Shell 通过；加入
 plan hook 回归后，阶段 5 provider 迁移前同一套 qz 130 项、E2B runtime 9 项、
@@ -94,7 +94,7 @@ YiCloud 测试继续通过旧 class 入口运行；依赖 patch 更新到各自�
 个人配置，两处 JSON 空格断言已修正。新 main 自带 DSH 显式空 `API_KEY` 修复；
 完整 `test_harboropik_opensandbox.sh` 本轮通过，没有新增生产认证改动。
 
-真实验收（经用户单独批准；使用工作区 `agent-fleet-opensandbox-task-test` Skill）：
+2026-10-10 历史入口尝试（使用工作区 `agent-fleet-opensandbox-task-test` Skill）：
 
 - task：`task_000076_ad1c5cc9`；dataset：`/data/harbor-datasets/TMax-15K-Harbor`。
 - 分支/代码 SHA：本工作分支 / `5f6de40`；仅有本地 Shell fixture 修改。
@@ -104,9 +104,19 @@ YiCloud 测试继续通过旧 class 入口运行；依赖 patch 更新到各自�
 - 当前模型 `API_KEY`、`MODEL` 为占位配置，用户已选择 Oracle 验收；观测本轮未通过。
 - Skill 只等待 native benchmark exit 文件，旧 queue worker 已结束却无该文件。已停掉等待进程及本次 Zellij，没有伪造退出文件。Skill 已补 queue 完成检测；native 模式只适用于任务已带受支持预构建引用的情况。
 
-真实 YiCloud provider 主链路仍待验证，不能将预检和本地测试当作 live smoke 通过。
-真实 qz Sandbox 不属于本次门槛；官方 E2B live、start 失败/取消 live cleanup、
-Docker live 回滚、观测和镜像发布仍待验证，阶段 7 整体未完成。
+2026-10-13 已执行一次真实 Oracle 验收（用户批准具体替代 task）：
+
+- Task：`agent-fleet-prebuild-smoke/bfgroup__b2-113`；被测代码 `b580d51`，旧 spec 实际加载拆分后的 YiCloud provider。
+- 1 completed trial、0 errored、0 retries；入口和 Skill exit 0，reward 0、`exception_info=null`。
+- 控制面确认 `sbx-9dd55d21-df7` / `env-6e45c2be-74b` / Running，镜像 digest 匹配，入口 `sleep infinity`，生命周期 1440min。
+- 严格 S3 传入 verifier uv、`/solution`、`/logs/agent`、`/tests`；实际 exec、Oracle/verifier 和结果下载已运行。
+- Oracle 补丁失败：`src/tools/stage.jam: does not match index`；verifier 166 PASS / 1 FAIL（`install_build_no`），任务未通过。
+- 自动清理后控制面 list 已无目标实例，再次 GetSandbox 返回 ret_code 105「资源不存在」。
+- 详细证据：[Oracle 真实验收记录](HARBOR_ADAPTERS_ORACLE_ACCEPTANCE_20261013.md)；run root `/data/harbor-runs/harbor-adapters-phase45-oracle-20261013`。
+
+本次获得 provider 真实执行及正常结束删除证据，不把 Oracle 成绩写成成功。
+真实模型 Agent/Claude Runtime、Opik 观测、start 失败/取消 live cleanup、多服务、
+官方 E2B、Docker live 回滚和新镜像发布仍待验证；真实 qz 不属于本次门槛。阶段 7 整体未完成。
 
 复现命令（仓库根目录，按 workspace 测试约定复用 runner）：
 
@@ -133,6 +143,6 @@ HARBOR_OPIK_PYTHON="$runner_python" timeout 240 bash \
 
 恢复后验证日志：`/tmp/harbor-adapters-resume-20261010/`。
 
-2026-10-10 Oracle 验收准备：TMax 原 task 无 `solution/solve.sh`，native 入口也因无预构建镜像引用在创建前失败。候选改为现有 `agent-fleet-prebuild-smoke/bfgroup__b2-113`，已有参考解，Oracle/1 worker/S3/queue 模式预检通过。自动审批要求对这个具体替代 task 单独授权，当前等用户确认；仍未创建 Sandbox。
+2026-10-10 Oracle 验收准备：TMax 原 task 无 `solution/solve.sh`，native 入口也因无预构建镜像引用在创建前失败。候选改为现有 `agent-fleet-prebuild-smoke/bfgroup__b2-113`，已有参考解，Oracle/1 worker/S3/queue 模式预检通过。当时自动审批要求对这个具体替代 task 单独授权；2026-10-13 用户已授权并完成一次实际运行，结果见上述记录。
 
 Skill 辅助改动仅在工作区 `.agents/skills/agent-fleet-opensandbox-task-test/`：增加 `--agent oracle`、明确 Claude 的模型配置要求、Oracle 参考解预检及 queue 完成检测，同步相关说明。该目录不属于本仓库 PR；Shell 语法及非法 Agent/缺参考解拒绝检查已通过。
