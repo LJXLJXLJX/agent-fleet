@@ -7,6 +7,13 @@ component=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 go_proxy=${HARBOR_TASK_IMAGE_GOPROXY:-https://goproxy.cn,direct}
 go_sumdb=${HARBOR_TASK_IMAGE_GOSUMDB:-sum.golang.google.cn}
 github_mirror=${HARBOR_TASK_IMAGE_GITHUB_MIRROR_URL:-}
+clone_timeout=${HARBOR_TASK_IMAGE_FRONTEND_CLONE_TIMEOUT_SEC:-600}
+if [[ ! "$clone_timeout" =~ ^[1-9][0-9]*$ ]] ||
+    [[ ${#clone_timeout} -gt 4 ]] ||
+    (( 10#$clone_timeout > 3600 )); then
+    echo "HARBOR_TASK_IMAGE_FRONTEND_CLONE_TIMEOUT_SEC must be an integer from 1 to 3600" >&2
+    exit 2
+fi
 buildkit_source=https://github.com/moby/buildkit.git
 if [[ -n "$github_mirror" ]]; then
     buildkit_source="${github_mirror%/}/moby/buildkit.git"
@@ -24,7 +31,7 @@ unset GOROOT
 export GOCACHE="$FRONTEND_WORK_DIR/go-cache"
 export GOPATH="$FRONTEND_WORK_DIR/go"
 export CGO_ENABLED=0
-timeout 600 git clone --single-branch --branch "${upstream[0]}" \
+timeout "$clone_timeout" git clone --single-branch --branch "${upstream[0]}" \
     "$buildkit_source" \
     "$FRONTEND_WORK_DIR/upstream"
 test "$(git -C "$FRONTEND_WORK_DIR/upstream" rev-parse HEAD)" = "${upstream[1]}"

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -113,6 +114,30 @@ class FrontendContractTest(unittest.TestCase):
         ).read_text()
         self.assertIn('binary_name="dockerfile-frontend-${binary_digest}"', script)
         self.assertIn('> "$FRONTEND_WORK_DIR/image/.dockerignore"', script)
+
+    def test_frontend_clone_timeout_is_bounded_and_configurable(self):
+        script = Path(__file__).resolve().parents[1] / "scripts" / "build.sh"
+        text = script.read_text()
+        self.assertIn(
+            "HARBOR_TASK_IMAGE_FRONTEND_CLONE_TIMEOUT_SEC:-600",
+            text,
+        )
+        self.assertIn('timeout "$clone_timeout" git clone', text)
+        for value in ("0", "3601", "1x", "999999999999999999999999"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                result = subprocess.run(
+                    ["bash", str(script)],
+                    env={
+                        **os.environ,
+                        "FRONTEND_WORK_DIR": str(Path(tmp) / "work"),
+                        "HARBOR_TASK_IMAGE_FRONTEND_CLONE_TIMEOUT_SEC": value,
+                    },
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("must be an integer from 1 to 3600", result.stderr)
 
     def test_optional_download_and_git_runtime_secrets_are_content_addressed(self):
         with tempfile.TemporaryDirectory() as tmp:
