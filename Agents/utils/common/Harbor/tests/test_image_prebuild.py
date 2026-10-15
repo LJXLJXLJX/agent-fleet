@@ -170,6 +170,16 @@ class DatasetPrebuildTest(unittest.TestCase):
             self.assertEqual(prune.call_count, count_at_exit)
         self.assertFalse(any(t.name == "image-cache-gc" for t in threading.enumerate()))
 
+    def test_zero_gc_interval_disables_initial_and_periodic_prune(self):
+        args = self.args()
+        args.dry_run = False
+        args.gc_interval_sec = 0
+        with patch.object(batch.subprocess, "run") as prune:
+            with batch.periodic_gc(args, self.root):
+                pass
+        prune.assert_not_called()
+        self.assertFalse((self.root / "buildkit-gc.log").exists())
+
     def test_invalid_batch_options_fail_before_build(self):
         for options in (
             ("--concurrency", "0"),

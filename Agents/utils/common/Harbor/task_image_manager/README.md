@@ -180,6 +180,10 @@ A rerun uses the existing uploaded-Bundle cache. Local cache hits skip health
 probes. Failed preparations are reported once; the batch does not switch
 sources or retry a task.
 
+Set `--gc-interval-sec 0` (or `HARBOR_TASK_IMAGE_PREBUILD_GC_INTERVAL_SEC=0`)
+to disable both the initial and periodic BuildKit cache prune. Positive values
+retain the initial prune and repeat it at the configured interval.
+
 Build and prebuild settings use `HARBOR_TASK_IMAGE_*`; Registry connection and
 credentials use `YICLOUD_HARBOR_*`. These settings do not require an OpenSandbox
 runtime. The old build/prebuild variable names are no longer read: update local

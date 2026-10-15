@@ -245,11 +245,10 @@ def periodic_gc(args, run_dir: Path):
 
     thread = None
     try:
-        if not args.dry_run:
+        if not args.dry_run and args.gc_interval_sec:
             prune()
-            if args.gc_interval_sec:
-                thread = threading.Thread(target=loop, name="image-cache-gc")
-                thread.start()
+            thread = threading.Thread(target=loop, name="image-cache-gc")
+            thread.start()
         yield
     finally:
         stop.set()
