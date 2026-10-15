@@ -132,6 +132,7 @@ Run batch image preparation independently of the selected Sandbox backend:
 
 ```bash
 HARBOR_TASK_IMAGE_PREBUILD_CONCURRENCY=1 \
+HARBOR_TASK_IMAGE_PREBUILD_UPLOAD_CONCURRENCY=1 \
 HARBOR_TASK_IMAGE_PREBUILD_BUILD_TIMEOUT_SEC=7200 \
 HARBOR_TASK_IMAGE_PREBUILD_ROOT=/path/to/prebuild-runs \
   bash /path/to/Harbor/task_image_manager/prebuild_dataset.sh \
@@ -149,7 +150,8 @@ You can also invoke the dataset CLI directly with environment configuration:
 python /path/to/Harbor/task_image_manager/dataset_cli.py \
   /path/to/dataset benchmark-name \
   --registry registry.example --project benchmark-name \
-  --prebuild-root /path/to/prebuild-runs --concurrency 1 --build-timeout-sec 7200
+  --prebuild-root /path/to/prebuild-runs --concurrency 12 \
+  --upload-concurrency 1 --build-timeout-sec 7200
 ```
 
 To prepare only named tasks, put one exact task directory name per line in a
@@ -165,7 +167,11 @@ selection, repository derivation, and manifest output paths belong to the
 batch entrypoint. `HARBOR_TASK_IMAGE_CLI` overrides the single-task launcher
 used by Harbor; batch preparation calls the Python API and ignores that setting.
 
-Only the configured number of tasks is in flight. An ordinary task failure
+Only the configured number of tasks is in flight. Registry copies use the same
+limit by default; `--upload-concurrency` (or
+`HARBOR_TASK_IMAGE_PREBUILD_UPLOAD_CONCURRENCY`) can bound uploads separately,
+for example to keep 12 builds in flight while publishing one image at a time.
+An ordinary task failure
 allows other tasks to continue and produces exit code 123. A shared frontend
 failure stops new dispatch, drains active tasks, and produces exit code 124.
 Interrupts also stop new dispatch and wait for active tasks under their build

@@ -26,6 +26,7 @@ if not __package__:
 
 from . import task_cli
 from .build_engine.frontend import FrontendBuildError
+from .registry import limit_copy_concurrency
 from .task_preparation import prepare_task_images
 
 PREFIX = "HARBOR_TASK_IMAGE_"
@@ -62,6 +63,13 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--concurrency", type=positive, default=setting("PREBUILD_CONCURRENCY", "1")
+    )
+    upload_concurrency = setting("PREBUILD_UPLOAD_CONCURRENCY", "").strip()
+    parser.add_argument(
+        "--upload-concurrency",
+        type=positive,
+        default=positive(upload_concurrency) if upload_concurrency else None,
+        help="maximum concurrent Registry copies (default: build concurrency)",
     )
     parser.add_argument(
         "--prebuild-root",
@@ -336,10 +344,13 @@ def run(args) -> int:
 
             emit(
                 f"[prebuild] benchmark={args.benchmark} supported={len(tasks)} "
-                f"skipped={len(skipped)} concurrency={args.concurrency} run_dir={run_dir}"
+                f"skipped={len(skipped)} concurrency={args.concurrency} "
+                f"upload_concurrency={args.upload_concurrency or args.concurrency} "
+                f"run_dir={run_dir}"
             )
             with periodic_gc(args, run_dir):
-                results = dispatch(tasks, args, run_dir, emit)
+                with limit_copy_concurrency(args.upload_concurrency or args.concurrency):
+                    results = dispatch(tasks, args, run_dir, emit)
             summary = {
                 "total": len(tasks),
                 "skipped": len(skipped),

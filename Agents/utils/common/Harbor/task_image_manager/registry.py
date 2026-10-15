@@ -10,7 +10,9 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +32,25 @@ SKOPEO_COPY_RETRY_DELAY_SECONDS = 3
 SKOPEO_COMMAND_TIMEOUT_SECONDS = float(
     os.environ.get("HARBOR_TASK_IMAGE_SKOPEO_TIMEOUT_SEC", "1800")
 )
+_COPY_CONCURRENCY_GATE: threading.BoundedSemaphore | None = None
+_COPY_CONCURRENCY_CONFIGURATION = threading.Lock()
+
+
+@contextmanager
+def limit_copy_concurrency(maximum: int):
+    """Limit concurrent Registry writes for one in-process batch."""
+    if maximum < 1:
+        raise ValueError("copy concurrency must be positive")
+    global _COPY_CONCURRENCY_GATE
+    with _COPY_CONCURRENCY_CONFIGURATION:
+        if _COPY_CONCURRENCY_GATE is not None:
+            raise RuntimeError("Registry copy concurrency is already configured")
+        _COPY_CONCURRENCY_GATE = threading.BoundedSemaphore(maximum)
+    try:
+        yield
+    finally:
+        with _COPY_CONCURRENCY_CONFIGURATION:
+            _COPY_CONCURRENCY_GATE = None
 
 
 def log(message: str) -> None:
@@ -309,19 +330,21 @@ class SkopeoPublisher:
                 source_ref,
                 self._image_url(destination),
             ]
-            for attempt in range(1, SKOPEO_COPY_ATTEMPTS + 1):
-                try:
-                    self._run(copy_command)
-                    break
-                except RuntimeError as exc:
-                    if attempt == SKOPEO_COPY_ATTEMPTS:
-                        raise
-                    log(
-                        "warning: skopeo copy failed "
-                        f"(attempt {attempt}/{SKOPEO_COPY_ATTEMPTS}); "
-                        f"retrying in {SKOPEO_COPY_RETRY_DELAY_SECONDS}s: {exc}"
-                    )
-                    time.sleep(SKOPEO_COPY_RETRY_DELAY_SECONDS)
+            gate = _COPY_CONCURRENCY_GATE
+            with gate if gate is not None else nullcontext():
+                for attempt in range(1, SKOPEO_COPY_ATTEMPTS + 1):
+                    try:
+                        self._run(copy_command)
+                        break
+                    except RuntimeError as exc:
+                        if attempt == SKOPEO_COPY_ATTEMPTS:
+                            raise
+                        log(
+                            "warning: skopeo copy failed "
+                            f"(attempt {attempt}/{SKOPEO_COPY_ATTEMPTS}); "
+                            f"retrying in {SKOPEO_COPY_RETRY_DELAY_SECONDS}s: {exc}"
+                        )
+                        time.sleep(SKOPEO_COPY_RETRY_DELAY_SECONDS)
             copied_digest = digest_path.read_text(encoding="utf-8").strip()
         finally:
             digest_path.unlink(missing_ok=True)

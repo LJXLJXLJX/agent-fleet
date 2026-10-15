@@ -3,6 +3,8 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -304,6 +306,62 @@ class ImagePreparationManifestTest(unittest.TestCase):
         finally:
             transport.stop()
             publisher.close()
+
+    def test_skopeo_copy_respects_batch_concurrency_limit(self) -> None:
+        target = image_registry.RegistryTarget("registry.example", "benchmark", "example")
+        publishers = [
+            image_registry.SkopeoPublisher(target, "", "", tls_verify=False)
+            for _ in range(2)
+        ]
+        digest = "sha256:" + "a" * 64
+        active = maximum = 0
+        lock = threading.Lock()
+
+        def fake_run(command: list[str], **kwargs):
+            nonlocal active, maximum
+            if command[1] == "copy":
+                with lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                try:
+                    time.sleep(0.03)
+                    Path(command[command.index("--digestfile") + 1]).write_text(
+                        digest, encoding="utf-8"
+                    )
+                finally:
+                    with lock:
+                        active -= 1
+                return ""
+            if command[1] == "inspect":
+                return digest + "\n"
+            raise AssertionError(command)
+
+        for publisher in publishers:
+            publisher._run = fake_run
+        errors = []
+
+        def copy(index: int) -> None:
+            try:
+                publishers[index].copy(
+                    f"/tmp/image-{index}.oci.tar",
+                    f"registry.example/benchmark/example:main-{index}",
+                    source_is_archive=True,
+                )
+            except Exception as exc:  # noqa: BLE001 -- preserve thread failure
+                errors.append(exc)
+
+        try:
+            with image_registry.limit_copy_concurrency(1):
+                threads = [threading.Thread(target=copy, args=(index,)) for index in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+        finally:
+            for publisher in publishers:
+                publisher.close()
+        self.assertEqual(errors, [])
+        self.assertEqual(maximum, 1)
 
 
 class BundleDependencyBoundaryTest(unittest.TestCase):

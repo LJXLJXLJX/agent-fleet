@@ -123,6 +123,24 @@ class DatasetPrebuildTest(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(maximum, 2)
 
+    def test_upload_concurrency_is_independent_from_build_concurrency(self):
+        args = self.args("--concurrency", "3", "--upload-concurrency", "1")
+        observed = []
+
+        def dispatch(tasks, parsed, run_dir, emit):
+            observed.append((parsed.concurrency, parsed.upload_concurrency))
+            return [batch.TaskResult(task.name, "ready") for task in tasks]
+
+        with (
+            patch.object(batch, "dispatch", side_effect=dispatch),
+            patch.object(batch, "limit_copy_concurrency") as limit,
+        ):
+            limit.return_value.__enter__.return_value = None
+            status = batch.run(args)
+        self.assertEqual(status, 0)
+        self.assertEqual(observed, [(3, 1)])
+        limit.assert_called_once_with(1)
+
     def test_source_options_are_forwarded_without_batch_retries(self):
         args = self.args(
             "--health-url", "https://health.example",
@@ -183,6 +201,7 @@ class DatasetPrebuildTest(unittest.TestCase):
     def test_invalid_batch_options_fail_before_build(self):
         for options in (
             ("--concurrency", "0"),
+            ("--upload-concurrency", "0"),
             ("--gc-interval-sec", "-1"),
             ("--skip-hash-verification", "--no-reuse-local-upload-cache"),
             ("--task-dir", "/unexpected"),
