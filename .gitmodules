@@ -3,4 +3,4 @@
 	url = https://github.com/sii-system/agent-opik-plugin.git
 [submodule "third_party/dependency-gateway"]
 	path = third_party/dependency-gateway
-	url = https://github.com/sii-system/dependency-gateway.git
+	url = https://github.com/LJXLJXLJX/dependency-gateway.git
