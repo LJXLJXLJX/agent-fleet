@@ -53,6 +53,7 @@ class HarborOpikE2BSmokeTest(unittest.TestCase):
                 "[environment]\n", encoding="utf-8"
             )
             (root_path / "queue").mkdir()
+            (root_path / "runtime").mkdir()
             tools_path = root_path / "bin"
             tools_path.mkdir()
             (tools_path / "uv").symlink_to("/bin/true")
@@ -62,13 +63,17 @@ class HarborOpikE2BSmokeTest(unittest.TestCase):
             fake_docker.chmod(0o755)
             fake_harbor = tools_path / "harbor"
             fake_harbor.write_text(
-                "#!/usr/bin/env bash\nprintf 'FAKE_HARBOR_ARG=%s\\n' \"$@\"\n",
+                "#!/usr/bin/env bash\nprintf 'FAKE_HARBOR_ARG=%s\\n' \"$@\"\n"
+                "printf 'FAKE_BACKEND_PLAN=%s\\n' \"$HARBOR_BACKEND_PLAN\"\n",
                 encoding="utf-8",
             )
             fake_harbor.chmod(0o755)
             env = os.environ.copy()
             env.update(
                 {
+                    "AGENT_FLEET_CONFIG_LOADED_ROOT": str(SCRIPT.parents[4]),
+                    "HARBOR_BACKEND_PLAN": "",
+                    "HARBOR_ENVIRONMENT_SPEC": "",
                     "AGENT": agent,
                     "HARBOR_ENVIRONMENT_TYPE": environment_type,
                     "HARBOR_E2B_SANDBOX_TIMEOUT_SEC": "3600",
@@ -136,6 +141,24 @@ class HarborOpikE2BSmokeTest(unittest.TestCase):
         self.assertIn(
             "HARBOR_VERIFIER_UV_BIN_DIR=/opt/tb-uv-backup/bin", completed.stdout
         )
+
+    def test_fixed_and_registry_commands_receive_the_same_backend_plan(self) -> None:
+        plans = []
+        for dataset in ("auto", "test-owner/test-dataset@v1"):
+            with self.subTest(dataset=dataset):
+                result = self.run_dry_run("e2b", dry_run=False, extra_env={
+                    "E2B_API_KEY": "fake-e2b-key", "DATASET_NAME": dataset,
+                })
+                self.assertEqual(result.returncode, 0, result.stdout)
+                line = next(line for line in result.stdout.splitlines()
+                            if line.startswith("FAKE_BACKEND_PLAN="))
+                plan = json.loads(line.removeprefix("FAKE_BACKEND_PLAN="))
+                self.assertEqual(plan["environment_spec"], "e2b")
+                self.assertEqual(plan["environment_type"], "e2b")
+                self.assertIn("FAKE_HARBOR_ARG=--env\nFAKE_HARBOR_ARG=e2b", result.stdout)
+                plans.append(plan)
+        self.assertEqual(len(plans), 2)
+        self.assertEqual(plans[0], plans[1])
 
     def test_oracle_e2b_uses_host_configured_prebuilt_environment(self) -> None:
         completed = self.run_dry_run("e2b", prebuilt_template="template-test")

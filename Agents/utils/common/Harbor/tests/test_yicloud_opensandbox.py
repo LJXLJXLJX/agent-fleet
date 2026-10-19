@@ -2,6 +2,7 @@ import asyncio
 import base64
 import contextvars
 import importlib.util
+import io
 import json
 import os
 import re
@@ -67,6 +68,28 @@ assert spec is not None and spec.loader is not None
 yicloud_opensandbox = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(yicloud_opensandbox)
 
+from harbor_environment_adapters.providers.opensandbox_yicloud import (
+    adapter as yicloud_adapter,
+)
+from harbor_environment_adapters.providers.opensandbox_yicloud import (
+    client as yicloud_client,
+)
+from harbor_environment_adapters.providers.opensandbox_yicloud import (
+    config as yicloud_config,
+)
+from harbor_environment_adapters.providers.opensandbox_yicloud import (
+    execution as yicloud_execution,
+)
+from harbor_environment_adapters.providers.opensandbox_yicloud import (
+    lifecycle as yicloud_lifecycle,
+)
+from harbor_environment_adapters.providers.opensandbox_yicloud import (
+    services as yicloud_services,
+)
+from harbor_environment_adapters.providers.opensandbox_yicloud import (
+    transfer as yicloud_transfer,
+)
+
 
 class Request:
     def __init__(self, **kwargs):
@@ -85,7 +108,7 @@ class DirectoryPackingDispatchTest(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(native=native, mode=mode), patch.dict(os.environ, {
                     "HARBOR_NATIVE_CONCURRENCY": native,
                     "HARBOR_OPENSANDBOX_COMMAND_MODE": mode,
-                }), patch.object(yicloud_opensandbox, "pack_directory_async",
+                }), patch.object(yicloud_transfer, "pack_directory_async",
                     new=AsyncMock(side_effect=lambda src, dst: dst.write_bytes(b"archive"))) as pack:
                     await instance._upload_dir_http(source, "/opt/deps")
                     self.assertEqual(pack.await_count, int(native == "1" and mode == "async"))
@@ -202,8 +225,8 @@ class NativeCommandPoolTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 release.set()
                 await asyncio.gather(*tasks, return_exceptions=True)
-                yicloud_opensandbox._native_command_pool().shutdown(wait=True)
-                yicloud_opensandbox._native_command_pool.cache_clear()
+                yicloud_execution._native_command_pool().shutdown(wait=True)
+                yicloud_execution._native_command_pool.cache_clear()
 
 
 def make_healthcheck_environment(ready_timeout_sec: int):
@@ -250,26 +273,96 @@ class FakeSandbox:
 
 
 class YiCloudOpenSandboxTest(unittest.TestCase):
+    def test_single_start_logs_ready_latency_from_create_to_execd(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance.logger = Mock()
+        instance._bundle = None
+        instance._sandbox_name = ""
+        instance.session_id = "test-session"
+        instance._project_name = "test-project"
+        instance._environment_id = "env-test"
+        instance._environment_name = "test-environment"
+        instance._image_ref_override = "repo/image@sha256:" + "a" * 64
+        instance.task_env_config = SimpleNamespace(docker_image="")
+        instance._persistent_env = {}
+        instance._request_cpu = "1"
+        instance._request_memory = "2Gi"
+        instance._lifecycle_minutes = 120
+        instance._request_timeout_sec = 180
+        instance._ready_timeout_sec = 300
+        instance._retain_on_start_failure = False
+        instance._validate_definition = Mock()
+        instance._initialize_service = Mock()
+        instance._resolve_environment_id = Mock()
+        instance._create_image_input = Mock(return_value=Request())
+        created = SimpleNamespace(Id="sbx-test", AccessToken="token")
+        current = SimpleNamespace(
+            EnvironmentId="env-test",
+            Image=SimpleNamespace(Ref=instance._image_ref),
+            Endpoints=SimpleNamespace(
+                Endpoints={
+                    "exec": SimpleNamespace(
+                        ProxyUrl="https://sandbox.example/command"
+                    )
+                }
+            ),
+        )
+        instance._sandbox_service = SimpleNamespace(
+            create_sandbox=Mock(),
+            models=SimpleNamespace(
+                CreateSandboxReq=Request,
+                CreateSandboxReqResources=Request,
+            ),
+        )
+        instance._retry_control_plane_auth = AsyncMock(
+            side_effect=[None, created]
+        )
+        instance._wait_until_running = AsyncMock(return_value=current)
+        instance._wait_until_execd_ready = AsyncMock()
+        instance.exec = AsyncMock(
+            return_value=SimpleNamespace(return_code=0, stdout="", stderr="")
+        )
+        instance._upload_environment_dir_after_start = AsyncMock()
+        instance._materialize_read_only_mounts = AsyncMock()
+        instance._handle_start_failure = AsyncMock()
+
+        with patch.object(
+            yicloud_lifecycle,
+            "_monotonic",
+            side_effect=[10.0, 10.125, 10.375, 10.5],
+        ):
+            asyncio.run(instance.start(force_build=False))
+
+        ready_logs = [
+            log for log in instance.logger.info.call_args_list
+            if log.args and str(log.args[0]).startswith("YiCloud Sandbox ready")
+        ]
+        self.assertEqual(len(ready_logs), 1)
+        self.assertEqual(ready_logs[0].args[-2:], (125.0, 375.0))
+        self.assertEqual(instance._create_request_started_at, 10.0)
+
     def test_sdk_version_requires_region_aware_client(self):
-        with patch.object(yicloud_opensandbox, "version", return_value="0.4.1"):
-            yicloud_opensandbox._require_yicloud_sdk()
+        with patch.object(yicloud_client, "version", return_value="0.4.1"):
+            yicloud_client._require_yicloud_sdk()
         with (
-            patch.object(yicloud_opensandbox, "version", return_value="0.3.1"),
+            patch.object(yicloud_client, "version", return_value="0.3.1"),
             self.assertRaisesRegex(RuntimeError, "expected yicloud-sdk-python==0.4.1"),
         ):
-            yicloud_opensandbox._require_yicloud_sdk()
+            yicloud_client._require_yicloud_sdk()
 
     def test_exec_runtime_keeps_missing_environment_as_none(self) -> None:
-        command, env = yicloud_opensandbox._prepare_exec_runtime("true", None)
+        command, env = yicloud_execution._prepare_exec_runtime("true", None)
 
         self.assertEqual(command, "true")
         self.assertIsNone(env)
 
     def test_verifier_runtime_prepends_without_replacing_image_path(self) -> None:
-        wrapped, env = yicloud_opensandbox._prepare_exec_runtime(
+        wrapped, env = yicloud_execution._prepare_exec_runtime(
             'printf "%s\\n" "$PATH"',
             {
-                yicloud_opensandbox.VERIFIER_PATH_PREPEND_ENV: "/verifier/bin",
+                yicloud_execution.VERIFIER_PATH_PREPEND_ENV: "/verifier/bin",
                 "KEEP": "value",
             },
         )
@@ -318,19 +411,19 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             image_python.write_text("#!/bin/sh\nprintf 'image-python\\n'\n")
             image_python.chmod(0o755)
 
-            wrapped, env = yicloud_opensandbox._prepare_exec_runtime(
+            wrapped, env = yicloud_execution._prepare_exec_runtime(
                 "command -v python3 && python3",
                 {
-                    yicloud_opensandbox.VERIFIER_PATH_PREPEND_ENV: str(
+                    yicloud_execution.VERIFIER_PATH_PREPEND_ENV: str(
                         runtime_root / "bin"
                     ),
-                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ID_ENV: (
+                    yicloud_execution.VERIFIER_RUNTIME_BUNDLE_ID_ENV: (
                         "test-python-verifier-bundle"
                     ),
-                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV: str(
+                    yicloud_execution.VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV: str(
                         archive
                     ),
-                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ROOT_ENV: str(
+                    yicloud_execution.VERIFIER_RUNTIME_BUNDLE_ROOT_ENV: str(
                         runtime_root
                     ),
                 },
@@ -387,19 +480,19 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
                 self.assertIsNotNone(target)
                 os.symlink(target, tools / name)
 
-            wrapped, env = yicloud_opensandbox._prepare_exec_runtime(
+            wrapped, env = yicloud_execution._prepare_exec_runtime(
                 "python3",
                 {
-                    yicloud_opensandbox.VERIFIER_PATH_PREPEND_ENV: str(
+                    yicloud_execution.VERIFIER_PATH_PREPEND_ENV: str(
                         runtime_bin
                     ),
-                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ID_ENV: (
+                    yicloud_execution.VERIFIER_RUNTIME_BUNDLE_ID_ENV: (
                         "test-python-verifier-bundle"
                     ),
-                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV: str(
+                    yicloud_execution.VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV: str(
                         archive
                     ),
-                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ROOT_ENV: str(
+                    yicloud_execution.VERIFIER_RUNTIME_BUNDLE_ROOT_ENV: str(
                         runtime_root
                     ),
                 },
@@ -421,10 +514,10 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
     def test_verifier_runtime_bundle_settings_must_be_complete(self) -> None:
         with self.assertRaisesRegex(ValueError, "must be configured together"):
-            yicloud_opensandbox._prepare_exec_runtime(
+            yicloud_execution._prepare_exec_runtime(
                 "true",
                 {
-                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV: (
+                    yicloud_execution.VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV: (
                         "/runtime.tar.gz"
                     )
                 },
@@ -435,17 +528,17 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             root = Path(tmp)
             tools = root / "tools"
             tools.mkdir()
-            wrapped, env = yicloud_opensandbox._prepare_exec_runtime(
+            wrapped, env = yicloud_execution._prepare_exec_runtime(
                 "printf 'command-ran\\n'",
                 {
-                    yicloud_opensandbox.VERIFIER_PATH_PREPEND_ENV: str(tools),
-                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ID_ENV: (
+                    yicloud_execution.VERIFIER_PATH_PREPEND_ENV: str(tools),
+                    yicloud_execution.VERIFIER_RUNTIME_BUNDLE_ID_ENV: (
                         "test-python-verifier-bundle"
                     ),
-                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV: str(
+                    yicloud_execution.VERIFIER_RUNTIME_BUNDLE_ARCHIVE_ENV: str(
                         root / "missing.tar.gz"
                     ),
-                    yicloud_opensandbox.VERIFIER_RUNTIME_BUNDLE_ROOT_ENV: str(
+                    yicloud_execution.VERIFIER_RUNTIME_BUNDLE_ROOT_ENV: str(
                         root / "runtime" / "python3.12-runtime"
                     ),
                 },
@@ -520,7 +613,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             os.environ,
             {"YICLOUD_HARBOR_HOST": REGISTRY_HOST},
         ):
-            yicloud_opensandbox._validate_managed_image_ref(
+            yicloud_config._validate_managed_image_ref(
                 f"{REGISTRY_HOST}/seta/0@{digest}",
                 "test image",
             )
@@ -532,7 +625,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
                     RuntimeError,
                     "must use the configured OpenSandbox registry",
                 ):
-                    yicloud_opensandbox._validate_managed_image_ref(
+                    yicloud_config._validate_managed_image_ref(
                         ref,
                         "test image",
                     )
@@ -756,7 +849,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         )
         self.assertNotIn("\\n", block)
         self.assertIn(
-            f"printf '\\n{yicloud_opensandbox.HOSTS_BLOCK_END}\\n'",
+            f"printf '\\n{yicloud_services.HOSTS_BLOCK_END}\\n'",
             command,
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -778,10 +871,10 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             self.assertEqual(
                 rendered_hosts[-1],
                 "127.0.0.1 localhost\n"
-                f"{yicloud_opensandbox.HOSTS_BLOCK_BEGIN}\n"
+                f"{yicloud_services.HOSTS_BLOCK_BEGIN}\n"
                 "10.0.0.1 main api\n"
                 "10.0.0.2 worker database\n"
-                f"{yicloud_opensandbox.HOSTS_BLOCK_END}\n",
+                f"{yicloud_services.HOSTS_BLOCK_END}\n",
             )
 
     def test_bundle_healthcheck_retries_until_success(self) -> None:
@@ -794,7 +887,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         )
         sleep = AsyncMock()
 
-        with patch.object(yicloud_opensandbox.asyncio, "sleep", sleep):
+        with patch.object(yicloud_execution.asyncio, "sleep", sleep):
             asyncio.run(instance._wait_bundle_ready())
 
         self.assertEqual(instance._run_service_command.await_count, 2)
@@ -812,9 +905,9 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
         fake_time = SimpleNamespace(monotonic=lambda: clock.value)
         with (
-            patch.object(yicloud_opensandbox, "time", fake_time),
+            patch.object(yicloud_services, "time", fake_time),
             patch.object(
-                yicloud_opensandbox.asyncio,
+                yicloud_execution.asyncio,
                 "sleep",
                 side_effect=advance,
             ) as sleep,
@@ -1102,13 +1195,13 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
     def test_yicloud_image_ref_strips_only_registry_host(self) -> None:
         digest = "sha256:" + "a" * 64
         self.assertEqual(
-            yicloud_opensandbox._yicloud_image_ref(
+            yicloud_client._yicloud_image_ref(
                 f"harbor.example/seta/973@{digest}"
             ),
             f"seta/973@{digest}",
         )
         self.assertEqual(
-            yicloud_opensandbox._yicloud_image_ref(f"seta/973@{digest}"),
+            yicloud_client._yicloud_image_ref(f"seta/973@{digest}"),
             f"seta/973@{digest}",
         )
 
@@ -1147,7 +1240,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
         operation = Mock(side_effect=[TransientAuthError("auth"), "created"])
         with patch.object(
-            yicloud_opensandbox.asyncio,
+            yicloud_execution.asyncio,
             "sleep",
             new=AsyncMock(),
         ) as sleep:
@@ -1188,7 +1281,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         )
 
         with patch.object(
-            yicloud_opensandbox.asyncio,
+            yicloud_execution.asyncio,
             "sleep",
             new=AsyncMock(),
         ) as sleep:
@@ -1209,7 +1302,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         instance._ready_timeout_sec = 120
         instance._ping_execd_sync = Mock(
             side_effect=[
-                yicloud_opensandbox.requests.ConnectionError(
+                yicloud_execution.requests.ConnectionError(
                     "temporary gateway failure"
                 ),
                 None,
@@ -1218,7 +1311,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         instance.logger = Mock()
 
         with patch.object(
-            yicloud_opensandbox.asyncio,
+            yicloud_execution.asyncio,
             "sleep",
             new=AsyncMock(),
         ) as sleep:
@@ -1273,7 +1366,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         instance._access_token = "sandbox-token"
         instance._ready_timeout_sec = 7
         instance._ping_execd_sync = Mock(
-            side_effect=yicloud_opensandbox.requests.ConnectionError(
+            side_effect=yicloud_execution.requests.ConnectionError(
                 "temporary gateway failure"
             )
         )
@@ -1283,9 +1376,9 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         )
 
         with (
-            patch.object(yicloud_opensandbox, "time", fake_time),
+            patch.object(yicloud_services, "time", fake_time),
             patch.object(
-                yicloud_opensandbox.asyncio,
+                yicloud_execution.asyncio,
                 "sleep",
                 new=AsyncMock(),
             ),
@@ -1305,7 +1398,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
                 )
             },
         ):
-            result = yicloud_opensandbox._host_routable_proxy_url(proxy_url)
+            result = yicloud_client._host_routable_proxy_url(proxy_url)
 
         self.assertEqual(
             result,
@@ -1316,7 +1409,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
     def test_proxy_url_is_unchanged_without_an_origin_override(self) -> None:
         proxy_url = "https://sandbox.example/v1/sandboxes/sbx-1/ping"
         with patch.dict("os.environ", {}, clear=True):
-            result = yicloud_opensandbox._host_routable_proxy_url(proxy_url)
+            result = yicloud_client._host_routable_proxy_url(proxy_url)
         self.assertEqual(result, proxy_url)
 
     def test_s3_download_url_is_passed_as_environment_not_command_text(self) -> None:
@@ -1328,7 +1421,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         instance.exec = AsyncMock(
             return_value=SimpleNamespace(return_code=0, stdout="", stderr="")
         )
-        artifact = yicloud_opensandbox.S3UploadArtifact(
+        artifact = yicloud_transfer.S3UploadArtifact(
             kind="file",
             logical_digest="a" * 64,
             payload_digest="b" * 64,
@@ -1454,7 +1547,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         instance = object.__new__(
             yicloud_opensandbox.YiCloudOpenSandboxEnvironment
         )
-        artifact = yicloud_opensandbox.S3UploadArtifact(
+        artifact = yicloud_transfer.S3UploadArtifact(
             kind="file",
             logical_digest="a" * 64,
             payload_digest="b" * 64,
@@ -1523,6 +1616,118 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             instance._s3_upload_store.stage_directory.side_effect,
         )
 
+    def test_oracle_solution_can_bypass_s3_with_explicit_execd_backend(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._upload_backend = "s3"
+        instance._oracle_solution_upload_backend = "execd"
+        instance._s3_upload_store = SimpleNamespace(
+            stage_directory=Mock(side_effect=AssertionError("S3 must not be used"))
+        )
+        instance._upload_dir_http = AsyncMock()
+        instance.logger = Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "solution"
+            source.mkdir()
+            (source / "solve.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            asyncio.run(instance.upload_dir(source, "/solution"))
+
+        instance._upload_dir_http.assert_awaited_once_with(source, "/solution")
+        instance._s3_upload_store.stage_directory.assert_not_called()
+        log_call = instance.logger.info.call_args
+        self.assertEqual(
+            log_call.args[:2],
+            (
+                (
+                    "YiCloud upload complete backend=execd kind=directory "
+                    "purpose=oracle-solution target=%s elapsed_seconds=%.3f"
+                ),
+                "/solution",
+            ),
+        )
+        self.assertGreaterEqual(log_call.args[2], 0.001)
+
+    def test_oracle_solution_can_be_staged_for_inline_launch(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._upload_backend = "s3"
+        instance._oracle_solution_upload_backend = "inline"
+        instance._oracle_inline_max_bytes = 256 * 1024
+        instance._s3_upload_store = SimpleNamespace(
+            stage_directory=Mock(side_effect=AssertionError("S3 must not be used"))
+        )
+        instance._upload_dir_http = AsyncMock()
+        instance.logger = Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "solution"
+            source.mkdir()
+            solve = source / "solve.sh"
+            solve.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+            solve.chmod(0o755)
+            asyncio.run(instance.upload_dir(source, "/solution"))
+
+        payload = base64.b64decode(instance._oracle_inline_solution_payload)
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+            member = archive.extractfile("./solve.sh")
+            self.assertIsNotNone(member)
+            self.assertEqual(member.read(), b"#!/bin/sh\necho ok\n")
+        instance._s3_upload_store.stage_directory.assert_not_called()
+        instance._upload_dir_http.assert_not_awaited()
+        self.assertEqual(instance._oracle_inline_solution_file_count, 1)
+        self.assertEqual(instance._oracle_inline_solution_logical_bytes, 18)
+
+    def test_oracle_agent_log_reupload_can_be_skipped_explicitly(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._upload_backend = "s3"
+        instance._oracle_skip_agent_log_reupload = True
+        instance._s3_upload_store = SimpleNamespace(
+            stage_directory=Mock(side_effect=AssertionError("S3 must not be used"))
+        )
+        instance._upload_dir_http = AsyncMock()
+        instance.logger = Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "agent"
+            source.mkdir()
+            (source / "oracle.txt").write_text("done\n", encoding="utf-8")
+            asyncio.run(instance.upload_dir(source, "/logs/agent"))
+
+        instance._s3_upload_store.stage_directory.assert_not_called()
+        instance._upload_dir_http.assert_not_awaited()
+        instance.logger.info.assert_called_once_with(
+            "YiCloud upload skipped purpose=oracle-agent-log-reupload "
+            "target=%s",
+            "/logs/agent",
+        )
+
+    def test_oracle_agent_log_downloads_can_be_skipped_explicitly(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._oracle_skip_agent_log_transfer = True
+        instance._download_file_chunks = AsyncMock()
+        instance._download_dir_archive = AsyncMock()
+        instance.logger = Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            asyncio.run(
+                instance.download_file(
+                    "/logs/agent/oracle.txt",
+                    Path(tmp) / "oracle.txt",
+                )
+            )
+            asyncio.run(instance.download_dir("/logs/agent", Path(tmp) / "agent"))
+
+        instance._download_file_chunks.assert_not_awaited()
+        instance._download_dir_archive.assert_not_awaited()
+        self.assertEqual(instance.logger.info.call_count, 2)
+
     def test_s3_bootstrap_is_uploaded_once_only_when_native_tools_are_missing(
         self,
     ) -> None:
@@ -1564,7 +1769,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             await instance._ensure_s3_downloader(download_url)
 
         with patch.dict(
-            yicloud_opensandbox.os.environ,
+            yicloud_adapter.os.environ,
             {"YICLOUD_SANDBOX_FAST_UPLOAD_ORIGIN": ""},
         ):
             asyncio.run(ensure_twice())
@@ -1572,7 +1777,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         self.assertEqual(uploaded["count"], 1)
         self.assertEqual(
             uploaded["target_path"],
-            yicloud_opensandbox.S3_HTTP_BOOTSTRAP_PATH,
+            yicloud_transfer.S3_HTTP_BOOTSTRAP_PATH,
         )
         self.assertEqual(
             uploaded["upload_url"],
@@ -1583,7 +1788,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         self.assertIn(b"/dev/tcp/", uploaded["payload"])
         self.assertLess(len(uploaded["payload"]), 2048)
         self.assertIn(
-            yicloud_opensandbox.S3_HTTP_BOOTSTRAP_PATH,
+            yicloud_transfer.S3_HTTP_BOOTSTRAP_PATH,
             instance._s3_download_command(
                 SimpleNamespace(payload_size=12, payload_digest="b" * 64),
                 "/tmp/payload",
@@ -1600,7 +1805,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
                 ),
             ]
         )
-        environment_id = yicloud_opensandbox._environment_id_by_exact_name(
+        environment_id = yicloud_client._environment_id_by_exact_name(
             sandbox,
             "test-project",
             "dedicated-test-environment",
@@ -1611,14 +1816,14 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             EnvironmentId=environment_id,
             Image=SimpleNamespace(Ref="project/task:image"),
         )
-        yicloud_opensandbox._validate_sandbox_binding(
+        yicloud_client._validate_sandbox_binding(
             running,
             "env-dedicated",
             "project/task:image",
         )
         running.EnvironmentId = "env-other"
         with self.assertRaisesRegex(RuntimeError, "environment binding mismatch"):
-            yicloud_opensandbox._validate_sandbox_binding(
+            yicloud_client._validate_sandbox_binding(
                 running,
                 "env-dedicated",
                 "project/task:image",
@@ -1628,13 +1833,13 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         running.Image = SimpleNamespace(
             Ref="", Uri="harbor.example/project/task:image"
         )
-        yicloud_opensandbox._validate_sandbox_binding(
+        yicloud_client._validate_sandbox_binding(
             running,
             "env-dedicated",
             "harbor.example/project/task:image",
         )
         running.Image = SimpleNamespace(Ref="project/task:image", Uri="")
-        yicloud_opensandbox._validate_sandbox_binding(
+        yicloud_client._validate_sandbox_binding(
             running,
             "env-dedicated",
             "harbor.example/project/task:image",
@@ -1643,26 +1848,26 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             Ref="", Uri="registry-a.example/project/task:image"
         )
         with self.assertRaisesRegex(RuntimeError, "image binding mismatch"):
-            yicloud_opensandbox._validate_sandbox_binding(
+            yicloud_client._validate_sandbox_binding(
                 running,
                 "env-dedicated",
                 "registry-b.example/project/task:image",
             )
         running.Image = SimpleNamespace(Ref="ubuntu:22.04", Uri="")
         with self.assertRaisesRegex(RuntimeError, "image binding mismatch"):
-            yicloud_opensandbox._validate_sandbox_binding(
+            yicloud_client._validate_sandbox_binding(
                 running,
                 "env-dedicated",
                 "ubuntu:24.04",
             )
 
     def test_tag_only_image_aliases_do_not_contain_empty_ref(self) -> None:
-        aliases = yicloud_opensandbox._image_ref_aliases("ubuntu:24.04")
+        aliases = yicloud_client._image_ref_aliases("ubuntu:24.04")
 
         self.assertEqual(aliases, {"ubuntu:24.04"})
         self.assertFalse(
             aliases.intersection(
-                yicloud_opensandbox._image_ref_aliases("ubuntu:22.04")
+                yicloud_client._image_ref_aliases("ubuntu:22.04")
             )
         )
 
@@ -1687,7 +1892,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
         with (
             patch.object(
-                yicloud_opensandbox.requests,
+                yicloud_execution.requests,
                 "Session",
                 return_value=FakeSession(),
             ),
@@ -1734,7 +1939,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
                 with (
                     patch.object(
-                        yicloud_opensandbox.requests,
+                        yicloud_execution.requests,
                         "Session",
                         return_value=FakeSession(captured),
                     ),
@@ -1750,7 +1955,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
                 )
                 self.assertEqual(completed.returncode, expected_code)
                 self.assertIn(
-                    f"{yicloud_opensandbox.EXIT_MARKER}{expected_code}",
+                    f"{yicloud_execution.EXIT_MARKER}{expected_code}",
                     completed.stdout,
                 )
 
@@ -1775,7 +1980,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
             @property
             def text(self):
-                raise yicloud_opensandbox.requests.exceptions.ChunkedEncodingError(
+                raise yicloud_execution.requests.exceptions.ChunkedEncodingError(
                     "response ended prematurely"
                 )
 
@@ -1783,7 +1988,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             text = (
                 '{"type":"stdout","text":"ok"}\n'
                 '{"type":"stdout","text":"'
-                f"{yicloud_opensandbox.EXIT_MARKER}0"
+                f"{yicloud_execution.EXIT_MARKER}0"
                 '"}\n'
             )
 
@@ -1804,14 +2009,14 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
         with (
             patch.object(
-                yicloud_opensandbox.requests,
+                yicloud_execution.requests,
                 "Session",
                 side_effect=[
                     FakeSession(InterruptedResponse()),
                     FakeSession(SuccessResponse()),
                 ],
             ),
-            patch.object(yicloud_opensandbox.time, "sleep") as sleep,
+            patch.object(yicloud_execution.time, "sleep") as sleep,
         ):
             result = instance._run_command_sync("echo ok", "/", {}, 30)
 
@@ -1851,7 +2056,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
         with (
             patch.object(
-                yicloud_opensandbox.requests,
+                yicloud_execution.requests,
                 "Session",
                 return_value=FakeSession(),
             ),
@@ -1882,7 +2087,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("fallback", result.stdout)
-        self.assertIn(f"{yicloud_opensandbox.EXIT_MARKER}0", result.stdout)
+        self.assertIn(f"{yicloud_execution.EXIT_MARKER}0", result.stdout)
 
     def test_remote_exec_cleanup_uses_unwrapped_root_request(self) -> None:
         instance = object.__new__(
@@ -1908,7 +2113,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
                 return Response()
 
         with patch.object(
-            yicloud_opensandbox.requests,
+            yicloud_execution.requests,
             "Session",
             return_value=FakeSession(),
         ):
@@ -1928,7 +2133,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
                 SimpleNamespace(return_code=0, stdout="", stderr=""),
                 SimpleNamespace(
                     return_code=0,
-                    stdout=yicloud_opensandbox.DETACHED_PENDING_MARKER,
+                    stdout=yicloud_execution.DETACHED_PENDING_MARKER,
                     stderr="",
                 ),
                 SimpleNamespace(return_code=7, stdout="done", stderr="warn"),
@@ -1936,7 +2141,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         )
         instance._cleanup_remote_exec_paths_sync = Mock()
 
-        with patch.object(yicloud_opensandbox.time, "sleep") as sleep:
+        with patch.object(yicloud_execution.time, "sleep") as sleep:
             result = instance._run_command_sync(
                 "sleep 10; exit 7",
                 "/work",
@@ -1977,6 +2182,175 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         self.assertTrue(any(path.endswith(".launch") for path in cleanup_paths))
         sleep.assert_called_once()
 
+    def test_oracle_timing_forces_remote_start_marker_and_logs_latency(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._run_command_direct_sync = Mock(
+            side_effect=[
+                SimpleNamespace(return_code=0, stdout="", stderr=""),
+                SimpleNamespace(return_code=0, stdout="done", stderr=""),
+            ]
+        )
+        instance._cleanup_remote_exec_paths_sync = Mock()
+        instance._create_request_started_at = 10.0
+        instance._last_execd_response_received_at = 10.375
+        instance._sandbox_id = "sbx-test"
+        instance.logger = Mock()
+
+        with (
+            patch.dict(os.environ, YICLOUD_SANDBOX_ORACLE_TIMING="1"),
+            patch.object(
+                yicloud_execution.time,
+                "monotonic",
+                side_effect=[10.375, 20.0, 19.0],
+            ),
+        ):
+            result = instance._run_command_sync(
+                "(/solution/solve.sh) > /logs/agent/oracle.txt 2>&1",
+                "/app",
+                {},
+                60,
+                0,
+            )
+
+        self.assertEqual(result.stdout, "done")
+        launch_command = instance._run_command_direct_sync.call_args_list[0].args[0]
+        encoded_script = re.search(
+            r"printf %s ([A-Za-z0-9+/=]+) \| base64 -d",
+            launch_command,
+        )
+        self.assertIsNotNone(encoded_script)
+        child_script = base64.b64decode(encoded_script.group(1)).decode()
+        self.assertIn(".started.tmp", child_script)
+        self.assertIn('harbor_started_path=', launch_command)
+        self.assertIn('[ -f "$harbor_started_path" ]', launch_command)
+        instance.logger.info.assert_called_once_with(
+            "YiCloud Oracle process started sandbox_id=%s "
+            "create_to_oracle_start_ms=%.3f "
+            "observation=remote_pre_exec_marker "
+            "create_to_oracle_start_lower_bound_ms=%.3f "
+            "confirmation_window_ms=%.3f "
+            "ready_to_oracle_start_lower_bound_ms=%s "
+            "ready_to_oracle_start_ms=%s "
+            "initialized_to_oracle_start_lower_bound_ms=%s "
+            "remote_uptime_seconds=%s",
+            "sbx-test",
+            375.0,
+            375.0,
+            0.0,
+            "unknown",
+            "unknown",
+            "unknown",
+            "unknown",
+        )
+
+    def test_oracle_timing_does_not_treat_chmod_as_solution_start(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        expected = SimpleNamespace(return_code=0, stdout="", stderr="")
+        instance._run_command_direct_sync = Mock(return_value=expected)
+        instance._run_command_detached_sync = Mock()
+
+        with patch.dict(os.environ, YICLOUD_SANDBOX_ORACLE_TIMING="1"):
+            result = instance._run_command_sync(
+                "chmod +x /solution/solve.sh",
+                "/app",
+                {},
+                None,
+                0,
+            )
+
+        self.assertIs(result, expected)
+        instance._run_command_detached_sync.assert_not_called()
+
+    def test_oracle_inline_chmod_is_deferred_into_launch_request(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._oracle_inline_solution_payload = "payload"
+        instance._sandbox_id = "sbx-test"
+        instance.logger = Mock()
+        instance._run_command_direct_sync = Mock()
+
+        result = instance._run_command_sync(
+            "chmod +x /solution/solve.sh",
+            "/app",
+            {},
+            None,
+            0,
+        )
+
+        self.assertEqual(result.return_code, 0)
+        self.assertEqual(
+            instance._oracle_inline_chmod_command,
+            "chmod +x /solution/solve.sh",
+        )
+        instance._run_command_direct_sync.assert_not_called()
+
+    def test_oracle_inline_launch_reports_remote_payload_and_solve_timing(self) -> None:
+        instance = object.__new__(
+            yicloud_opensandbox.YiCloudOpenSandboxEnvironment
+        )
+        instance._oracle_inline_solution_payload = "cGF5bG9hZA=="
+        instance._oracle_inline_solution_archive_bytes = 7
+        instance._oracle_inline_solution_logical_bytes = 7
+        instance._oracle_inline_solution_file_count = 1
+        instance._oracle_inline_chmod_command = "chmod +x /solution/solve.sh"
+        instance._create_request_started_at = 10.0
+        instance._ready_observed_at = 10.2
+        instance._initialized_at = 10.3
+        instance._last_execd_response_received_at = 10.6
+        instance._sandbox_id = "sbx-test"
+        instance.logger = Mock()
+        instance._cleanup_remote_exec_paths_sync = Mock()
+        instance._run_command_direct_sync = Mock(
+            side_effect=[
+                SimpleNamespace(
+                    return_code=0,
+                    stdout=(
+                        f"{yicloud_execution.ORACLE_REMOTE_START_MARKER}123.00\n"
+                        f"{yicloud_execution.ORACLE_PAYLOAD_TIMING_MARKER}"
+                        "122.98 123.00\n"
+                    ),
+                    stderr="",
+                ),
+                SimpleNamespace(
+                    return_code=0,
+                    stdout=(
+                        f"{yicloud_execution.ORACLE_REMOTE_TIMING_MARKER}"
+                        "123.00 123.05 \ndone"
+                    ),
+                    stderr="",
+                ),
+            ]
+        )
+
+        with (
+            patch.dict(os.environ, YICLOUD_SANDBOX_ORACLE_TIMING="1"),
+            patch.object(
+                yicloud_execution.time,
+                "monotonic",
+                side_effect=[10.5, 20.0, 19.0],
+            ),
+        ):
+            result = instance._run_command_sync(
+                "(/solution/solve.sh) > /logs/agent/oracle.txt 2>&1",
+                "/app",
+                {},
+                60,
+                0,
+            )
+
+        launch_command = instance._run_command_direct_sync.call_args_list[0].args[0]
+        self.assertIn("tar xzf - -C /solution", launch_command)
+        self.assertIn("chmod +x /solution/solve.sh", launch_command)
+        self.assertEqual(result.stdout, "done")
+        messages = [call.args[0] for call in instance.logger.info.call_args_list]
+        self.assertTrue(any("payload materialized" in message for message in messages))
+        self.assertTrue(any("process finished" in message for message in messages))
+
     def test_detached_timeout_kills_process_tree_without_setsid(self) -> None:
         instance = object.__new__(
             yicloud_opensandbox.YiCloudOpenSandboxEnvironment
@@ -1990,7 +2364,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         instance._cleanup_remote_exec_paths_sync = Mock()
 
         with patch.object(
-            yicloud_opensandbox.time,
+            yicloud_execution.time,
             "monotonic",
             side_effect=[0, 2],
         ):
@@ -2034,12 +2408,12 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
         with (
             patch.object(
-                yicloud_opensandbox.uuid,
+                yicloud_execution.uuid,
                 "uuid4",
                 return_value=SimpleNamespace(hex=command_id),
             ),
             patch.object(
-                yicloud_opensandbox.time,
+                yicloud_execution.time,
                 "monotonic",
                 side_effect=[0, 2],
             ),
@@ -2121,12 +2495,12 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
         with (
             patch.object(
-                yicloud_opensandbox.uuid,
+                yicloud_execution.uuid,
                 "uuid4",
                 return_value=SimpleNamespace(hex=command_id),
             ),
             patch.object(
-                yicloud_opensandbox.time,
+                yicloud_execution.time,
                 "monotonic",
                 side_effect=[0, 2],
             ),
@@ -2235,7 +2609,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             return function(*args)
 
         with patch.object(
-            yicloud_opensandbox.asyncio,
+            yicloud_execution.asyncio,
             "to_thread",
             side_effect=run_inline,
         ):
@@ -2276,12 +2650,12 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
         with (
             patch.object(
-                yicloud_opensandbox.requests,
+                yicloud_execution.requests,
                 "Session",
                 return_value=FakeSession(),
             ),
             patch.object(
-                yicloud_opensandbox.asyncio,
+                yicloud_execution.asyncio,
                 "to_thread",
                 side_effect=run_inline,
             ),
@@ -2324,7 +2698,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             source.write_bytes(b"agent-package")
             source.chmod(0o755)
             with patch.object(
-                yicloud_opensandbox.subprocess,
+                yicloud_transfer.subprocess,
                 "run",
                 side_effect=fake_run,
             ):
@@ -2355,7 +2729,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
         )
 
         with patch.dict(
-            yicloud_opensandbox.os.environ,
+            yicloud_adapter.os.environ,
             {"YICLOUD_SANDBOX_FAST_UPLOAD_ORIGIN": ""},
         ):
             upload_url = instance._fast_upload_url()
@@ -2379,7 +2753,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             source.write_bytes(b"agent-package")
             with (
                 patch.object(
-                    yicloud_opensandbox.subprocess,
+                    yicloud_transfer.subprocess,
                     "run",
                     return_value=SimpleNamespace(
                         returncode=28,
@@ -2419,10 +2793,10 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             source.chmod(0o755)
             with (
                 patch.object(
-                    yicloud_opensandbox, "FAST_UPLOAD_CHUNK_BYTES", 4
+                    yicloud_transfer, "FAST_UPLOAD_CHUNK_BYTES", 4
                 ),
                 patch.dict(
-                    yicloud_opensandbox.os.environ,
+                    yicloud_adapter.os.environ,
                     {"YICLOUD_SANDBOX_FAST_UPLOAD_ORIGIN": ""},
                 ),
             ):
@@ -2457,7 +2831,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
             source.write_bytes(b"#!/bin/sh\n")
             source.chmod(0o755)
             with patch.object(
-                yicloud_opensandbox.asyncio,
+                yicloud_execution.asyncio,
                 "to_thread",
                 side_effect=run_inline,
             ):
@@ -2550,7 +2924,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
             def prepare_request(self, request):
                 return (
-                    yicloud_opensandbox.requests.sessions.Session()
+                    yicloud_execution.requests.sessions.Session()
                     .prepare_request(request)
                 )
 
@@ -2560,7 +2934,7 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
                 return FakeResponse()
 
         with patch.object(
-            yicloud_opensandbox.requests,
+            yicloud_execution.requests,
             "Session",
             FakeSession,
         ):
@@ -2606,25 +2980,25 @@ class YiCloudOpenSandboxTest(unittest.TestCase):
 
             def prepare_request(self, request):
                 return (
-                    yicloud_opensandbox.requests.sessions.Session()
+                    yicloud_execution.requests.sessions.Session()
                     .prepare_request(request)
                 )
 
             def send(self, prepared, timeout):
                 sends.append((prepared, timeout))
                 if len(sends) == 1:
-                    raise yicloud_opensandbox.requests.ConnectionError(
+                    raise yicloud_execution.requests.ConnectionError(
                         "response disconnected"
                     )
                 return FakeResponse()
 
         with (
             patch.object(
-                yicloud_opensandbox.requests,
+                yicloud_execution.requests,
                 "Session",
                 FakeSession,
             ),
-            patch.object(yicloud_opensandbox.time, "sleep") as sleep,
+            patch.object(yicloud_execution.time, "sleep") as sleep,
         ):
             instance._upload_chunk_sync(
                 b"agent-package",
@@ -2674,7 +3048,7 @@ class BoundedDownloadTests(unittest.IsolatedAsyncioTestCase):
         source = self.root / "source ' with spaces"
         target = self.root / "target"
         # Incompressible data spanning multiple transfer requests.
-        source.write_bytes(os.urandom(3 * yicloud_opensandbox.DOWNLOAD_CHUNK_BYTES + 37))
+        source.write_bytes(os.urandom(3 * yicloud_transfer.DOWNLOAD_CHUNK_BYTES + 37))
         target.write_bytes(b"old")
         target.chmod(0o640)
         await self.instance.download_file(str(source), target)
@@ -2683,7 +3057,7 @@ class BoundedDownloadTests(unittest.IsolatedAsyncioTestCase):
                              hashlib.file_digest(right, "sha256").digest())
         self.assertEqual(target.stat().st_mode & 0o777, 0o640)
         self.assertLessEqual(max(self.response_sizes),
-                             4 * ((yicloud_opensandbox.DOWNLOAD_CHUNK_BYTES + 2) // 3))
+                             4 * ((yicloud_transfer.DOWNLOAD_CHUNK_BYTES + 2) // 3))
         self.assertFalse(list(self.root.glob("*.part")))
 
     async def test_file_symlink_uses_referent_size(self):

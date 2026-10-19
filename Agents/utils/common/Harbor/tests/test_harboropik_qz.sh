@@ -36,6 +36,8 @@ run_dry() {
   local qz_node_dist_url="${9:-}"
   local qz_template_map="${10:-}"
   env -i \
+    AGENT_FLEET_CONFIG_LOADED_ROOT="$(cd "$HARBOR_DIR/../../../.." && pwd)" \
+    OPIK_URL= \
     AGENT="$agent" \
     HARBOR_FORCE_BUILD="$force_build" \
     QZ_SANDBOX_TIMEOUT_SEC="$qz_timeout" \
@@ -227,6 +229,8 @@ grep -F -- "CC_NODE_DIST_URL=$upstream_node_url" <<< "$upstream_run" >/dev/null
 # default. Non-qz Harbor backends preserve their explicit npmjs default.
 non_qz_registry="$(
   env -i \
+    AGENT_FLEET_CONFIG_LOADED_ROOT="$(cd "$HARBOR_DIR/../../../.." && pwd)" \
+    OPIK_URL= \
     PATH="$tmp/bin:/usr/bin:/bin" \
     HOME="$tmp/home" \
     AGENT_FLEET_PATHS_FILE="$tmp/no-paths" \

@@ -49,20 +49,23 @@ printf 'FROM alpine:3.20\n' > "$tmp/dataset/1/environment/Dockerfile"
 printf 'fake package\n' > "$tmp/deps/claude.tgz"
 printf 'fake wheel\n' > "$tmp/deps/wheels/dependency.whl"
 printf '# fake Claude Opik hook\n' > "$tmp/deps/claude_realtime_trace.py"
-mkdir -p "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin"
-printf 'target-system-libraries\n' \
-  > "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/.harbor-python-runtime-v2"
-printf '#!/bin/sh\nexit 0\n' \
-  > "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python3.12"
-printf '#!/bin/sh\nexit 0\n' \
-  > "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/harbor-verifier-bundle-check"
-chmod +x \
-  "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python3.12" \
-  "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/harbor-verifier-bundle-check"
-ln -s python3.12 "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python3"
-ln -s python3.12 "$tmp/verifier-bundle/agent-fleet-swe-rebench-v2-verifier-bundle/bin/python"
-tar -czf "$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" \
-  -C "$tmp/verifier-bundle" agent-fleet-swe-rebench-v2-verifier-bundle
+# Reuse the current static runtime fixture; the old marker-only archive is invalid.
+PYTHONPATH="$(cd "$HARBOR_DIR/../../../.." && pwd)" "$MANAGER_PYTHON" - \
+  "$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz" <<'PYTHON'
+from pathlib import Path
+import sys
+from Agents.utils.common.Harbor.tests.test_swe_rebench_v2_bundle_preparer import (
+    SweRebenchV2BundlePreparerTest,
+    swe_rebench_v2_bundle_preparer,
+)
+
+fixture = SweRebenchV2BundlePreparerTest()
+fixture.setUp()
+try:
+    swe_rebench_v2_bundle_preparer.build(fixture.python_runtime, Path(sys.argv[1]))
+finally:
+    fixture.tearDown()
+PYTHON
 bundled_web_mcp="$(python3 "$HARBOR_DIR/../mcp/build.py" "$tmp/deps/wheels")"
 printf 'fake python runtime\n' > "$tmp/deps/wheels/dsh-sdk-minimal-python3.12-runtime.tar.gz"
 printf 'fake sdk minimal runtime\n' > "$tmp/deps/wheels/dsh-sdk-minimal-runtime-dsh-v0.1.3-alpha.1.tar.gz"
@@ -94,6 +97,7 @@ run_dry() {
   env -i \
     PATH="$tmp/bin:/usr/bin:/bin" \
     HOME="$tmp/home" \
+    AGENT_FLEET_CONFIG_LOADED_ROOT="$(cd "$HARBOR_DIR/../../../.." && pwd)" \
     AGENT_FLEET_CACHE_DIR="$tmp/cache" \
     AGENT="$agent" \
     DATASET_NAME="$dataset_name" \
@@ -126,6 +130,8 @@ run_dry() {
     HARBOR_CC_CLAUDE_TGZ_SOURCE="$tmp/deps/claude.tgz" \
     HARBOR_CC_PY_WHEEL_DIR_SOURCE="$tmp/deps/wheels" \
     HARBOR_CC_WEB_MCP_ENABLED="${RUN_DRY_WEB_MCP_ENABLED:-0}" \
+    HARBOR_ORACLE_VERIFIER_UV_BACKUP_ENABLED="${RUN_DRY_ORACLE_VERIFIER_UV_BACKUP_ENABLED:-1}" \
+    HARBOR_ORACLE_DISABLE_VERIFICATION="${RUN_DRY_ORACLE_DISABLE_VERIFICATION:-0}" \
     LOCAL_WHEEL_DIR="$tmp/deps/wheels" \
     EXA_API_KEY="${RUN_DRY_EXA_API_KEY:-}" \
     HARBOR_ENVIRONMENT_TYPE="$environment_type" \
@@ -169,6 +175,30 @@ if grep -F -- 'FAKE_HARBOR_ARG=PATH=' <<< "$automatic" >/dev/null; then
   echo 'OpenSandbox verifier unexpectedly replaces the task image PATH' >&2
   exit 1
 fi
+
+oracle_without_uv_backup="$(
+  RUN_DRY_ORACLE_VERIFIER_UV_BACKUP_ENABLED=0 \
+    run_dry '' "$HARBOR_DIR/task_image_manager/task_cli.py" '{}'
+)"
+grep -F -- '[INFO] Oracle verifier uv backup disabled; only task tests will be uploaded' \
+  <<< "$oracle_without_uv_backup" >/dev/null
+if grep -F -- '--mounts-json' <<< "$oracle_without_uv_backup" >/dev/null; then
+  echo 'Oracle without verifier uv backup unexpectedly mounts verifier runtime data' >&2
+  exit 1
+fi
+if grep -F -- 'HARBOR_VERIFIER_UV_BIN_DIR=' <<< "$oracle_without_uv_backup" >/dev/null; then
+  echo 'Oracle without verifier uv backup unexpectedly configures verifier uv tools' >&2
+  exit 1
+fi
+
+oracle_performance_only="$(
+  RUN_DRY_ORACLE_VERIFIER_UV_BACKUP_ENABLED=0 \
+    RUN_DRY_ORACLE_DISABLE_VERIFICATION=1 \
+    run_dry '' "$HARBOR_DIR/task_image_manager/task_cli.py" '{}'
+)"
+grep -F -- '[INFO] Oracle verification disabled for isolated performance timing' \
+  <<< "$oracle_performance_only" >/dev/null
+grep -F -- '--disable-verification' <<< "$oracle_performance_only" >/dev/null
 
 rebench="$(run_dry \
   'test-project/manual:immutable' "$tmp/does-not-exist.py" '{}' \
@@ -340,9 +370,9 @@ grep -F -- "$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bun
 docker_rebench_opencode="$(run_dry \
   '' "$tmp/does-not-exist.py" '{}' agent-fleet-swe-rebench-v2 docker 0 \
   opencode)"
-grep -F -- "\"source\":\"$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz\"" \
+grep -F -- "\"source\": \"$tmp/cache/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz\"" \
   <<< "$docker_rebench_opencode" >/dev/null
-grep -F -- '"target":"/opt/agent-fleet/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz"' \
+grep -F -- '"target": "/opt/agent-fleet/verifier-runtimes/agent-fleet-swe-rebench-v2-verifier-bundle.tar.gz"' \
   <<< "$docker_rebench_opencode" >/dev/null
 
 e2b_rebench="$(run_dry \

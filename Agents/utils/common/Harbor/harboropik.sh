@@ -999,11 +999,15 @@ run_oracle_task() {
   fi
   mkdir -p "$out_dir"
 
-  VERIFIER_UV_BIN_DIR_SOURCE="$(mktemp -d "${RUNTIME_DIR%/}/verifier-uv.oracle.XXXXXX" 2>/dev/null || true)"
-  if [[ -n "$VERIFIER_UV_BIN_DIR_SOURCE" ]]; then
-    prepare_verifier_uv_bin "$VERIFIER_UV_BIN_DIR_SOURCE" || true
+  if [[ "$HARBOR_ORACLE_VERIFIER_UV_BACKUP_ENABLED" == "1" ]]; then
+    VERIFIER_UV_BIN_DIR_SOURCE="$(mktemp -d "${RUNTIME_DIR%/}/verifier-uv.oracle.XXXXXX" 2>/dev/null || true)"
+    if [[ -n "$VERIFIER_UV_BIN_DIR_SOURCE" ]]; then
+      prepare_verifier_uv_bin "$VERIFIER_UV_BIN_DIR_SOURCE" || true
+    else
+      echo "[WARN] failed to create verifier uv backup dir; verifier will use its normal uv install path" >&2
+    fi
   else
-    echo "[WARN] failed to create verifier uv backup dir; verifier will use its normal uv install path" >&2
+    echo "[INFO] Oracle verifier uv backup disabled; only task tests will be uploaded"
   fi
   configure_e2b_verifier_tool_upload
 
@@ -1023,6 +1027,10 @@ run_oracle_task() {
     --timeout-multiplier "$HARBOR_TIMEOUT_MULTIPLIER"
     --agent-setup-timeout-multiplier "$HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER"
   )
+  if [[ "$HARBOR_ORACLE_DISABLE_VERIFICATION" == "1" ]]; then
+    cmd+=( --disable-verification )
+    echo "[INFO] Oracle verification disabled for isolated performance timing"
+  fi
   if [[ "$HARBOR_NATIVE_CONCURRENCY" == "1" ]] && ! harbor_uses_registry_dataset; then
     append_native_task_config
   elif harbor_uses_local_opensandbox_dataset; then

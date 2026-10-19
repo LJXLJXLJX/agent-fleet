@@ -297,18 +297,7 @@ while true; do
       export PI_MODELS_CONFIG=""
       export PI_SETTINGS_CONFIG=""
     fi
-    export HARBOR_ENVIRONMENT_TYPE="$environment_type"
-    if [[ "$environment_type" == "e2b" && -n "${HARBOR_E2B_PREBUILT_TEMPLATE:-}" ]]; then
-      export HARBOR_ENVIRONMENT_SPEC="$HARBOR_E2B_PREBUILT_ENVIRONMENT_SPEC"
-    elif [[ "$environment_type" == "opensandbox" ]]; then
-      export HARBOR_ENVIRONMENT_SPEC="yicloud_opensandbox:YiCloudOpenSandboxEnvironment"
-    elif [[ "$environment_type" == "qz" ]]; then
-      export HARBOR_ENVIRONMENT_SPEC="qz_e2b_sandbox:QzSandboxEnvironment"
-    elif [[ "$environment_type" != "${RL_ENVIRONMENT_TYPE:-docker}" ]]; then
-      # A per-request backend override must not inherit the listener's default
-      # environment import path.
-      export HARBOR_ENVIRONMENT_SPEC="$environment_type"
-    fi
+    harbor_resolve_backend_plan --rollout-environment-type "$environment_type" || exit 1
     if ! prepare_request_verifier_runtime_bundle "$dataset_name"; then
       echo "[ERROR] failed to prepare verifier runtime bundle for request backend: $environment_type" >&2
       exit 1

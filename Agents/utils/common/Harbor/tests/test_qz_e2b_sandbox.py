@@ -13,7 +13,9 @@ from typing import ClassVar
 from unittest.mock import Mock, patch
 
 HARBOR_DIR = Path(__file__).resolve().parents[1]
-MODULE_PATH = HARBOR_DIR / "qz_e2b_sandbox.py"
+MODULE_PATH = (
+    HARBOR_DIR / "harbor_environment_adapters/providers/e2b_series/qz_legacy/adapter.py"
+)
 sys.path.insert(0, str(HARBOR_DIR))
 
 import qz_template_manager as template_manager
@@ -48,9 +50,7 @@ def install_harbor_stubs() -> None:
             self.session_id = "test-session"
             self.network_policy = types.SimpleNamespace(network_mode="allow")
             self._workdir = Path("/dockerfile-workdir")
-            self.task_env_config = types.SimpleNamespace(
-                workdir="/task-config-workdir"
-            )
+            self.task_env_config = types.SimpleNamespace(workdir="/task-config-workdir")
 
         async def start(self, force_build: bool) -> None:
             type(self).start_calls.append(force_build)
@@ -83,7 +83,10 @@ def install_harbor_stubs() -> None:
 
 def load_module():
     install_harbor_stubs()
-    spec = importlib.util.spec_from_file_location("qz_e2b_sandbox", MODULE_PATH)
+    spec = importlib.util.spec_from_file_location(
+        "harbor_environment_adapters.providers.e2b_series.qz_legacy.adapter",
+        MODULE_PATH,
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
