@@ -48,6 +48,7 @@ scripts/logs/
 .pi-subagents/
 
 # Local agent review and planning artifacts
+/wip/
 review-outputs/
 docs/superpowers/
 docs/CODE_REVIEW_*.md
