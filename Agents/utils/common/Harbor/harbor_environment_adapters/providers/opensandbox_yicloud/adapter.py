@@ -11,7 +11,6 @@ from harbor.environments.capabilities import (
     EnvironmentCapabilities,
     EnvironmentResourceCapabilities,
 )
-from opensandbox_s3_upload import S3UploadStore
 
 from .client import YiCloudClientMixin, _require_yicloud_sdk, _yicloud_image_ref
 from .config import (
@@ -23,6 +22,7 @@ from .config import (
 )
 from .execution import YiCloudExecutionMixin
 from .lifecycle import YiCloudLifecycleMixin
+from .s3_transfer import S3UploadStore
 from .services import ServiceRuntime, YiCloudServicesMixin
 from .transfer import YiCloudTransferMixin
 

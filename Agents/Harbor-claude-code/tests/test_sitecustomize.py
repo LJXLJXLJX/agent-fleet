@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -335,11 +336,11 @@ class ClaudeInstallCommandTest(unittest.TestCase):
         )
         self.assertIn(
             "if [ -f "
-            "/opt/tb-opik/python-wheels/node-runtime.tar.xz ]",
+            "/opt/tb-opik/python-wheels/node-runtime.tar.gz ]",
             command,
         )
         self.assertIn(
-            "tar -xJf /opt/tb-opik/python-wheels/node-runtime.tar.xz "
+            "tar -xzf /opt/tb-opik/python-wheels/node-runtime.tar.gz "
             '-C "$node_dir"',
             command,
         )
@@ -419,10 +420,15 @@ class ClaudeInstallCommandTest(unittest.TestCase):
     def test_s3_node_runtime_does_not_reenter_package_manager_fallback(self) -> None:
         self._assert_isolated_node_install(corrupt_cache=False)
 
+    def test_s3_gzip_node_runtime_installs_without_python_or_xz(self) -> None:
+        self._assert_isolated_node_install(corrupt_cache=False, minimal_path=True)
+
     def test_corrupt_node_cache_uses_configured_dist_before_failing(self) -> None:
         self._assert_isolated_node_install(corrupt_cache=True)
 
-    def _assert_isolated_node_install(self, *, corrupt_cache: bool) -> None:
+    def _assert_isolated_node_install(
+        self, *, corrupt_cache: bool, minimal_path: bool = False
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             runtime_bin = root / "node-v22.23.2-linux-x64" / "bin"
@@ -452,8 +458,8 @@ class ClaudeInstallCommandTest(unittest.TestCase):
 
             wheel_dir = root / "wheels"
             wheel_dir.mkdir()
-            node_archive = wheel_dir / "node-runtime.tar.xz"
-            with tarfile.open(node_archive, "w:xz") as archive:
+            node_archive = wheel_dir / "node-runtime.tar.gz"
+            with tarfile.open(node_archive, "w:gz") as archive:
                 archive.add(runtime_bin.parent, arcname=runtime_bin.parent.name)
 
             claude_tgz = root / "claude-code.tgz"
@@ -478,6 +484,24 @@ class ClaudeInstallCommandTest(unittest.TestCase):
                 f"#!/bin/sh\ntouch {shlex.quote(str(apt_marker))}\nexit 97\n"
             )
             fake_apt.chmod(0o755)
+            if minimal_path:
+                for name in (
+                    "chmod",
+                    "cp",
+                    "dirname",
+                    "find",
+                    "gzip",
+                    "ln",
+                    "mkdir",
+                    "mktemp",
+                    "mv",
+                    "sleep",
+                    "tar",
+                ):
+                    source = shutil.which(name)
+                    self.assertIsNotNone(source)
+                    assert source is not None
+                    (fake_bin / name).symlink_to(source)
             if corrupt_cache:
                 # Even a usable system Node must not bypass the isolated fallback.
                 for name in ("node", "npm"):
@@ -487,14 +511,18 @@ class ClaudeInstallCommandTest(unittest.TestCase):
             home = root / "home"
             home.mkdir()
             result = subprocess.run(
-                ["bash", "-c", command],
+                ["/bin/bash", "-c", command],
                 text=True,
                 capture_output=True,
                 check=False,
                 env={
                     **os.environ,
                     "HOME": str(home),
-                    "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                    "PATH": (
+                        str(fake_bin)
+                        if minimal_path
+                        else f"{fake_bin}:{os.environ['PATH']}"
+                    ),
                     "PYTHONWARNINGS": "error",
                 },
             )
@@ -556,7 +584,7 @@ class ClaudeInstallCommandTest(unittest.TestCase):
                     binary.write_text("#!/bin/sh\nexit " + ("0\n" if failure == "corrupt-cache" else "1\n"))
                     binary.chmod(0o755)
                 system_node = (binaries / "node").read_bytes()
-                node_archive = wheels / "node-runtime.tar.xz"
+                node_archive = wheels / "node-runtime.tar.gz"
                 extra_env = {
                     "CC_OPIK_ENABLE_HOOK": "false",
                     "CC_OPIK_PY_WHEEL_DIR": str(wheels),
@@ -569,10 +597,10 @@ class ClaudeInstallCommandTest(unittest.TestCase):
                     download.write_bytes(b"not an archive")
                     extra_env["CC_NODE_DIST_URL"] = download.as_uri()
                 elif failure == "invalid-node":
-                    with tarfile.open(node_archive, "w:xz") as archive:
+                    with tarfile.open(node_archive, "w:gz") as archive:
                         archive.add(binaries / "node", arcname="node-runtime/bin/node")
                 elif failure == "unsafe-link":
-                    with tarfile.open(node_archive, "w:xz") as archive:
+                    with tarfile.open(node_archive, "w:gz") as archive:
                         link = tarfile.TarInfo("node-runtime/bin/node")
                         link.type = tarfile.SYMTYPE
                         link.linkname = str(binaries / "node")

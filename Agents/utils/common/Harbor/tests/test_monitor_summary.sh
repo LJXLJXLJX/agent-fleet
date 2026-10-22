@@ -55,6 +55,7 @@ start_fake_wheel_server() {
   local srv="$TEST_TMP_DIR/wheelsrv"
   mkdir -p "$srv"
   printf 'cache_schema=3\n' > "$srv/manifest.txt"
+  : > "$srv/node-runtime.tar.gz"
   : > "$srv/claude-code-test.tgz"
   : > "$srv/npm-cache-ready"
 

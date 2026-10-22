@@ -21,11 +21,11 @@ from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from artifact_collection import artifact_download_slot
-from opensandbox_packing import pack_directory, pack_directory_async
-from opensandbox_s3_upload import S3UploadArtifact, S3UploadStore
 
 from .config import _positive_int
 from .execution import _execd_request_attempts, _retryable_execd_error
+from .packing import pack_directory, pack_directory_async
+from .s3_transfer import S3UploadArtifact, S3UploadStore
 
 UPLOAD_CHUNK_BYTES = 512 * 1024
 

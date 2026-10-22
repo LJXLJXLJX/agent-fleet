@@ -131,7 +131,7 @@ class Config:
                 _value(
                     values,
                     "NODE_RUNTIME_TARBALL",
-                    str(wheel_dir / "node-runtime.tar.xz"),
+                    str(wheel_dir / "node-runtime.tar.gz"),
                 )
             ),
             npm_registry_url=_value(

@@ -395,7 +395,7 @@ class OpikOpenCodeHarbor(OpenCode):
                     "}; "
                     "wheel_dir=\"${CC_OPIK_PY_WHEEL_DIR:-/opt/tb-opik/python-wheels}\"; "
                     "wheel_url=\"${HARBOR_LOCAL_WHEEL_SERVER_URL:-}\"; "
-                    "node_tgz=\"$wheel_dir/node-runtime.tar.xz\"; "
+                    "node_tgz=\"$wheel_dir/node-runtime.tar.gz\"; "
                     "opencode_tgz=\"${OPENCODE_TGZ_PATH:-}\"; "
                     "opencode_linux_x64_tgz=\"${OPENCODE_LINUX_X64_TGZ_PATH:-}\"; "
                     "opencode_name=\"opencode-ai-${opencode_version}.tgz\"; "

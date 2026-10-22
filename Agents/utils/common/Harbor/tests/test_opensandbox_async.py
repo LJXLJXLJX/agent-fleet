@@ -12,7 +12,7 @@ from unittest.mock import patch
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from opensandbox_async import (  # noqa: E402
+from harbor_environment_adapters.providers.opensandbox_yicloud.async_commands import (  # noqa: E402
     AsyncCommandRunner,
     CommandProtocolError,
     CommandSubmissionUnknown,
@@ -29,7 +29,7 @@ class SharedConnectionCapacityTest(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200)
 
         client = httpx.AsyncClient
-        with patch("opensandbox_async.httpx.AsyncClient", side_effect=lambda **kwargs:
+        with patch("harbor_environment_adapters.providers.opensandbox_yicloud.async_commands.httpx.AsyncClient", side_effect=lambda **kwargs:
                    client(transport=httpx.MockTransport(handle), **kwargs)):
             transport = _SharedTransport()
         try:

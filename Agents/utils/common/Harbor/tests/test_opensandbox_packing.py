@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import opensandbox_packing as packing
+from harbor_environment_adapters.providers.opensandbox_yicloud import packing
 
 
 class PackingTest(unittest.IsolatedAsyncioTestCase):

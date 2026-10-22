@@ -30,8 +30,12 @@ harbor_ensure_local_wheels_server() {
     local agent_tgz
     agent_tgz="$(harbor_agent_tgz_basename)"
 
-    # Treat wheel servers without the selected agent tgz as incomplete.
-    local urls=("${HARBOR_LOCAL_WHEEL_SERVER_URL%/}/manifest.txt" "${HARBOR_LOCAL_WHEEL_SERVER_URL%/}/${agent_tgz}")
+    # Require both the shared gzip Node runtime and the selected agent package.
+    local urls=(
+      "${HARBOR_LOCAL_WHEEL_SERVER_URL%/}/manifest.txt"
+      "${HARBOR_LOCAL_WHEEL_SERVER_URL%/}/node-runtime.tar.gz"
+      "${HARBOR_LOCAL_WHEEL_SERVER_URL%/}/${agent_tgz}"
+    )
     if harbor_agent_is_opencode; then
       urls+=("${HARBOR_LOCAL_WHEEL_SERVER_URL%/}/${OPENCODE_LINUX_X64_TGZ_BASENAME}")
     elif harbor_agent_is_pi; then
@@ -133,7 +137,7 @@ harbor_local_cache_ready() {
     && grep -qx 'cache_schema=3' "$LOCAL_WHEEL_DIR/manifest.txt" \
     && [[ "$(find "$LOCAL_WHEEL_DIR" -maxdepth 1 -name 'opik-*.whl' -type f | wc -l | tr -d ' ')" == "1" ]] \
     && [[ -f "$LOCAL_WHEEL_DIR/get-pip.py" ]] \
-    && harbor_tar_file_ready "$LOCAL_WHEEL_DIR/node-runtime.tar.xz" \
+    && harbor_tar_file_ready "$LOCAL_WHEEL_DIR/node-runtime.tar.gz" \
     && harbor_python_runtime_archive_ready "$LOCAL_WHEEL_DIR/python3.12-runtime.tar.gz" \
     && {
       if harbor_agent_is_opencode; then
@@ -186,7 +190,7 @@ harbor_pick_remote_wheel_url() {
     [[ -n "${candidate:-}" ]] || continue
     local agent_tgz
     agent_tgz="$(harbor_agent_tgz_basename)"
-    local urls=("${candidate%/}/${agent_tgz}")
+    local urls=("${candidate%/}/node-runtime.tar.gz" "${candidate%/}/${agent_tgz}")
     if harbor_agent_is_opencode; then
       urls+=("${candidate%/}/${OPENCODE_LINUX_X64_TGZ_BASENAME}")
     else
@@ -246,8 +250,11 @@ harbor_apply_effective_wheel_source() {
 harbor_prewarm_s3_upload_sources() {
   local -a sources=("$@")
   echo "prewarming immutable OpenSandbox S3 objects..."
-  if python3 "$SCRIPT_DIR/opensandbox_s3_upload.py" preflight \
-    && python3 "$SCRIPT_DIR/opensandbox_s3_upload.py" prewarm "${sources[@]}"; then
+  if PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+      python3 -m harbor_environment_adapters.providers.opensandbox_yicloud.s3_transfer preflight \
+    && PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+      python3 -m harbor_environment_adapters.providers.opensandbox_yicloud.s3_transfer \
+        prewarm "${sources[@]}"; then
     return 0
   fi
   if [[ "$YICLOUD_SANDBOX_UPLOAD_BACKEND" == "auto" ]]; then

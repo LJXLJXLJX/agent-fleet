@@ -857,7 +857,7 @@ class YiCloudExecutionMixin:
         timeout_sec: int | None,
         uid: int | None = None,
     ) -> ExecResult:
-        from opensandbox_async import AsyncCommandRunner
+        from .async_commands import AsyncCommandRunner
 
         if getattr(self, "_async_commands_stopping", False):
             raise RuntimeError("YiCloud async command environment is stopping")

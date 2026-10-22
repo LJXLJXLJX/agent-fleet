@@ -21,10 +21,14 @@ SCRIPT_DIR="$HARBOR_DIR"
 verifier_runtime_bundle_required() { return 1; }
 
 # Simulate an unavailable S3 prewarm without touching external state.
-python3() { return 1; }
+python3() {
+  printf 'PYTHON_ARGS=%s\n' "$*" >&2
+  return 1
+}
 
 output="$(harbor_prewarm_s3_upload_cache 2>&1)"
 grep -Fx -- 'prewarming immutable OpenSandbox S3 objects...' <<< "$output" >/dev/null
+grep -Fx -- 'PYTHON_ARGS=-m harbor_environment_adapters.providers.opensandbox_yicloud.s3_transfer preflight' <<< "$output" >/dev/null
 grep -Fx -- '[WARN] OpenSandbox S3 attempt failed backend=auto phase=prewarm; runtime will retry S3 and warn before any HTTP fallback' <<< "$output" >/dev/null
 
 echo 'OpenSandbox S3 auto fallback warning test passed.'

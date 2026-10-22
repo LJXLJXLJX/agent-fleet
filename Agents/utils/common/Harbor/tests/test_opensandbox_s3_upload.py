@@ -13,7 +13,7 @@ HARBOR_DIR = Path(__file__).resolve().parents[1]
 if str(HARBOR_DIR) not in os.sys.path:
     os.sys.path.insert(0, str(HARBOR_DIR))
 
-from opensandbox_s3_upload import (
+from harbor_environment_adapters.providers.opensandbox_yicloud.s3_transfer import (
     S3UploadStore,
     S3WriteUnavailableError,
     _direct_urlopen,
@@ -52,7 +52,7 @@ class S3UploadStoreTest(unittest.TestCase):
         request = Request("http://ceph.example/cache/object", method="HEAD")
 
         with patch(
-            "opensandbox_s3_upload.build_opener", return_value=opener
+            "harbor_environment_adapters.providers.opensandbox_yicloud.s3_transfer.build_opener", return_value=opener
         ) as build:
             self.assertIs(_direct_urlopen(request, 15), response)
 
@@ -134,7 +134,7 @@ class S3UploadStoreTest(unittest.TestCase):
 
             with (
                 patch(
-                    "opensandbox_s3_upload._direct_urlopen",
+                    "harbor_environment_adapters.providers.opensandbox_yicloud.s3_transfer._direct_urlopen",
                     return_value=self.anonymous_response(
                         source.stat().st_size
                     ),
@@ -165,7 +165,7 @@ class S3UploadStoreTest(unittest.TestCase):
 
             with (
                 patch(
-                    "opensandbox_s3_upload._direct_urlopen", side_effect=missing
+                    "harbor_environment_adapters.providers.opensandbox_yicloud.s3_transfer._direct_urlopen", side_effect=missing
                 ),
                 self.assertRaises(S3WriteUnavailableError),
             ):
@@ -189,9 +189,9 @@ class S3UploadStoreTest(unittest.TestCase):
 
             with (
                 patch(
-                    "opensandbox_s3_upload._direct_urlopen", side_effect=missing
+                    "harbor_environment_adapters.providers.opensandbox_yicloud.s3_transfer._direct_urlopen", side_effect=missing
                 ),
-                patch("opensandbox_s3_upload.subprocess.run") as run,
+                patch("harbor_environment_adapters.providers.opensandbox_yicloud.s3_transfer.subprocess.run") as run,
                 self.assertRaises(PermissionError),
             ):
                 store.stage_file(source)
@@ -209,12 +209,12 @@ class S3UploadStoreTest(unittest.TestCase):
 
             with (
                 patch(
-                    "opensandbox_s3_upload._direct_urlopen",
+                    "harbor_environment_adapters.providers.opensandbox_yicloud.s3_transfer._direct_urlopen",
                     return_value=self.anonymous_response(
                         source.stat().st_size
                     ),
                 ),
-                patch("opensandbox_s3_upload.subprocess.run") as run,
+                patch("harbor_environment_adapters.providers.opensandbox_yicloud.s3_transfer.subprocess.run") as run,
             ):
                 store.stage_file(source)
 
@@ -273,7 +273,7 @@ class S3UploadStoreTest(unittest.TestCase):
 
             with (
                 patch(
-                    "opensandbox_s3_upload._direct_urlopen",
+                    "harbor_environment_adapters.providers.opensandbox_yicloud.s3_transfer._direct_urlopen",
                     side_effect=[
                         forbidden,
                         self.anonymous_response(source.stat().st_size),
@@ -321,7 +321,7 @@ class S3UploadStoreTest(unittest.TestCase):
 
             with (
                 patch(
-                    "opensandbox_s3_upload._direct_urlopen",
+                    "harbor_environment_adapters.providers.opensandbox_yicloud.s3_transfer._direct_urlopen",
                     side_effect=forbidden,
                 ),
                 patch.object(store, "_run", side_effect=authenticated_ls) as run,
@@ -348,7 +348,7 @@ class S3UploadStoreTest(unittest.TestCase):
 
             with (
                 patch(
-                    "opensandbox_s3_upload._direct_urlopen",
+                    "harbor_environment_adapters.providers.opensandbox_yicloud.s3_transfer._direct_urlopen",
                     side_effect=forbidden,
                 ),
                 self.assertRaises(S3WriteUnavailableError),

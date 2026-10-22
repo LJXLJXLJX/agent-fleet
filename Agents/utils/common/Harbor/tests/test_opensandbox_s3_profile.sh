@@ -2,8 +2,8 @@
 set -euo pipefail
 
 HARBOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=../opensandbox_s3_profile.sh
-source "${HARBOR_DIR}/opensandbox_s3_profile.sh"
+# shellcheck source=../harbor_environment_adapters/providers/opensandbox_yicloud/scripts/s3_profile.sh
+source "${HARBOR_DIR}/harbor_environment_adapters/providers/opensandbox_yicloud/scripts/s3_profile.sh"
 
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "${TEST_ROOT}"' EXIT

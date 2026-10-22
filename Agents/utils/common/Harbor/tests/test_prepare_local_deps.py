@@ -45,6 +45,10 @@ class PrepareLocalDepsTest(unittest.TestCase):
         self.assertEqual(
             config.pi_runtime_tarball, self.root / "wheels" / "pi-runtime-0.81.1.tar.gz"
         )
+        self.assertEqual(
+            config.node_runtime_tarball,
+            self.root / "wheels" / "node-runtime.tar.gz",
+        )
         self.assertEqual(config.npm_registry_url, "https://npm.example.invalid/")
         self.assertEqual(config.cache_schema, "9")
 
@@ -219,13 +223,15 @@ class PrepareLocalDepsTest(unittest.TestCase):
         self.assertNotIn("opencode-ai@4.5.6", manifest)
         self.assertIn("prepare_pi_cache=1\n", manifest)
         self.assertIn("pi_runtime_version=0.81.1\n", manifest)
+        self.assertIn("node-runtime.tar.gz", manifest)
+        self.assertNotIn("node-runtime.tar.xz", manifest)
         self.assertIn("@earendil-works/pi-coding-agent@0.81.1", manifest)
 
     def test_pi_portable_node_runtime_recompresses_node_tarball(self):
         wheel_dir = self.root / "wheels"
         wheel_dir.mkdir()
-        source = wheel_dir / "node-runtime.tar.xz"
-        with tarfile.open(source, "w:xz") as archive:
+        source = wheel_dir / "node-runtime.tar.gz"
+        with tarfile.open(source, "w:gz") as archive:
             payload = b"fixture-node"
             info = tarfile.TarInfo("node-v22/bin/node")
             info.mode = 0o755

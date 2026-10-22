@@ -4,6 +4,11 @@ Harbor loads the concrete environment through the preserved spec
 `yicloud_opensandbox:YiCloudOpenSandboxEnvironment`. That module is now a
 compatibility import of `adapter.YiCloudOpenSandboxEnvironment`.
 
+This environment spec is the only YiCloud/OpenSandbox compatibility module
+kept at the Harbor root. Async command transport, directory packing, S3
+staging, and S3 profile resolution are internal provider modules; repository
+callers use their package paths rather than root-level facades.
+
 The former 3175-line provider is split by its existing responsibilities:
 
 | Module | Responsibility |
@@ -15,6 +20,10 @@ The former 3175-line provider is split by its existing responsibilities:
 | `services.py` | Existing Bundle compatibility, service graph, depends_on/healthchecks, aliases, sidecar exec/stop and group cleanup |
 | `execution.py` | Execd commands, SSE, verifier runtime activation, dispatch retry/idempotence, detached command polling and native command pool |
 | `transfer.py` | HTTP/fast upload, S3/auto fallback, read-only mount delivery, bounded downloads and safe archive extraction |
+| `async_commands.py` | Bounded native-background execd transport, polling, output retrieval, cancellation and cleanup |
+| `packing.py` | Bounded directory archive workers used by native async uploads |
+| `s3_transfer.py` | Content-addressed S3 staging, anonymous-read verification, local cache and the preflight/prewarm CLI |
+| `scripts/s3_profile.sh` | Project-local S3 profile validation and environment projection sourced during Harbor bootstrap |
 
 Internal method groups share the adapter's existing state and call each other
 through `self`. They have no independent construction, registration, lifecycle

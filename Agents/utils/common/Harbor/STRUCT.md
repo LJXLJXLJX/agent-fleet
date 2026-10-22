@@ -13,9 +13,12 @@ serialized plan. See [adapter handoff](harbor_environment_adapters/README.md).
 
 `harbor_environment_adapters/providers/opensandbox_yicloud/` owns the YiCloud
 runtime, split into adapter, configuration, client, lifecycle, services,
-execution, and transfer. `providers/e2b_series/qz_legacy/adapter.py` preserves the qz
-implementation. `yicloud_opensandbox.py` and `qz_e2b_sandbox.py` retain their
-Harbor import paths as compatibility modules.
+execution, transfer, async commands, packing, S3 staging, and S3 profile
+resolution. `yicloud_opensandbox.py` is its only Harbor-root compatibility
+module; internal callers use package paths and the S3 prewarm path uses the
+package CLI. `providers/e2b_series/qz_legacy/adapter.py` preserves the qz
+implementation. `qz_e2b_sandbox.py` retains its Harbor import path as a
+compatibility module.
 
 ## Files
 
