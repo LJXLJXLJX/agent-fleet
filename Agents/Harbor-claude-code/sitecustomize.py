@@ -242,7 +242,7 @@ def _patch_claude_code_realtime_hooks() -> None:
             (extra_env or {}).get(
                 "CC_OPIK_PY_WHEEL_DIR", "/opt/tb-opik/python-wheels"
             )
-            + "/node-runtime.tar.xz"
+            + "/node-runtime.tar.gz"
         )
 
         # Intercept both exec_as_root and exec_as_agent during install so that:
@@ -344,7 +344,7 @@ def _patch_claude_code_realtime_hooks() -> None:
                 "PY\n"
                 "    then node_extract_ok=1; fi; "
                 "  elif command -v tar >/dev/null 2>&1 && "
-                f"tar -xJf {node_runtime_path} -C \"$node_dir\"; then "
+                f"tar -xzf {node_runtime_path} -C \"$node_dir\"; then "
                 "    node_extract_ok=1; "
                 "  fi; "
                 "  node_bin=\"\"; "

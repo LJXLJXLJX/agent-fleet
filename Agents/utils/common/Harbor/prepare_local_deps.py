@@ -116,7 +116,7 @@ class Config:
                 _value(
                     values,
                     "NODE_RUNTIME_TARBALL",
-                    str(wheel_dir / "node-runtime.tar.xz"),
+                    str(wheel_dir / "node-runtime.tar.gz"),
                 )
             ),
             pi_node_runtime_tarball=Path(
@@ -198,7 +198,7 @@ def npm_tarball_urls(original_url: str, registry_url: str) -> list[str]:
 def _manifest_packages(config: Config) -> str:
     packages = (
         "opik,uuid6,socksio,pip,setuptools,wheel,get-pip.py,"
-        "python3.12-runtime.tar.gz,node-runtime.tar.xz,npm-cache,"
+        "python3.12-runtime.tar.gz,node-runtime.tar.gz,npm-cache,"
         f"npm-cache-ready,@anthropic-ai/claude-code@{config.claude_code_version}"
     )
     if config.prepare_opencode_cache:
@@ -457,7 +457,10 @@ class DependencyPreparer:
 
     def _prepare_node_runtime_tarball(self) -> None:
         target = self.config.node_runtime_tarball
+        legacy = target.parent / "node-runtime.tar.xz"
         if tarball_ready(target):
+            if target.name == "node-runtime.tar.gz":
+                legacy.unlink(missing_ok=True)
             print("[prepare] skip node runtime tarball (cached)")
             return
         target.unlink(missing_ok=True)
@@ -470,15 +473,17 @@ class DependencyPreparer:
             for item in index
             if isinstance(item, dict) and str(item.get("version", "")).startswith("v22.")
         )
-        url = f"https://nodejs.org/dist/{version}/node-{version}-linux-x64.tar.xz"
+        url = f"https://nodejs.org/dist/{version}/node-{version}-linux-x64.tar.gz"
         downloaded = _download_atomic(
             [url],
             target,
             prefix="node-runtime-",
-            suffix=".tar.xz",
+            suffix=".tar.gz",
             validate=tarball_ready,
             label="node runtime",
         )
+        if target.name == "node-runtime.tar.gz":
+            legacy.unlink(missing_ok=True)
         print(f"downloaded node runtime tarball: {downloaded}")
 
     def _prepare_pi_node_runtime_tarball(self) -> None:

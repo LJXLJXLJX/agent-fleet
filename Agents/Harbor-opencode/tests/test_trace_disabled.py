@@ -224,6 +224,7 @@ class OpenCodeTraceDisabledTests(unittest.TestCase):
             for command in (
                 "dirname",
                 "find",
+                "gzip",
                 "ln",
                 "mkdir",
                 "mktemp",
@@ -272,7 +273,7 @@ class OpenCodeTraceDisabledTests(unittest.TestCase):
                 ),
             )
             self._write_executable(runtime_bin / "npx", "exit 0")
-            with tarfile.open(cache_dir / "node-runtime.tar.xz", "w") as archive:
+            with tarfile.open(cache_dir / "node-runtime.tar.gz", "w:gz") as archive:
                 archive.add(runtime_bin.parent, arcname=runtime_bin.parent.name)
 
             self._write_executable(

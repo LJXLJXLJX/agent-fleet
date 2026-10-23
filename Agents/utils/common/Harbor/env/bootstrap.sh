@@ -10,8 +10,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 # shellcheck source=../../../../../scripts/config_loader.sh
 source "$REPO_ROOT/scripts/config_loader.sh"
 agent_fleet_load_config "$REPO_ROOT"
-# shellcheck source=../opensandbox_s3_profile.sh
-source "$SCRIPT_DIR/opensandbox_s3_profile.sh"
+# shellcheck source=../harbor_environment_adapters/providers/opensandbox_yicloud/scripts/s3_profile.sh
+source "$SCRIPT_DIR/harbor_environment_adapters/providers/opensandbox_yicloud/scripts/s3_profile.sh"
 
 # Keep setup-managed and explicitly supplied prerequisite directories visible
 # for direct Harbor entry points as well as scripts/run_fleet.sh.

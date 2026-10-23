@@ -40,7 +40,10 @@ delivery are unchanged. Provider checks still run in the existing preflight.
 `providers/opensandbox_yicloud/adapter.py` composes the extracted internal method
 groups into the concrete Harbor `BaseEnvironment`. All method groups share that
 one adapter instance and its existing state; they are not pluggable providers or
-new lifecycle/transfer interfaces. See [YiCloud responsibilities](providers/opensandbox_yicloud/README.md).
+new lifecycle/transfer interfaces. The same provider package owns async command
+transport, directory packing, S3 staging, and S3 profile resolution; these
+internal helpers no longer have Harbor-root modules. See
+[YiCloud responsibilities](providers/opensandbox_yicloud/README.md).
 
 `providers/e2b_series/qz_legacy/adapter.py` preserves the qz implementation. Its old
 `qz_e2b_sandbox.py` entrypoint re-exports the class and public qz configuration

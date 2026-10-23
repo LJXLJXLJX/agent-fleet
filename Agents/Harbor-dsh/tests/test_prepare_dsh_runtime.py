@@ -11,6 +11,8 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
+from Agents.utils.common.Harbor import prepare_local_deps
+
 MODULE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(MODULE_DIR))
 
@@ -25,6 +27,41 @@ class PrepareDshCliRuntimeTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_prepare_checks_node_version_from_shared_gzip_cache(self) -> None:
+        shared = prepare_local_deps.Config.from_environment({"WHEEL_DIR": str(self.root)})
+        with tarfile.open(shared.node_runtime_tarball, "w:gz") as archive:
+            for name, payload in (
+                ("node/bin/node", b"#!/bin/sh\necho 21\n"),
+                ("node/bin/corepack", b"#!/bin/sh\nexit 0\n"),
+            ):
+                info = tarfile.TarInfo(name)
+                info.mode = 0o755
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+        legacy = self.root / "node-runtime.tar.xz"
+        legacy.touch()
+        prepare_local_deps.DependencyPreparer(shared)._prepare_node_runtime_tarball()
+        self.assertFalse(legacy.exists())
+
+        source = self.root / "source.tar.gz"
+        with tarfile.open(source, "w:gz") as archive:
+            payload = b"lockfileVersion: 9\n"
+            info = tarfile.TarInfo("source/pnpm-lock.yaml")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+        config = cli_runtime.Config.from_environment(
+            {
+                "WHEEL_DIR": str(self.root),
+                "DSH_CLI_SOURCE_ARCHIVE": str(source),
+                "DSH_CLI_SOURCE_ARCHIVE_SHA256": cli_runtime.sha256(source),
+            }
+        )
+
+        # Reaching the version check proves the shared archive was found,
+        # extracted, and executed without a NODE_RUNTIME_TARBALL override.
+        with self.assertRaisesRegex(RuntimeError, "DSH requires Node 22 or newer"):
+            cli_runtime.prepare(config)
 
     def test_config_and_cache_require_the_pinned_cli_version(self) -> None:
         config = cli_runtime.Config.from_environment(
