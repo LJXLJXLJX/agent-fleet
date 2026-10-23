@@ -17,12 +17,15 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from harbor_analyzer.pi import dispatch_to_child
 from harbor_pi_runtime import (
+    PiInvocationError,
     PiRuntimeConfig,
     base_url_from_env,
     load_final_json_from_event_stream,
     models_config,
+    retryable_pi_failure,
     run_pi_json_process,
 )
+from harbor_pi_runtime.process import final_output_block_reason
 
 
 def write_fixture_pi(path: Path) -> Path:
@@ -84,6 +87,84 @@ class HarborPiRuntimeTest(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.root = Path(self.temp_dir.name)
         self.pi_bin = write_fixture_pi(self.root / "fixture-pi")
+
+    def test_retry_policy_distinguishes_permanent_and_transient_provider_failures(self):
+        for detail in (
+            "404_message_model_not_found", "401_authenticationerror",
+            "403_permission_denied", "413_message_request_body_exceeded_67108864_bytes",
+            "litellm_contextwindowexceedederror", "400_badrequesterror", "422_invalid_input",
+        ):
+            with self.subTest(detail=detail):
+                self.assertFalse(retryable_pi_failure("pi_provider_request_failed:" + detail))
+        for detail in ("429_rate_limit", "503_serviceunavailableerror", "timeout", "connection_reset"):
+            with self.subTest(detail=detail):
+                self.assertTrue(retryable_pi_failure("pi_provider_request_failed:" + detail))
+        self.assertTrue(retryable_pi_failure("pi_final_message_truncated"))
+        self.assertFalse(retryable_pi_failure("pi_prompt_too_large"))
+
+    def test_invocation_errors_keep_safe_codes_without_raw_os_error_details(self):
+        error = PiInvocationError(
+            "pi_dispatch_os_error:/private/API_KEY=fake-secret", label="fixture", attempt=1
+        )
+        self.assertEqual(error.block_reason, "pi_dispatch_os_error")
+        self.assertNotIn("fake-secret", str(error))
+
+    def test_provider_retry_status_ignores_numbers_in_error_details(self):
+        for message, retryable in (
+            ("429 rate limit exceeded: limit 400 requests per minute", True),
+            ("503 service unavailable: 404 requests queued", True),
+            ("HTTP 503: upstream returned BadRequestError", True),
+            ("rate limit exceeded: limit 400 requests per minute", True),
+            ("HTTP status code 413: retry after 429 seconds", False),
+            ("403 permission denied: limit 503 requests per minute", False),
+        ):
+            with self.subTest(message=message):
+                reason, _ = final_output_block_reason([
+                    {"message": {"role": "assistant", "errorMessage": message}},
+                ], [])
+                self.assertEqual(retryable_pi_failure(reason), retryable)
+                error = PiInvocationError(reason, label="fixture", attempt=1)
+                self.assertEqual(error.retryable, retryable)
+
+    def test_invocation_errors_expose_only_known_provider_classes(self):
+        for message, expected, retryable in (
+            ("401 Invalid API key: sk-proj-fake-private-key", "401", False),
+            ("503 upstream https://private.invalid/fake-private-path", "503", True),
+            ("ContextWindowExceededError: sk-proj-fake-private-key", "context_window_exceeded", False),
+            ("sk-proj-fake-private-key at https://private.invalid", "unknown_error", True),
+        ):
+            with self.subTest(message=message):
+                reason, _ = final_output_block_reason([
+                    {"message": {"role": "assistant", "errorMessage": message}},
+                ], [])
+                error = PiInvocationError(reason, label="fixture", attempt=1)
+                self.assertEqual(error.block_reason, f"pi_provider_request_failed:{expected}")
+                self.assertEqual(error.retryable, retryable)
+                self.assertEqual(str(error), f"pi agent failed for fixture attempt 1: {error.block_reason}")
+        unknown = PiInvocationError("unknown_fake_private_key:private.invalid", label="fixture", attempt=1)
+        self.assertEqual(unknown.block_reason, "pi_invocation_failed")
+
+    def test_harness_integrity_failures_retry_but_configuration_errors_do_not(self):
+        for reason in (
+            "pi_dispatch_exit_code:-6", "pi_jsonl_invalid", "pi_subagent_session_not_observed",
+            "pi_subagent_lifecycle_invalid", "pi_subagent_turn_invalid", "pi_final_json_missing",
+            "pi_event_stream_os_error:/private/log", "pi_event_compaction_error:/private/log",
+            "pi_dispatch_os_error:/private/binary",
+        ):
+            with self.subTest(reason=reason):
+                self.assertTrue(retryable_pi_failure(reason))
+                error = PiInvocationError(reason, label="fixture", attempt=1)
+                self.assertTrue(error.retryable)
+                self.assertEqual(error.block_reason, reason.partition(":")[0])
+        for reason in (
+            "pi_binary_not_found", "pi_provider_not_configured", "pi_model_not_configured",
+            "pi_api_key_env_invalid", "pi_api_key_env_missing:PRIVATE_API_KEY",
+            "pi_thinking_level_invalid", "pi_base_url_invalid", "pi_extension_missing",
+            "pi_streaming_stdin_unsupported", "pi_prompt_too_large",
+        ):
+            with self.subTest(reason=reason):
+                self.assertFalse(retryable_pi_failure(reason))
+                self.assertFalse(PiInvocationError(reason, label="fixture", attempt=1).retryable)
 
     def run_runtime(self, prompt: str, **overrides: object):
         options = {

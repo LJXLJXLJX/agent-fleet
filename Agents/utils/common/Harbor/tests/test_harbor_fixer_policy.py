@@ -22,6 +22,8 @@ from fixer_test_support import (
     make_fix_plan,
 )
 from harbor_fixer.policy import run_policy_preflight
+from harbor_fixer.policy.agent import evaluate_agent
+from harbor_pi_runtime import PiInvocationError
 
 
 def _command(template: dict, action_id: str, executable: str, *arguments: str) -> dict:
@@ -51,6 +53,34 @@ def _file_edit(action_id: str, cwd: str, path: str) -> dict:
 
 
 class HarborFixerPolicyTest(FixerTestCase):
+    def test_permanent_provider_error_denies_without_retrying(self):
+        invoker = mock.Mock()
+        invoker.invoke.side_effect = PiInvocationError(
+            "pi_provider_request_failed:401_invalid_api_key_fake_provider_credential", label="policy", attempt=1
+        )
+        with mock.patch("harbor_fixer.policy.agent.sleep_before_retry") as backoff:
+            decision = evaluate_agent(invoker, {
+                "tier": "T3", "plan_id": "plan-1", "action": {"action_id": "action-1"},
+            })
+        self.assertEqual(decision["decision"], "deny")
+        self.assertEqual(decision["source"], "policy_agent_fallback")
+        self.assertIn("pi_provider_request_failed:401", decision["reason"])
+        self.assertNotIn("fake_provider_credential", json.dumps(decision))
+        self.assertEqual(invoker.invoke.call_count, 1)
+        backoff.assert_not_called()
+
+    def test_transient_lifecycle_failure_can_recover_before_policy_decision(self):
+        policy_input = {"tier": "T3", "plan_id": "plan-1", "action": {"action_id": "action-1"}}
+        valid = PolicyInvoker().invoke("", policy_input, attempt=2, label="policy")
+        invoker = mock.Mock()
+        invoker.invoke.side_effect = [
+            PiInvocationError("pi_subagent_lifecycle_invalid", label="policy", attempt=1), valid,
+        ]
+        with mock.patch("harbor_fixer.policy.agent.sleep_before_retry"):
+            decision = evaluate_agent(invoker, policy_input)
+        self.assertEqual(decision["decision"], "allow")
+        self.assertEqual(decision["source"], "policy_agent")
+
     def setUp(self) -> None:
         super().setUp()
         self.workspace = self.root / "workspace"
