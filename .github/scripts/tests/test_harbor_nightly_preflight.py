@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -116,6 +117,131 @@ class PreflightTest(unittest.TestCase):
             self.assertEqual(preflight.main([]), 1)
             probe.assert_not_called()
             self.assertIn("::error::", output.getvalue())
+
+    def configure(self, benchmark="sierra-research/tau3-bench", failure=None, **overrides):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "github-env"
+            target.write_text("EXISTING=value\n")
+            env = {
+                "MODEL": "run-model", "API_KEY": "fake-run-key",
+                "BASE_URL": "https://run.invalid/v1/chat/completions",
+                "GITHUB_ENV": str(target), **overrides,
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(preflight, "probe", side_effect=failure) as probe,
+                contextlib.redirect_stdout(io.StringIO()) as output,
+                contextlib.redirect_stderr(io.StringIO()) as error,
+            ):
+                status = preflight.main(["--benchmark", benchmark])
+            exported = dict(line.split("=", 1) for line in target.read_text().splitlines())
+            return status, exported, probe.call_args_list, output.getvalue() + error.getvalue()
+
+    def test_shared_run_configuration_is_forwarded_without_another_request(self):
+        for benchmark, roles in (
+            ("scale-ai/swe-atlas-qna", {"EVAL_MODEL": "run-model"}),
+            ("sierra-research/tau3-bench", {
+                "TAU2_USER_MODEL": "openai/run-model",
+                "TAU2_NL_ASSERTIONS_MODEL": "openai/run-model",
+                "TAU2_USER_LLM_ARGS_JSON": "{}",
+            }),
+        ):
+            with self.subTest(benchmark=benchmark):
+                status, exported, calls, log = self.configure(benchmark)
+                self.assertEqual(status, 0, log)
+                self.assertEqual(calls, [])
+                self.assertEqual(exported, {
+                    "EXISTING": "value", "OPENAI_BASE_URL": "https://run.invalid/v1",
+                    "OPENAI_API_BASE": "https://run.invalid/v1",
+                    "OPENAI_API_KEY": "fake-run-key", **roles,
+                })
+                self.assertNotIn("fake-run-key", log)
+
+    def test_only_distinct_role_models_are_probed(self):
+        status, exported, calls, log = self.configure(
+            TAU2_USER_MODEL="openai/other-model", TAU2_NL_ASSERTIONS_MODEL="other-model"
+        )
+        self.assertEqual(status, 0, log)
+        self.assertEqual(calls, [mock.call(
+            "https://run.invalid/v1", "other-model", "fake-run-key", "chat/completions"
+        )])
+        self.assertEqual(exported["TAU2_USER_MODEL"], "openai/other-model")
+        self.assertEqual(exported["TAU2_NL_ASSERTIONS_MODEL"], "openai/other-model")
+
+    def test_gateway_overrides_are_checked_by_normalized_endpoint_model_and_key(self):
+        for url, key, needs_probe in (
+            ("https://judge.invalid/v1", "fake-run-key", True),
+            ("https://run.invalid/v1", "fake-judge-key", True),
+            ("https://run.invalid/v1/chat/completions/", "fake-run-key", False),
+        ):
+            with self.subTest(url=url, key=key):
+                status, exported, calls, log = self.configure(
+                    VERIFIER_BASE_URL_RAW=url, VERIFIER_API_KEY=key
+                )
+                self.assertEqual(status, 0, log)
+                root = preflight.api_root(url)
+                self.assertEqual(calls, [mock.call(
+                    root, "run-model", key, "chat/completions"
+                )] if needs_probe else [])
+                self.assertEqual(exported["OPENAI_BASE_URL"], root)
+                self.assertEqual(exported["OPENAI_API_KEY"], key)
+                self.assertNotIn(key, log)
+
+    def test_failed_override_leaves_existing_environment_output_untouched(self):
+        status, exported, calls, log = self.configure(
+            failure=preflight.PreflightError("HTTP 404"),
+            TAU2_NL_ASSERTIONS_MODEL="openai/unavailable-model",
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(calls, [mock.call(
+            "https://run.invalid/v1", "unavailable-model", "fake-run-key", "chat/completions"
+        )])
+        self.assertEqual(exported, {"EXISTING": "value"})
+        self.assertIn("TAU2_NL_ASSERTIONS_MODEL", log)
+        self.assertNotIn("fake-run-key", log)
+
+    def test_invalid_configuration_is_rejected_before_requests_or_publication(self):
+        for overrides in (
+            {"MODEL": ""},
+            {"API_KEY": "fake-key\nINJECTED=value"},
+            {"TAU2_USER_MODEL": ""},
+            {"TAU2_USER_MODEL": "model\nINJECTED=value"},
+            {"VERIFIER_BASE_URL_RAW": "https://judge.invalid"},
+            {"TAU2_USER_TEMPERATURE": "not-numeric"},
+            {"TAU2_USER_TEMPERATURE": "nan"},
+        ):
+            with self.subTest(overrides=overrides):
+                status, exported, calls, log = self.configure(**overrides)
+                self.assertEqual(status, 1)
+                self.assertEqual(calls, [])
+                self.assertEqual(exported, {"EXISTING": "value"})
+                self.assertNotIn("INJECTED", log)
+
+    def test_explicit_tau_user_parameters_are_preserved(self):
+        status, exported, calls, log = self.configure(
+            TAU2_USER_REASONING_EFFORT="high", TAU2_USER_TEMPERATURE="0.2"
+        )
+        self.assertEqual(status, 0, log)
+        self.assertEqual(calls, [])
+        self.assertEqual(json.loads(exported["TAU2_USER_LLM_ARGS_JSON"]),
+                         {"reasoning_effort": "high", "temperature": 0.2})
+        explicit = '{"temperature":0.3}'
+        status, exported, _calls, log = self.configure(TAU2_USER_LLM_ARGS_JSON=explicit)
+        self.assertEqual(status, 0, log)
+        self.assertEqual(exported.get("TAU2_USER_LLM_ARGS_JSON", explicit), explicit)
+
+    def test_unrelated_benchmarks_need_no_role_configuration(self):
+        status, exported, calls, log = self.configure("seta", MODEL="", API_KEY="")
+        self.assertEqual(status, 0, log)
+        self.assertEqual(calls, [])
+        self.assertEqual(exported, {"EXISTING": "value"})
+
+    def test_gpt5_override_uses_completion_token_budget(self):
+        with mock.patch.object(preflight, "urlopen", return_value=self.response({"choices": [{}]})) as request:
+            preflight.probe("https://judge.invalid/v1", "gpt-5.2", "fake-key", "chat/completions")
+            body = json.loads(request.call_args.args[0].data)
+            self.assertEqual(body["max_completion_tokens"], 16)
+            self.assertNotIn("max_tokens", body)
 
 
 if __name__ == "__main__":

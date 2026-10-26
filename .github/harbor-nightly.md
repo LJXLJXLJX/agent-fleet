@@ -50,7 +50,20 @@ route. The step has a three-minute ceiling. Response bodies and credentials
 are not logged.
 
 A model that disappears mid-run can still fail trials. The preflight checks
-availability at startup; it does not change models or weaken the health gate.
+availability at startup.
+
+After selection, the random nightly forwards the already-checked run's
+`BASE_URL`, `MODEL`, and `API_KEY` to Atlas's judge and Tau3's simulator/judge
+through `OPENAI_*`, `EVAL_MODEL`, and `TAU2_*` settings. This makes no additional
+model requests by default. Explicit role-model environment settings or the
+optional `HARBOR_NIGHTLY_VERIFIER_BASE_URL` / `HARBOR_NIGHTLY_VERIFIER_API_KEY`
+pair are checked only when they differ from the run configuration; identical
+overrides are checked once. Settings are published after all checks pass.
+
+Tau3 uses an `openai/` SDK prefix while sending the original model ID, and
+avoids its implicit GPT-specific reasoning parameter for custom aliases.
+Explicit user arguments are preserved. Scores reflect the selected evaluation
+models, which may differ from the benchmark's prescribed defaults.
 
 For fixed benchmark runs, the shared launcher passes the active model gateway
 hostname through Harbor's `--allow-agent-host`. This lets agent model requests
@@ -93,6 +106,12 @@ also had three agent timeouts; removing the image incompatibility alone does
 not establish that all tasks will complete within their time budgets.
 
 ## Pinned runtime preparation
+
+Both workflows bind `HARBOR_CLAUDE_CODE_DIR` to their checked-out source. A
+service-level override must not route a new checkout through an older runtime
+copy: the October 22–25 runs used a legacy `.tar.xz` installer against a gzip
+dependency cache. Docker installations also replace unsupported existing Node
+versions from the portable cache, even when the image already supplies npm.
 
 Both workflows call `Agents/utils/common/Harbor/setup_runner_env.sh` during
 prerequisite validation and export their own runner directories under
