@@ -78,6 +78,7 @@ class DsecSandboxEnvironment(
         default_exec_timeout_sec: int | str | None = None,
         transfer_max_bytes: int | str | None = None,
         transfer_timeout_sec: int | str | None = None,
+        start_concurrency: int | str | None = None,
         poll_interval_sec: float = 0.2,
         request_attempts: int | str = 3,
         **kwargs: Any,
@@ -138,6 +139,12 @@ class DsecSandboxEnvironment(
             transfer_timeout_sec
             or os.environ.get("DSEC_SANDBOX_TRANSFER_TIMEOUT_SEC", "1800"),
             "transfer_timeout_sec",
+        )
+        self._start_concurrency = _positive_int(
+            start_concurrency
+            or os.environ.get("DSEC_SANDBOX_START_CONCURRENCY", "32"),
+            "start_concurrency",
+            maximum=4096,
         )
         self._request_attempts = _positive_int(
             request_attempts, "request_attempts", maximum=5
@@ -265,9 +272,9 @@ class DsecSandboxEnvironment(
                 )
 
     def _resource_request(self) -> dict[str, int | str]:
-        """Select deployment-owned shared scheduling without task quotas."""
+        """Request explicit unrestricted scheduling without task or host quotas."""
         return {
-            "policy": "shared/v1",
+            "policy": "unrestricted/v1",
             "cpu_millicores": 0,
             "memory_bytes": 0,
             "pids_limit": 0,

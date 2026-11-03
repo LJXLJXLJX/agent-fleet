@@ -4,15 +4,40 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
-import requests
+import httpx
 
 from .client import DsecControllerError
 
 _CREATE_FAILURE_STATES = {"create_failed", "recovery_required", "closed", "exited"}
 _CLOSE_TERMINAL_STATES = {"closed", "create_failed"}
+_START_LIMITERS: dict[int, threading.BoundedSemaphore] = {}
+_START_LIMITERS_LOCK = threading.Lock()
+
+
+def _start_limiter(maximum: int) -> threading.BoundedSemaphore:
+    """Share create-to-ready admission across all trial event loops."""
+
+    with _START_LIMITERS_LOCK:
+        return _START_LIMITERS.setdefault(maximum, threading.BoundedSemaphore(maximum))
+
+
+@asynccontextmanager
+async def _start_admission(maximum: int) -> AsyncIterator[None]:
+    """Acquire process-wide admission without occupying an executor thread."""
+
+    limiter = _start_limiter(maximum)
+    while not limiter.acquire(blocking=False):
+        await asyncio.sleep(0.05)
+    try:
+        yield
+    finally:
+        limiter.release()
 
 
 class DsecLifecycleMixin:
@@ -28,11 +53,7 @@ class DsecLifecycleMixin:
             "request_id": self._sandbox_request_id(),
             "image": self._image_ref,
             "process": {
-                "argv": [
-                    "/bin/sh",
-                    "-lc",
-                    "trap : TERM INT; sleep infinity & wait",
-                ],
+                "argv": ["/bin/sleep", "infinity"],
                 # Harbor 0.18 owns task-level environment in _persistent_env;
                 # per-exec overlays are intentionally not active at creation.
                 "env": dict(self._persistent_env),
@@ -60,7 +81,7 @@ class DsecLifecycleMixin:
                 last_error = error
                 if not error.retryable or attempt + 1 == self._request_attempts:
                     raise
-            except requests.RequestException as error:
+            except httpx.RequestError as error:
                 last_error = error
                 if attempt + 1 == self._request_attempts:
                     raise
@@ -95,25 +116,25 @@ class DsecLifecycleMixin:
             )
         self._validate_definition()
         try:
-            record = await self._create_with_stable_identity()
-            sandbox_id = record.get("sandbox_id")
-            if not isinstance(sandbox_id, str) or not sandbox_id:
-                raise RuntimeError("DSec Controller returned no sandbox identity")
-            self._sandbox_id = sandbox_id
-            if record.get("state") in _CREATE_FAILURE_STATES:
-                raise RuntimeError(
-                    "DSec Sandbox entered terminal state "
-                    f"{record.get('state')}"
-                )
-            if record.get("state") != "ready":
-                record = await self._wait_sandbox_state(
-                    {"ready"}, timeout_sec=self._ready_timeout_sec
-                )
-            observation = record.get("observation") or {}
-            if observation.get("reachable") is not True:
-                raise RuntimeError(
-                    "DSec Sandbox is ready but owning Node is unreachable"
-                )
+            async with _start_admission(self._start_concurrency):
+                record = await self._create_with_stable_identity()
+                sandbox_id = record.get("sandbox_id")
+                if not isinstance(sandbox_id, str) or not sandbox_id:
+                    raise RuntimeError("DSec Controller returned no sandbox identity")
+                self._sandbox_id = sandbox_id
+                if record.get("state") in _CREATE_FAILURE_STATES:
+                    raise RuntimeError(
+                        f"DSec Sandbox entered terminal state {record.get('state')}"
+                    )
+                if record.get("state") != "ready":
+                    record = await self._wait_sandbox_state(
+                        {"ready"}, timeout_sec=self._ready_timeout_sec
+                    )
+                observation = record.get("observation") or {}
+                if observation.get("reachable") is not True:
+                    raise RuntimeError(
+                        "DSec Sandbox is ready but owning Node is unreachable"
+                    )
             setup = await self.exec(
                 "mkdir -p /logs/agent /logs/verifier /logs/artifacts /artifacts "
                 "&& chmod 777 /logs/agent /logs/verifier /logs/artifacts /artifacts",
@@ -133,6 +154,7 @@ class DsecLifecycleMixin:
     async def stop(self, delete: bool) -> None:
         sandbox_id = self._sandbox_id
         if not sandbox_id:
+            await self._client.close()
             return
         if not delete:
             self.logger.warning(
@@ -147,3 +169,4 @@ class DsecLifecycleMixin:
             )
         if self._sandbox_id == sandbox_id:
             self._sandbox_id = ""
+        await self._client.close()

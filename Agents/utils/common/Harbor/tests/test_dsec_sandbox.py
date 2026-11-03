@@ -9,6 +9,7 @@ import os
 import sys
 import tarfile
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -66,6 +67,9 @@ adapter = importlib.import_module(
 transfer = importlib.import_module(
     "harbor_environment_adapters.providers.dsec_controller.transfer"
 )
+lifecycle = importlib.import_module(
+    "harbor_environment_adapters.providers.dsec_controller.lifecycle"
+)
 
 
 class DsecLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -78,6 +82,7 @@ class DsecLifecycleTests(unittest.IsolatedAsyncioTestCase):
             create_execution=AsyncMock(),
             execution_status=AsyncMock(),
             execution_output=AsyncMock(return_value=b""),
+            close=AsyncMock(),
         )
         instance._image_ref_override = (
             "registry.example/tasks/sample@sha256:" + "a" * 64
@@ -92,6 +97,7 @@ class DsecLifecycleTests(unittest.IsolatedAsyncioTestCase):
         instance._default_exec_timeout_sec = 2
         instance._exec_output_limit_bytes = 4096
         instance._request_attempts = 3
+        instance._start_concurrency = 32
         instance._poll_interval_sec = 0.001
         instance.session_id = "trial-one__env"
         instance.context_id = None
@@ -105,7 +111,7 @@ class DsecLifecycleTests(unittest.IsolatedAsyncioTestCase):
         instance._effective_memory_mb = None
         instance._effective_storage_mb = None
         instance._resource_request = lambda: {
-            "policy": "shared/v1",
+            "policy": "unrestricted/v1",
             "cpu_millicores": 0,
             "memory_bytes": 0,
             "pids_limit": 0,
@@ -148,6 +154,73 @@ class DsecLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spec["request_id"], environment._sandbox_request_id())
         environment._upload_environment_dir_after_start.assert_awaited_once()
 
+    async def test_start_admission_is_shared_until_ready(self):
+        environments = [self.environment() for _ in range(3)]
+        active = 0
+        peak = 0
+        admitted = asyncio.Event()
+        release = asyncio.Event()
+
+        def create(index):
+            async def run():
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    admitted.set()
+                await release.wait()
+                active -= 1
+                return {
+                    "sandbox_id": f"sbx-{index}",
+                    "state": "ready",
+                    "observation": {"reachable": True},
+                }
+
+            return run
+
+        for index, environment in enumerate(environments):
+            environment._start_concurrency = 2
+            environment._create_with_stable_identity = create(index)
+            environment.exec = AsyncMock(
+                return_value=SimpleNamespace(return_code=0, stdout="", stderr="")
+            )
+
+        tasks = [asyncio.create_task(environment.start(False)) for environment in environments]
+        await asyncio.wait_for(admitted.wait(), timeout=1)
+        await asyncio.sleep(0)
+        self.assertEqual(peak, 2)
+        release.set()
+        await asyncio.gather(*tasks)
+
+    def test_start_admission_is_shared_across_event_loops(self):
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+        admitted = threading.Event()
+        release = threading.Event()
+
+        async def run():
+            nonlocal active, peak
+            async with lifecycle._start_admission(2):
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                    if active == 2:
+                        admitted.set()
+                release.wait(timeout=2)
+                with lock:
+                    active -= 1
+
+        threads = [threading.Thread(target=lambda: asyncio.run(run())) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(admitted.wait(timeout=1))
+        self.assertEqual(peak, 2)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+
     def test_public_network_maps_only_to_explicit_bridge(self):
         environment = self.environment()
         environment._network_mode = "bridge"
@@ -188,7 +261,9 @@ class DsecLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_retains_sandbox_identity_when_close_request_fails(self):
         environment = self.environment()
         environment._sandbox_id = "sbx-one"
-        environment._client.close_sandbox.side_effect = RuntimeError("controller unavailable")
+        environment._client.close_sandbox.side_effect = RuntimeError(
+            "controller unavailable"
+        )
 
         with self.assertRaisesRegex(RuntimeError, "controller unavailable"):
             await environment.stop(delete=True)
@@ -229,7 +304,7 @@ class DsecLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.stdout, "ok")
         self.assertEqual(
             environment._client.create_execution.await_args.args[1]["argv"],
-            ["/bin/bash", "-lc", "exit 7"],
+            ["/bin/bash", "-c", "exit 7"],
         )
         with self.assertRaisesRegex(ValueError, "root execution identity"):
             await environment.exec("true", user="1000")
@@ -350,11 +425,13 @@ class DsecLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("test-dsec", level="WARNING") as captured:
             adapter.DsecSandboxEnvironment._validate_definition(environment)
 
-        self.assertIn("does not enforce per-Sandbox resource limits", captured.output[0])
+        self.assertIn(
+            "does not enforce per-Sandbox resource limits", captured.output[0]
+        )
         self.assertEqual(
             adapter.DsecSandboxEnvironment._resource_request(environment),
             {
-                "policy": "shared/v1",
+                "policy": "unrestricted/v1",
                 "cpu_millicores": 0,
                 "memory_bytes": 0,
                 "pids_limit": 0,
@@ -449,7 +526,9 @@ class DsecTransferTests(unittest.IsolatedAsyncioTestCase):
             await environment.upload_dir(source, str(remote))
             await environment.download_dir(str(remote), downloaded)
 
-            self.assertEqual((downloaded / "nested" / "data.txt").read_text(), "payload")
+            self.assertEqual(
+                (downloaded / "nested" / "data.txt").read_text(), "payload"
+            )
             self.assertEqual(os.readlink(downloaded / "link.txt"), "nested/data.txt")
 
     async def test_materialization_skips_harbor_writable_outputs(self):
