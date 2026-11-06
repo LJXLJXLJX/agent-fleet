@@ -129,7 +129,7 @@ class DsecExecutionMixin:
             raise ValueError(
                 "DSec backend only supports the root execution identity"
             )
-        effective_cwd = cwd or self.task_env_config.workdir or "/"
+        effective_cwd = cwd or self.task_env_config.workdir
         effective_env = self._merge_env(env)
         command_bytes = command.encode("utf-8")
         if len(command_bytes) <= _MAX_DIRECT_COMMAND_BYTES:

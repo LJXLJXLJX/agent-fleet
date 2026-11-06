@@ -309,6 +309,25 @@ class DsecLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "root execution identity"):
             await environment.exec("true", user="1000")
 
+    async def test_omits_working_directory_when_task_workdir_is_unset(self):
+        environment = self.environment()
+        environment.task_env_config = SimpleNamespace(
+            docker_image=None, workdir=None
+        )
+        environment._sandbox_id = "sbx-one"
+        spec = environment._create_spec()
+        self.assertNotIn("working_directory", spec["process"])
+        environment._client.create_execution.return_value = {
+            "execution_id": "exec-one",
+            "state": "succeeded",
+            "exit_code": 0,
+            "stdout": {"committed_bytes": 0, "truncated": False},
+            "stderr": {"committed_bytes": 0, "truncated": False},
+        }
+        await environment.exec("pwd")
+        exec_req = environment._client.create_execution.await_args.args[1]
+        self.assertNotIn("working_directory", exec_req)
+
     async def test_oversized_command_is_materialized_with_bounded_argv(self):
         environment = self.environment()
         environment._sandbox_id = "sbx-one"

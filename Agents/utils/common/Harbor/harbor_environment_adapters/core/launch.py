@@ -121,6 +121,13 @@ def validate_backend(
                 "plain HTTP DSec Controller requires "
                 "DSEC_SANDBOX_ALLOW_INSECURE_HTTP=1"
             )
+        raw_headers = config.get("DSEC_SANDBOX_CONTROLLER_HEADERS_JSON", "").strip()
+        if raw_headers:
+            from ..providers.dsec_controller.runtime_preflight import parse_controller_headers
+            try:
+                parse_controller_headers(raw_headers)
+            except ValueError as error:
+                raise LaunchError(str(error)) from error
         messages.append(f"DSec Sandbox Controller: {endpoint}")
     if backend == "qz":
         if not (config.get("SBX_API_KEY") or config.get("QZ_SANDBOX_API_KEY")

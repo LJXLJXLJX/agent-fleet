@@ -30,12 +30,15 @@ class _Response:
 
 
 class _Opener:
-    def __init__(self, payload):
+    def __init__(self, payload, expected_headers=None):
         self.payload = payload
+        self.expected_headers = expected_headers or {}
 
     def open(self, request, timeout):
         assert request.full_url == "http://controller/v1alpha1/status"
         assert timeout == 15
+        for key, value in self.expected_headers.items():
+            assert request.get_header(key) == value
         return _Response(self.payload)
 
 
@@ -88,6 +91,22 @@ class DsecRuntimePreflightTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "exact OPENCODE_VERSION"):
             validate_dsec_agent_runtime(config, opener=object())
+
+    def test_forwards_controller_headers_json_on_status_preflight(self):
+        config = {
+            "AGENT": "claude-code",
+            "CLAUDE_CODE_VERSION": "2.1.90",
+            "DSEC_SANDBOX_CONTROLLER_ENDPOINT": "http://controller",
+            "DSEC_SANDBOX_CONTROLLER_HEADERS_JSON": '{"X-Backend":"10.254.73.22:873"}',
+        }
+        message = validate_dsec_agent_runtime(
+            config,
+            opener=_Opener(
+                _status({"agent": "claude-code", "version": "2.1.90"}),
+                expected_headers={"X-backend": "10.254.73.22:873"},
+            ),
+        )
+        self.assertIn("claude-code@2.1.90", message)
 
 
 if __name__ == "__main__":

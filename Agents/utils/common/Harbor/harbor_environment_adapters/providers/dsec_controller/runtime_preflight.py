@@ -16,6 +16,48 @@ _AGENT_VERSION_ENV = {
 }
 
 
+def parse_controller_headers(
+    raw_headers: str | Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Validate optional fixed HTTP headers for gateway-routed Controller calls."""
+
+    if raw_headers is None or raw_headers == "":
+        return {}
+    if isinstance(raw_headers, str):
+        stripped = raw_headers.strip()
+        if not stripped:
+            return {}
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                "DSEC_SANDBOX_CONTROLLER_HEADERS_JSON must be valid JSON"
+            ) from error
+    elif isinstance(raw_headers, Mapping):
+        parsed = raw_headers
+    else:
+        raise ValueError(
+            "DSEC_SANDBOX_CONTROLLER_HEADERS_JSON must be a JSON object"
+        )
+    if not isinstance(parsed, Mapping):
+        raise ValueError(
+            "DSEC_SANDBOX_CONTROLLER_HEADERS_JSON must be a JSON object"
+        )
+    headers: dict[str, str] = {}
+    for key, value in parsed.items():
+        if (
+            not isinstance(key, str)
+            or not isinstance(value, str)
+            or not key.strip()
+            or not value.strip()
+        ):
+            raise ValueError(
+                "DSEC_SANDBOX_CONTROLLER_HEADERS_JSON entries must be non-empty strings"
+            )
+        headers[key.strip()] = value.strip()
+    return headers
+
+
 def required_agent_runtime(config: Mapping[str, str]) -> tuple[str, str] | None:
     """Return the exact runtime required by this Harbor invocation."""
 
@@ -40,7 +82,14 @@ def validate_dsec_agent_runtime(
     if required is None:
         return None
     endpoint = config.get("DSEC_SANDBOX_CONTROLLER_ENDPOINT", "").rstrip("/")
-    request = Request(endpoint + "/v1alpha1/status", method="GET")
+    headers = parse_controller_headers(
+        config.get("DSEC_SANDBOX_CONTROLLER_HEADERS_JSON", "")
+    )
+    request = Request(
+        endpoint + "/v1alpha1/status",
+        headers=headers,
+        method="GET",
+    )
     transport = opener or build_opener(ProxyHandler({}))
     try:
         with transport.open(request, timeout=15) as response:

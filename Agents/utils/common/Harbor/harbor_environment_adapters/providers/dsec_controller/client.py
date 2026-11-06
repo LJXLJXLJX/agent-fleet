@@ -7,11 +7,14 @@ not authorize a retry under a new resource identity.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
 import httpx
+
+from .runtime_preflight import parse_controller_headers
 
 API_VERSION = "sandbox-lifecycle/v1alpha1"
 MAX_JSON_RESPONSE_BYTES = 16 << 20
@@ -36,6 +39,7 @@ class DsecControllerClient:
         *,
         allow_insecure_http: bool = False,
         request_timeout_sec: int = 15,
+        headers: str | Mapping[str, str] | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         parsed = urlsplit(endpoint)
@@ -57,10 +61,12 @@ class DsecControllerClient:
             raise ValueError("request_timeout_sec must be between 1 and 60")
         self.endpoint = f"{parsed.scheme}://{parsed.netloc}"
         self.request_timeout_sec = request_timeout_sec
+        self.headers = parse_controller_headers(headers)
         self.client = client or httpx.AsyncClient(
             follow_redirects=False,
             timeout=httpx.Timeout(request_timeout_sec),
             trust_env=False,
+            headers=self.headers,
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
         )
 
@@ -76,6 +82,7 @@ class DsecControllerClient:
             method,
             self.endpoint + path,
             json=body,
+            headers=self.headers,
         ) as response:
             limit = (
                 MAX_OUTPUT_READ_BYTES

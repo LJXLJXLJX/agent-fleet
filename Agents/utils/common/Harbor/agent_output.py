@@ -73,6 +73,7 @@ class _LoggedEnvironment:
     async def exec(self, command: str, **kwargs):
         stdout_path = shlex.quote(str(self._log_dir / "command.stdout"))
         stderr_path = shlex.quote(str(self._log_dir / "command.stderr"))
+        claude_log_path = shlex.quote(str(self._log_dir / "claude-code.txt"))
         # The subshell preserves explicit exit/exec and pipeline semantics.
         # Do not put it in an if/|| condition: Bash would disable errexit in
         # the original command. Existing agent-specific tee files stay intact.
@@ -81,6 +82,11 @@ class _LoggedEnvironment:
             "set +e; (\n" + command + "\n) "
             f">{stdout_path} 2>{stderr_path}; "
             "harbor_capture_rc=$?; "
+            'if [ "$harbor_capture_rc" -eq 1 ] && [ -s '
+            f"{claude_log_path} ] && tail -n 5 {claude_log_path} | "
+            "grep -Eq '\"subtype\":\"error_max_turns\"|context_length_exceeded'; then "
+            "harbor_capture_rc=0; "
+            "fi; "
             f"tail -c {TAIL_BYTES} -- {stdout_path}; "
             f"tail -c {TAIL_BYTES} -- {stderr_path} >&2; "
             'exit "$harbor_capture_rc"'

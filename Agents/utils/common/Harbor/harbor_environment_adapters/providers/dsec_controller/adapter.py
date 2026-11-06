@@ -156,6 +156,7 @@ class DsecSandboxEnvironment(
             controller_endpoint,
             allow_insecure_http=allow_insecure,
             request_timeout_sec=request_timeout,
+            headers=os.environ.get("DSEC_SANDBOX_CONTROLLER_HEADERS_JSON", ""),
         )
         self._sandbox_id = ""
         self._execution_sequence = 0
@@ -213,6 +214,7 @@ class DsecSandboxEnvironment(
                 os.environ.get("DSEC_SANDBOX_ALLOW_INSECURE_HTTP", "0"),
                 "DSEC_SANDBOX_ALLOW_INSECURE_HTTP",
             ),
+            headers=os.environ.get("DSEC_SANDBOX_CONTROLLER_HEADERS_JSON", ""),
         )
 
     def _bundle_image_ref(self) -> str:

@@ -49,17 +49,19 @@ class DsecLifecycleMixin:
         return "harbor-sandbox-" + hashlib.sha256(material.encode()).hexdigest()[:40]
 
     def _create_spec(self) -> dict[str, Any]:
+        process: dict[str, Any] = {
+            "argv": ["/bin/sleep", "infinity"],
+            # Harbor 0.18 owns task-level environment in _persistent_env;
+            # per-exec overlays are intentionally not active at creation.
+            "env": dict(self._persistent_env),
+            "user": "root",
+        }
+        if self.task_env_config.workdir:
+            process["working_directory"] = str(self.task_env_config.workdir)
         spec: dict[str, Any] = {
             "request_id": self._sandbox_request_id(),
             "image": self._image_ref,
-            "process": {
-                "argv": ["/bin/sleep", "infinity"],
-                # Harbor 0.18 owns task-level environment in _persistent_env;
-                # per-exec overlays are intentionally not active at creation.
-                "env": dict(self._persistent_env),
-                "user": "root",
-                "working_directory": "/",
-            },
+            "process": process,
             "resources": self._resource_request(),
             "lifecycle": {"ttl_seconds": self._ttl_seconds},
             "image_delivery": {

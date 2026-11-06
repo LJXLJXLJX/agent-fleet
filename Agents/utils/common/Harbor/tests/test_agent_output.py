@@ -163,3 +163,17 @@ class AgentOutputTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
             self.assertEqual(path.read_bytes(), b"partial")
+
+    async def test_claude_max_turns_or_context_length_exit_code_normalized(self):
+        for payload in (
+            '{"type":"result","subtype":"error_max_turns"}\n',
+            '{"type":"result","result":"API Error: 500 ... context_length_exceeded"}\n',
+        ):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                claude_log = shlex.quote(str(Path(directory) / "claude-code.txt"))
+                cmd = f" (printf %s {shlex.quote(payload)}; exit 1) | tee {claude_log}"
+                result = await exec_logged_agent(
+                    Agent([r"API Error"]), LocalEnvironment(), cmd, log_dir=directory,
+                )
+                self.assertEqual(result.return_code, 0)
+                self.assertIsNone(result.classification)

@@ -61,6 +61,36 @@ class DsecControllerClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(peak, 128)
         self.assertTrue(all(result["state"] == "ready" for result in results))
 
+    async def test_custom_headers_are_forwarded_on_requests(self):
+        seen_backend = None
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal seen_backend
+            seen_backend = request.headers.get("X-Backend")
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "api_version": API_VERSION,
+                    "status": "ok",
+                    "result": {"sandbox": {"state": "ready"}},
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+        async_client = httpx.AsyncClient(transport=transport)
+        client = DsecControllerClient(
+            "http://10.100.184.182",
+            allow_insecure_http=True,
+            headers='{"X-Backend": "10.254.73.22:873"}',
+            client=async_client,
+        )
+        result = await client.sandbox_status("sandbox-1")
+        await client.close()
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(seen_backend, "10.254.73.22:873")
+
 
 if __name__ == "__main__":
     unittest.main()
