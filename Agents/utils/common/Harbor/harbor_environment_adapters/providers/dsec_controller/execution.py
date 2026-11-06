@@ -10,9 +10,10 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import httpx
 from harbor.environments.base import ExecResult
 
-from .client import MAX_OUTPUT_READ_BYTES
+from .client import MAX_OUTPUT_READ_BYTES, DsecControllerError
 
 _EXECUTION_TERMINAL_STATES = {
     "succeeded",
@@ -42,6 +43,24 @@ class DsecExecutionMixin:
         ).hexdigest()
         return f"harbor-exec-{digest[:40]}"
 
+    async def _call_with_retry(self, operation: Any, *args: Any) -> Any:
+        """Retry idempotent execution RPCs on transient Controller/Node errors."""
+        attempts = getattr(self, "_request_attempts", 3)
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return await operation(*args)
+            except DsecControllerError as error:
+                last_error = error
+                if not error.retryable or attempt + 1 == attempts:
+                    raise
+            except httpx.RequestError as error:
+                last_error = error
+                if attempt + 1 == attempts:
+                    raise
+            await asyncio.sleep(min(2**attempt, 5))
+        raise RuntimeError("DSec execution retry loop exhausted") from last_error
+
     async def _read_execution_stream(
         self, record: dict[str, Any], stream: str
     ) -> bytes:
@@ -56,7 +75,8 @@ class DsecExecutionMixin:
         chunks: list[bytes] = []
         for offset in range(0, committed, MAX_OUTPUT_READ_BYTES):
             length = min(MAX_OUTPUT_READ_BYTES, committed - offset)
-            chunk = await self._client.execution_output(
+            chunk = await self._call_with_retry(
+                self._client.execution_output,
                 self._sandbox_id,
                 record["execution_id"],
                 stream,
@@ -89,7 +109,9 @@ class DsecExecutionMixin:
         if env:
             request["env"] = env
         try:
-            record = await self._client.create_execution(self._sandbox_id, request)
+            record = await self._call_with_retry(
+                self._client.create_execution, self._sandbox_id, request
+            )
             execution_id = record.get("execution_id")
             if not isinstance(execution_id, str) or not execution_id:
                 raise RuntimeError("DSec Controller returned no execution identity")
@@ -103,8 +125,8 @@ class DsecExecutionMixin:
                         f"DSec execution wait deadline exceeded: {execution_id}"
                     )
                 await asyncio.sleep(self._poll_interval_sec)
-                record = await self._client.execution_status(
-                    self._sandbox_id, execution_id
+                record = await self._call_with_retry(
+                    self._client.execution_status, self._sandbox_id, execution_id
                 )
             stdout, stderr = await asyncio.gather(
                 self._read_execution_stream(record, "stdout"),

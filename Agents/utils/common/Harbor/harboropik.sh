@@ -425,23 +425,39 @@ verifier_uv_bin_ready() {
     && [[ -x "$VERIFIER_UV_BIN_DIR_SOURCE/curl" ]]
 }
 
+verifier_uv_preinstalled() {
+  [[ "$HARBOR_BACKEND_PREINSTALLED_AGENTS" == "1" ]] \
+    && [[ "${HARBOR_ORACLE_VERIFIER_UV_BACKUP_ENABLED:-1}" == "1" ]]
+}
+
+effective_verifier_uv_bin_dir() {
+  if verifier_uv_preinstalled \
+    && [[ "$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH" == "/opt/tb-uv-backup/bin" ]]; then
+    printf '%s\n' "${HARBOR_PREINSTALLED_VERIFIER_UV_BIN_DIR:-/opt/agent-fleet/runtime/verifier-uv/bin}"
+  else
+    printf '%s\n' "$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH"
+  fi
+}
+
 append_verifier_uv_env() {
+  local uv_bin_dir
+  uv_bin_dir="$(effective_verifier_uv_bin_dir)"
   local prefix="/root/.local/bin:/home/oai/.local/bin:/home/agent/.local/bin:/home/ubuntu/.local/bin"
   if [[ -n "${HARBOR_VERIFIER_UV_HOME:-}" ]]; then
     prefix="$HARBOR_VERIFIER_UV_HOME/.local/bin:$prefix"
   fi
-  prefix="$prefix:$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH"
+  prefix="$prefix:$uv_bin_dir"
   if [[ "$HARBOR_BACKEND_HOST_DOCKER" == "1" ]]; then
     cmd+=( --ve "HARBOR_VERIFIER_PATH_PREPEND=$prefix" )
   else
     cmd+=( --ve "PATH=$prefix:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" )
   fi
-  cmd+=( --ve "HARBOR_VERIFIER_UV_BIN_DIR=$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH" )
+  cmd+=( --ve "HARBOR_VERIFIER_UV_BIN_DIR=$uv_bin_dir" )
 }
 
 opensandbox_verifier_tool_env_required() {
   [[ "$HARBOR_BACKEND_TASK_IMAGES" == "1" ]] \
-    && { verifier_uv_bin_ready || verifier_runtime_bundle_required; }
+    && { verifier_uv_bin_ready || verifier_uv_preinstalled || verifier_runtime_bundle_required; }
 }
 
 append_verifier_runtime_bundle_env() {
@@ -461,14 +477,16 @@ append_verifier_runtime_bundle_env() {
 
 append_opensandbox_verifier_tool_env() {
   local verifier_path_prefix=""
-  if verifier_uv_bin_ready; then
+  local uv_bin_dir
+  uv_bin_dir="$(effective_verifier_uv_bin_dir)"
+  if verifier_uv_bin_ready || verifier_uv_preinstalled; then
     verifier_path_prefix="/root/.local/bin:/home/oai/.local/bin:/home/agent/.local/bin:/home/ubuntu/.local/bin"
     if [[ -n "${HARBOR_VERIFIER_UV_HOME:-}" ]]; then
       verifier_path_prefix="$HARBOR_VERIFIER_UV_HOME/.local/bin:$verifier_path_prefix"
     fi
-    verifier_path_prefix="$verifier_path_prefix:$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH"
+    verifier_path_prefix="$verifier_path_prefix:$uv_bin_dir"
     cmd+=(
-      --ve "HARBOR_VERIFIER_UV_BIN_DIR=$HARBOR_VERIFIER_UV_BIN_DIR_MOUNT_PATH"
+      --ve "HARBOR_VERIFIER_UV_BIN_DIR=$uv_bin_dir"
     )
   fi
 
@@ -685,11 +703,13 @@ run_oracle_task() {
   mkdir -p "$out_dir"
 
   if [[ "$HARBOR_ORACLE_VERIFIER_UV_BACKUP_ENABLED" == "1" ]]; then
-    VERIFIER_UV_BIN_DIR_SOURCE="$(mktemp -d "${RUNTIME_DIR%/}/verifier-uv.oracle.XXXXXX" 2>/dev/null || true)"
-    if [[ -n "$VERIFIER_UV_BIN_DIR_SOURCE" ]]; then
-      prepare_verifier_uv_bin "$VERIFIER_UV_BIN_DIR_SOURCE" || true
-    else
-      echo "[WARN] failed to create verifier uv backup dir; verifier will use its normal uv install path" >&2
+    if [[ "$HARBOR_BACKEND_PREINSTALLED_AGENTS" != "1" ]]; then
+      VERIFIER_UV_BIN_DIR_SOURCE="$(mktemp -d "${RUNTIME_DIR%/}/verifier-uv.oracle.XXXXXX" 2>/dev/null || true)"
+      if [[ -n "$VERIFIER_UV_BIN_DIR_SOURCE" ]]; then
+        prepare_verifier_uv_bin "$VERIFIER_UV_BIN_DIR_SOURCE" || true
+      else
+        echo "[WARN] failed to create verifier uv backup dir; verifier will use its normal uv install path" >&2
+      fi
     fi
   else
     echo "[INFO] Oracle verifier uv backup disabled; only task tests will be uploaded"
@@ -749,9 +769,11 @@ run_oracle_task() {
       python3 "$SCRIPT_DIR/harbor_shell_utils.py" readonly-mounts \
         "${verifier_mount_args[@]}"
     )"
-    cmd+=(
-      --mounts-json "$verifier_mounts_json"
-    )
+    if [[ "$verifier_mounts_json" != "[]" ]]; then
+      cmd+=(
+        --mounts-json "$verifier_mounts_json"
+      )
+    fi
     append_opensandbox_verifier_tool_env
   elif [[ "$HARBOR_BACKEND_VERIFIER_UPLOAD" != "1" ]] \
     && { verifier_uv_bin_ready || verifier_runtime_bundle_required; }; then
@@ -889,7 +911,8 @@ run_harbor() {
     echo "[ERROR] HARBOR_LLM_KWARGS is not valid JSON" >&2
     exit 1
   fi
-  if [[ "$HARBOR_BACKEND_READONLY_MOUNTS" == "1" || "$HARBOR_BACKEND_VERIFIER_UPLOAD" == "1" ]]; then
+  if [[ "$HARBOR_BACKEND_PREINSTALLED_AGENTS" != "1" ]] \
+    && [[ "$HARBOR_BACKEND_READONLY_MOUNTS" == "1" || "$HARBOR_BACKEND_VERIFIER_UPLOAD" == "1" ]]; then
     VERIFIER_UV_BIN_DIR_SOURCE="$(mktemp -d "${RUNTIME_DIR%/}/verifier-uv.${job_name}.XXXXXX" 2>/dev/null || true)"
     if [[ -n "$VERIFIER_UV_BIN_DIR_SOURCE" ]]; then
       prepare_verifier_uv_bin "$VERIFIER_UV_BIN_DIR_SOURCE" || true
@@ -1308,11 +1331,13 @@ run_harbor() {
 
 run_opencode_task() {
   harbor_apply_effective_wheel_source
-  VERIFIER_UV_BIN_DIR_SOURCE="$(mktemp -d "${RUNTIME_DIR%/}/verifier-uv.opencode.XXXXXX" 2>/dev/null || true)"
-  if [[ -n "$VERIFIER_UV_BIN_DIR_SOURCE" ]]; then
-    prepare_verifier_uv_bin "$VERIFIER_UV_BIN_DIR_SOURCE" || true
-  else
-    echo "[WARN] failed to create verifier uv backup dir; verifier will use its normal uv install path" >&2
+  if [[ "$HARBOR_BACKEND_PREINSTALLED_AGENTS" != "1" ]]; then
+    VERIFIER_UV_BIN_DIR_SOURCE="$(mktemp -d "${RUNTIME_DIR%/}/verifier-uv.opencode.XXXXXX" 2>/dev/null || true)"
+    if [[ -n "$VERIFIER_UV_BIN_DIR_SOURCE" ]]; then
+      prepare_verifier_uv_bin "$VERIFIER_UV_BIN_DIR_SOURCE" || true
+    else
+      echo "[WARN] failed to create verifier uv backup dir; verifier will use its normal uv install path" >&2
+    fi
   fi
   configure_e2b_verifier_tool_upload
   if harbor_trace_to_opik_enabled; then

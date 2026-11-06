@@ -328,6 +328,34 @@ class DsecLifecycleTests(unittest.IsolatedAsyncioTestCase):
         exec_req = environment._client.create_execution.await_args.args[1]
         self.assertNotIn("working_directory", exec_req)
 
+    async def test_exec_retries_retryable_controller_errors(self):
+        environment = self.environment()
+        environment._sandbox_id = "sbx-one"
+        environment._request_attempts = 3
+        environment._client.create_execution.side_effect = [
+            lifecycle.DsecControllerError(
+                code="dependency_unavailable",
+                message="dependency_unavailable",
+                retryable=True,
+            ),
+            {
+                "execution_id": "exec-one",
+                "state": "succeeded",
+                "exit_code": 0,
+                "stdout": {"committed_bytes": 2, "truncated": False},
+                "stderr": {"committed_bytes": 0, "truncated": False},
+            },
+        ]
+        environment._client.execution_output.return_value = b"ok"
+        with unittest.mock.patch(
+            "harbor_environment_adapters.providers.dsec_controller.execution.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            result = await environment.exec("echo ok")
+        self.assertEqual(result.return_code, 0)
+        self.assertEqual(result.stdout, "ok")
+        self.assertEqual(environment._client.create_execution.await_count, 2)
+
     async def test_oversized_command_is_materialized_with_bounded_argv(self):
         environment = self.environment()
         environment._sandbox_id = "sbx-one"
